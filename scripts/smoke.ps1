@@ -1,10 +1,15 @@
 param(
     [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\windows-monitor.exe'),
-    [ValidateRange(5, 300)][int]$MeasureSeconds = 30
+    [ValidateRange(5, 300)][int]$MeasureSeconds = 30,
+    [switch]$RequireTaskbar,
+    [switch]$ExpectDockHidden
 )
 
 $ErrorActionPreference = 'Stop'
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
+if ($RequireTaskbar -and $ExpectDockHidden) {
+    throw 'Choose either visible or hidden taskbar validation.'
+}
 
 if (-not ('MonitorSmoke.Native' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -15,6 +20,9 @@ namespace MonitorSmoke {
     public static class Native {
         [StructLayout(LayoutKind.Sequential)]
         public struct Rect { public int Left, Top, Right, Bottom; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct Point { public int X, Y; }
 
         [StructLayout(LayoutKind.Sequential)]
         public struct ThreadInfo {
@@ -31,6 +39,8 @@ namespace MonitorSmoke {
         public static extern bool GetGUIThreadInfo(uint thread, ref ThreadInfo info);
         [DllImport("user32.dll")]
         public static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
+        [DllImport("user32.dll")]
+        public static extern IntPtr WindowFromPoint(Point point);
         [DllImport("user32.dll")]
         public static extern bool IsWindowVisible(IntPtr hwnd);
         [DllImport("user32.dll")]
@@ -77,6 +87,64 @@ function Get-PanelWindow {
     [MonitorSmoke.Native]::FindWindow('WindowsMonitor.Panel', [intptr]::Zero)
 }
 
+function Test-Setting([string]$Entry) {
+    $reader = $file = $null
+    try {
+        $file = [IO.File]::Open($stateFile, 'Open', 'Read', ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        $reader = [IO.StreamReader]::new($file)
+        return ($reader.ReadToEnd() -split '\r?\n') -contains $Entry
+    } catch [IO.IOException] {
+        return $false
+    } finally {
+        if ($null -ne $reader) {
+            $reader.Dispose()
+        } elseif ($null -ne $file) {
+            $file.Dispose()
+        }
+    }
+}
+
+function Get-Bounds([intptr]$Handle) {
+    $rect = [MonitorSmoke.Native+Rect]::new()
+    $oldDpiContext = [MonitorSmoke.Native]::SetThreadDpiAwarenessContext([intptr](-4))
+    try {
+        Assert-True ([MonitorSmoke.Native]::GetWindowRect($Handle, [ref]$rect)) 'Cannot get panel bounds.'
+    } finally {
+        if ($oldDpiContext -ne [intptr]::Zero) {
+            [void][MonitorSmoke.Native]::SetThreadDpiAwarenessContext($oldDpiContext)
+        }
+    }
+    $rect
+}
+
+function Test-TaskbarPlacement {
+    $panel = Get-Bounds $window
+    $taskbar = [MonitorSmoke.Native]::FindWindow('Shell_TrayWnd', [intptr]::Zero)
+    if ($taskbar -eq [intptr]::Zero) { return $false }
+    $bar = Get-Bounds $taskbar
+    $taskbarDpi = [MonitorSmoke.Native]::GetDpiForWindow($taskbar)
+    return (
+        [MonitorSmoke.Native]::IsWindowVisible($window) -and
+        ($panel.Right - $panel.Left) -eq [math]::Floor((360 * $taskbarDpi + 48) / 96) -and
+        ($panel.Bottom - $panel.Top) -eq [math]::Floor((36 * $taskbarDpi + 48) / 96) -and
+        $panel.Left -ge $bar.Left -and $panel.Right -le $bar.Right -and
+        $panel.Top -ge $bar.Top -and $panel.Bottom -le $bar.Bottom
+    )
+}
+
+function Test-PanelOnTopAtCenter {
+    $panel = Get-Bounds $window
+    $point = [MonitorSmoke.Native+Point]::new()
+    $point.X = [int](($panel.Right + $panel.Left) / 2)
+    $point.Y = [int](($panel.Bottom + $panel.Top) / 2)
+    $old = [MonitorSmoke.Native]::SetThreadDpiAwarenessContext([intptr](-4))
+    try {
+        return [MonitorSmoke.Native]::WindowFromPoint($point) -eq $window
+    } finally {
+        if ($old -ne [intptr]::Zero) { [void][MonitorSmoke.Native]::SetThreadDpiAwarenessContext($old) }
+    }
+}
+
 function Is-InMenu {
     $info = [MonitorSmoke.Native+ThreadInfo]::new()
     $info.Size = [Runtime.InteropServices.Marshal]::SizeOf($info)
@@ -98,15 +166,7 @@ try {
     Assert-True ($owner -eq $app.Id) 'The launched instance must own the window.'
     Wait-For { [MonitorSmoke.Native]::IsWindowVisible($window) } 'Panel was not visible.'
 
-    $rect = [MonitorSmoke.Native+Rect]::new()
-    $oldDpiContext = [MonitorSmoke.Native]::SetThreadDpiAwarenessContext([intptr](-4))
-    try {
-        Assert-True ([MonitorSmoke.Native]::GetWindowRect($window, [ref]$rect)) 'Cannot get panel bounds.'
-    } finally {
-        if ($oldDpiContext -ne [intptr]::Zero) {
-            [void][MonitorSmoke.Native]::SetThreadDpiAwarenessContext($oldDpiContext)
-        }
-    }
+    $rect = Get-Bounds $window
     $dpi = [MonitorSmoke.Native]::GetDpiForWindow($window)
     $width = $rect.Right - $rect.Left
     $height = $rect.Bottom - $rect.Top
@@ -130,15 +190,34 @@ try {
     Assert-True ((Get-PanelWindow) -eq $window) 'A second launch replaced the original window.'
 
     Send-Panel 0x111 105
-    Wait-For { (Get-Content $stateFile) -contains 'theme=dark' } 'Dark theme was not saved.'
+    Wait-For { Test-Setting 'theme=dark' } 'Dark theme was not saved.'
     Send-Panel 0x111 104
-    Wait-For { (Get-Content $stateFile) -contains 'theme=light' } 'Light theme was not saved.'
+    Wait-For { Test-Setting 'theme=light' } 'Light theme was not saved.'
     Send-Panel 0x111 102
     Wait-For { ([MonitorSmoke.Native]::GetWindowLongPtr($window, -20).ToInt64() -band 8) -eq 0 } 'Topmost did not turn off.'
     Send-Panel 0x111 102
     Wait-For { ([MonitorSmoke.Native]::GetWindowLongPtr($window, -20).ToInt64() -band 8) -ne 0 } 'Topmost did not turn back on.'
     Send-Panel 0x111 106
-    Wait-For { (Get-Content $stateFile) -contains 'traffic=0' } 'Reset did not clear the persisted counter.'
+    Wait-For { Test-Setting 'traffic=0' } 'Reset did not clear the persisted counter.'
+
+    foreach ($option in @(@(110, 2), @(111, 3), @(112, 5), @(109, 1))) {
+        Send-Panel 0x111 $option[0]
+        Wait-For { Test-Setting "refresh=$($option[1])" } 'Refresh interval was not saved.'
+    }
+
+    $dockedPixels = $null
+    if ($RequireTaskbar -or $ExpectDockHidden) {
+        Send-Panel 0x111 108
+        Wait-For { Test-Setting 'taskbar=true' } 'Dock preference was not saved.'
+        if ($RequireTaskbar) {
+            Wait-For { Test-TaskbarPlacement } 'The panel did not enter an available taskbar slot.'
+            Wait-For { Test-PanelOnTopAtCenter } 'The taskbar panel is not visible above Explorer.'
+            $docked = Get-Bounds $window
+            $dockedPixels = '{0}x{1}' -f ($docked.Right - $docked.Left), ($docked.Bottom - $docked.Top)
+        } else {
+            Wait-For { -not [MonitorSmoke.Native]::IsWindowVisible($window) } 'The panel did not hide with the taskbar covered.'
+        }
+    }
 
     $app.Refresh()
     $cpuStart = $app.TotalProcessorTime.TotalSeconds
@@ -158,15 +237,41 @@ try {
     }
     $cpu = 100 * ($app.TotalProcessorTime.TotalSeconds - $cpuStart) / $timer.Elapsed.TotalSeconds / [Environment]::ProcessorCount
 
+    Send-Panel 0x111 112
+    Wait-For { Test-Setting 'refresh=5' } 'Refresh setting was not saved at exit.'
     Send-Panel 0x111 107
     Assert-True ($app.WaitForExit(5000) -and $app.ExitCode -eq 0) 'Exit did not shut down cleanly.'
     Assert-True ((Get-PanelWindow) -eq [intptr]::Zero) 'The window remained after exit.'
-    Assert-True ((Get-Content $stateFile) -contains 'theme=light') 'Settings were not preserved at exit.'
+    Assert-True (Test-Setting 'theme=light') 'Settings were not preserved at exit.'
+
+    if ($RequireTaskbar -or $ExpectDockHidden) {
+        $app.Dispose()
+        $app = Start-Monitor
+        Wait-For { (Get-PanelWindow) -ne [intptr]::Zero } 'Panel did not reopen.'
+        $window = Get-PanelWindow
+        if ($RequireTaskbar) {
+            Wait-For { Test-TaskbarPlacement } 'Dock preference was not restored after restart.'
+        } else {
+            Wait-For { Test-Setting 'taskbar=true' } 'Dock preference was not preserved after restart.'
+            Assert-True (-not [MonitorSmoke.Native]::IsWindowVisible($window)) 'The restarted panel should be hidden.'
+        }
+        Send-Panel 0x111 108
+        Wait-For {
+            $floating = Get-Bounds $window
+            ($floating.Right - $floating.Left) -eq $width -and
+            ($floating.Bottom - $floating.Top) -eq $height -and
+            (Test-Setting 'taskbar=false')
+        } 'Disabling taskbar mode did not restore the floating panel.'
+        Send-Panel 0x111 107
+        Assert-True ($app.WaitForExit(5000) -and $app.ExitCode -eq 0) 'The relaunched instance failed to close.'
+    }
 
     [pscustomobject]@{
         Passed                         = $true
         Dpi                            = $dpi
         PanelPixels                    = ('{0}x{1}' -f $width, $height)
+        TaskbarPixels                  = $dockedPixels
+        DockHidden                     = [bool]$ExpectDockHidden
         LogicalProcessors              = [Environment]::ProcessorCount
         ExecutableBytes                = (Get-Item $Exe).Length
         SamplingSeconds                = [math]::Round($timer.Elapsed.TotalSeconds, 2)

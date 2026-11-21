@@ -32,9 +32,9 @@ pub fn traffic_delta(previous: &HashMap<u64, Bytes>, current: &HashMap<u64, Byte
     delta
 }
 
-pub fn rate(bytes: u64, elapsed: Duration) -> Option<f64> {
-    let seconds = elapsed.as_secs_f64();
-    (seconds > 0.0 && seconds <= 5.0).then(|| bytes as f64 / seconds)
+pub fn rate(bytes: u64, elapsed: Duration, interval: Duration) -> Option<f64> {
+    (!elapsed.is_zero() && elapsed <= interval * 2 + Duration::from_secs(2))
+        .then(|| bytes as f64 / elapsed.as_secs_f64())
 }
 
 #[derive(Clone, Copy, Default)]
@@ -149,9 +149,19 @@ mod tests {
 
     #[test]
     fn rates_use_elapsed_time_and_recover_from_sleep() {
-        assert_eq!(rate(300, Duration::from_millis(1500)), Some(200.0));
-        assert_eq!(rate(300, Duration::ZERO), None);
-        assert_eq!(rate(300, Duration::from_secs(20)), None);
+        assert_eq!(
+            rate(300, Duration::from_millis(1500), Duration::from_secs(1)),
+            Some(200.0)
+        );
+        assert_eq!(rate(300, Duration::ZERO, Duration::from_secs(1)), None);
+        assert_eq!(
+            rate(300, Duration::from_secs(20), Duration::from_secs(5)),
+            None
+        );
+        assert_eq!(
+            rate(500, Duration::from_secs(5), Duration::from_secs(5)),
+            Some(100.0)
+        );
     }
 
     #[test]

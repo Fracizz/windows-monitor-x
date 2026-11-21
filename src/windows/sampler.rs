@@ -3,7 +3,7 @@ use std::{
     mem::{size_of, swap},
     ptr::{addr_of, null_mut},
     slice,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use ::windows::{
@@ -35,7 +35,7 @@ use crate::model::{Bytes, CpuTime, Sample, rate, traffic_delta};
 pub struct Sampler {
     previous_network: HashMap<u64, Bytes>,
     network: HashMap<u64, Bytes>,
-    network_time: Option<Instant>,
+    network_time: Option<(Instant, Duration)>,
     traffic: u64,
     previous_cpu: Option<CpuTime>,
     disk: Option<PerformanceQuery>,
@@ -58,20 +58,21 @@ impl Sampler {
         }
     }
 
-    pub fn poll(&mut self) -> Sample {
+    pub fn poll(&mut self, interval: Duration) -> Sample {
         let now = Instant::now();
         let mut sample = Sample::default();
         if read_network(&mut self.network) {
-            if let Some(previous_time) = self.network_time {
+            if let Some((previous_time, previous_interval)) = self.network_time {
                 let delta = traffic_delta(&self.previous_network, &self.network);
                 self.traffic = self
                     .traffic
                     .saturating_add(delta.sent.saturating_add(delta.received));
                 let elapsed = now - previous_time;
-                sample.upload = rate(delta.sent, elapsed);
-                sample.download = rate(delta.received, elapsed);
+                let cadence = interval.max(previous_interval);
+                sample.upload = rate(delta.sent, elapsed, cadence);
+                sample.download = rate(delta.received, elapsed, cadence);
             }
-            self.network_time = Some(now);
+            self.network_time = Some((now, interval));
             swap(&mut self.previous_network, &mut self.network);
         }
 
@@ -278,9 +279,9 @@ mod tests {
     #[ignore = "requires a Windows desktop with physical drive performance counters"]
     fn samples_real_windows_counters() {
         let mut sampler = Sampler::new();
-        sampler.poll();
+        sampler.poll(Duration::from_secs(1));
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let sample = sampler.poll();
+        let sample = sampler.poll(Duration::from_secs(1));
         eprintln!(
             "{sample:?}, {} active physical adapters",
             sampler.previous_network.len()

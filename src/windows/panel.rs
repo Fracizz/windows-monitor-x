@@ -1,6 +1,6 @@
 use ::windows::{
     Win32::{
-        Foundation::{HWND, RECT},
+        Foundation::{COLORREF, HWND, RECT},
         Graphics::{
             Direct2D::{
                 Common::{D2D_RECT_F, D2D_SIZE_U, D2D1_COLOR_F},
@@ -15,9 +15,13 @@ use ::windows::{
                 DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, DWRITE_FONT_STRETCH_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_LINE_SPACING_METHOD_UNIFORM,
-                DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP,
-                DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
-                IDWriteTypography,
+                DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory,
+                IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, IDWriteTypography,
+            },
+            Gdi::{
+                CreateFontIndirectW, CreateSolidBrush, DEFAULT_CHARSET, DT_CENTER, DT_NOPREFIX,
+                DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FillRect, HDC, HGDIOBJ,
+                LOGFONTW, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
             },
         },
         UI::WindowsAndMessaging::GetClientRect,
@@ -28,13 +32,69 @@ use windows_numerics::Vector2;
 
 use crate::model::Reading;
 
-pub const WIDTH: i32 = 420;
-pub const HEIGHT: i32 = 68;
-pub const RADIUS: i32 = 11;
-
 const ROW_HEIGHT: f32 = 24.0;
 const ROW_BASELINE: f32 = 17.0;
-const COLUMN_EDGES: [f32; 2] = [125.0, 244.0];
+const UNIT_GAP: f32 = 4.0;
+const PERCENT_GAP: f32 = 2.5;
+const ARROW_WING: f32 = 3.7;
+const ARROW_GAP: f32 = 6.5;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Layout {
+    #[default]
+    Floating,
+    Taskbar,
+}
+
+impl Layout {
+    pub const fn size(self) -> (i32, i32) {
+        match self {
+            Self::Floating => (420, 68),
+            Self::Taskbar => (360, 36),
+        }
+    }
+
+    pub const fn radius(self) -> i32 {
+        match self {
+            Self::Floating => 12,
+            Self::Taskbar => 6,
+        }
+    }
+
+    const fn slots(self) -> [Slot; 6] {
+        match self {
+            Self::Floating => [
+                Slot::new(0.0, 25.0, 99.0, 9.0),
+                Slot::new(0.0, 25.0, 99.0, 35.0),
+                Slot::new(128.0, 166.0, 224.0, 9.0),
+                Slot::new(128.0, 166.0, 224.0, 35.0),
+                Slot::new(259.0, 312.0, 401.0, 9.0),
+                Slot::new(259.0, 312.0, 401.0, 35.0),
+            ],
+            Self::Taskbar => [
+                Slot::new(0.0, 19.0, 85.0, -3.0),
+                Slot::new(0.0, 19.0, 85.0, 14.0),
+                Slot::new(109.0, 144.0, 185.0, -3.0),
+                Slot::new(109.0, 144.0, 185.0, 14.0),
+                Slot::new(211.0, 263.0, 347.0, -3.0),
+                Slot::new(211.0, 263.0, 347.0, 14.0),
+            ],
+        }
+    }
+
+    const fn dividers(self) -> [(Vector2, Vector2); 2] {
+        match self {
+            Self::Floating => [
+                (point(112.0, 12.0), point(112.0, 56.0)),
+                (point(242.0, 12.0), point(242.0, 56.0)),
+            ],
+            Self::Taskbar => [
+                (point(96.0, 5.0), point(96.0, 31.0)),
+                (point(198.0, 5.0), point(198.0, 31.0)),
+            ],
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Slot {
@@ -44,44 +104,16 @@ struct Slot {
     row_y: f32,
 }
 
-const SLOTS: [Slot; 6] = [
-    Slot {
-        label_x: 19.0,
-        number_x: 34.0,
-        number_end: 76.0,
-        row_y: 10.0,
-    },
-    Slot {
-        label_x: 19.0,
-        number_x: 34.0,
-        number_end: 76.0,
-        row_y: 34.0,
-    },
-    Slot {
-        label_x: 141.0,
-        number_x: 171.0,
-        number_end: 212.0,
-        row_y: 10.0,
-    },
-    Slot {
-        label_x: 141.0,
-        number_x: 171.0,
-        number_end: 212.0,
-        row_y: 34.0,
-    },
-    Slot {
-        label_x: 260.0,
-        number_x: 309.0,
-        number_end: 373.0,
-        row_y: 10.0,
-    },
-    Slot {
-        label_x: 260.0,
-        number_x: 309.0,
-        number_end: 373.0,
-        row_y: 34.0,
-    },
-];
+impl Slot {
+    const fn new(label_x: f32, number_x: f32, number_end: f32, row_y: f32) -> Self {
+        Self {
+            label_x,
+            number_x,
+            number_end,
+            row_y,
+        }
+    }
+}
 
 struct Colors {
     surface: u32,
@@ -94,22 +126,22 @@ struct Colors {
 }
 
 const LIGHT: Colors = Colors {
-    surface: 0xf9fbfe,
-    number: 0x142237,
-    label: 0x526278,
-    border: 0xd0dbe8,
-    divider: 0xe1e8f2,
-    upload: 0x147466,
-    download: 0x285db2,
+    surface: 0xfbf9f3,
+    number: 0x282a23,
+    label: 0x626354,
+    border: 0xddd8c9,
+    divider: 0xe8e2d3,
+    upload: 0x48734c,
+    download: 0x96652b,
 };
 const DARK: Colors = Colors {
-    surface: 0x18212d,
-    number: 0xedf4ff,
-    label: 0xafbdcf,
-    border: 0x3b4a5d,
-    divider: 0x344153,
-    upload: 0x83e4cd,
-    download: 0x9ebfff,
+    surface: 0x242520,
+    number: 0xf5f1e6,
+    label: 0xc6c5b4,
+    border: 0x4b4c42,
+    divider: 0x44463d,
+    upload: 0xa6d3a0,
+    download: 0xe7bd7b,
 };
 
 struct Target {
@@ -121,14 +153,25 @@ struct TextReading {
     displayed: Reading,
     number: IDWriteTextLayout,
     unit: IDWriteTextLayout,
+    number_x: f32,
+    unit_x: f32,
+}
+
+impl TextReading {
+    fn arrow_x(&self) -> f32 {
+        self.number_x - ARROW_WING - ARROW_GAP
+    }
 }
 
 pub struct Panel {
     factory: ID2D1Factory,
     fonts: IDWriteFactory,
     number_format: IDWriteTextFormat,
+    compact_format: IDWriteTextFormat,
+    percent_format: IDWriteTextFormat,
     unit_format: IDWriteTextFormat,
     tabular: IDWriteTypography,
+    mode: Layout,
     labels: [IDWriteTextLayout; 4],
     values: [Option<TextReading>; 6],
     target: Option<Target>,
@@ -138,11 +181,12 @@ impl Panel {
     pub fn new() -> Result<Self> {
         let factory = unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
         let fonts = unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED)? };
-        let label_format = text_format(&fonts, 13.0, DWRITE_FONT_WEIGHT_NORMAL)?;
+        let label_format = text_format(&fonts, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?;
         let number_format = text_format(&fonts, 16.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+        let compact_format = text_format(&fonts, 15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+        let percent_format = text_format(&fonts, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
         let unit_format = text_format(&fonts, 11.5, DWRITE_FONT_WEIGHT_NORMAL)?;
         let tabular = unsafe {
-            number_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
             let typography = fonts.CreateTypography()?;
             typography.AddFontFeature(DWRITE_FONT_FEATURE {
                 nameTag: DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES,
@@ -153,19 +197,29 @@ impl Panel {
         let labels = [
             layout(&fonts, &label_format, "CPU", 38.0)?,
             layout(&fonts, &label_format, "内存", 42.0)?,
-            layout(&fonts, &label_format, "硬盘", 47.0)?,
-            layout(&fonts, &label_format, "总流量", 48.0)?,
+            layout(&fonts, &label_format, "磁盘", 47.0)?,
+            layout(&fonts, &label_format, "累计流量", 80.0)?,
         ];
         Ok(Self {
             factory,
             fonts,
             number_format,
+            compact_format,
+            percent_format,
             unit_format,
             tabular,
+            mode: Layout::Floating,
             labels,
             values: [const { None }; 6],
             target: None,
         })
+    }
+
+    pub fn set_layout(&mut self, mode: Layout) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.values = [const { None }; 6];
+        }
     }
 
     pub fn resize(&mut self, hwnd: HWND, dpi: u32) {
@@ -193,37 +247,38 @@ impl Panel {
         }
         let target = self.target.as_ref().expect("render target initialized");
         let colors = if dark { DARK } else { LIGHT };
+        let slots = self.mode.slots();
         let result = unsafe {
             let window = &target.window;
             let brush = &target.brush;
             window.BeginDraw();
             window.Clear(Some(&color(colors.surface)));
-            brush.SetColor(&color(colors.border));
-            window.DrawRoundedRectangle(
-                &D2D1_ROUNDED_RECT {
-                    rect: D2D_RECT_F {
-                        left: 0.75,
-                        top: 0.75,
-                        right: WIDTH as f32 - 0.75,
-                        bottom: HEIGHT as f32 - 0.75,
+            if self.mode == Layout::Floating {
+                let (width, height) = self.mode.size();
+                let radius = self.mode.radius() as f32 - 0.5;
+                brush.SetColor(&color(colors.border));
+                window.DrawRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: 0.75,
+                            top: 0.75,
+                            right: width as f32 - 0.75,
+                            bottom: height as f32 - 0.75,
+                        },
+                        radiusX: radius,
+                        radiusY: radius,
                     },
-                    radiusX: RADIUS as f32 - 0.5,
-                    radiusY: RADIUS as f32 - 0.5,
-                },
-                brush,
-                1.0,
-                None,
-            );
-            brush.SetColor(&color(colors.divider));
-            for x in COLUMN_EDGES {
-                window.DrawLine(point(x, 12.0), point(x, 56.0), brush, 1.0, None);
+                    brush,
+                    1.0,
+                    None,
+                );
             }
-            brush.SetColor(&color(colors.upload));
-            draw_arrow(target, SLOTS[0], true);
-            brush.SetColor(&color(colors.download));
-            draw_arrow(target, SLOTS[1], false);
+            brush.SetColor(&color(colors.divider));
+            for (start, end) in self.mode.dividers() {
+                window.DrawLine(start, end, brush, 1.0, None);
+            }
             brush.SetColor(&color(colors.label));
-            for (slot, label) in SLOTS[2..].iter().zip(&self.labels) {
+            for (slot, label) in slots[2..].iter().zip(&self.labels) {
                 window.DrawTextLayout(
                     point(slot.label_x, slot.row_y),
                     label,
@@ -231,17 +286,27 @@ impl Panel {
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
             }
-            for (slot, text) in SLOTS.iter().zip(self.values.iter().flatten()) {
+            for (index, (slot, text)) in slots.iter().zip(self.values.iter().flatten()).enumerate()
+            {
+                if index < 2 {
+                    let upload = index == 0;
+                    brush.SetColor(&color(if upload {
+                        colors.upload
+                    } else {
+                        colors.download
+                    }));
+                    draw_arrow(target, text.arrow_x(), slot.row_y, upload);
+                }
                 brush.SetColor(&color(colors.number));
                 window.DrawTextLayout(
-                    point(slot.number_x, slot.row_y),
+                    point(text.number_x, slot.row_y),
                     &text.number,
                     brush,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
                 brush.SetColor(&color(colors.label));
                 window.DrawTextLayout(
-                    point(slot.number_end + 4.0, slot.row_y),
+                    point(text.unit_x, slot.row_y),
                     &text.unit,
                     brush,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
@@ -256,16 +321,27 @@ impl Panel {
     }
 
     fn update_text(&mut self, readings: &[Reading; 6]) -> Result<()> {
-        for ((cached, reading), slot) in self.values.iter_mut().zip(readings).zip(SLOTS) {
+        for (index, ((cached, reading), slot)) in self
+            .values
+            .iter_mut()
+            .zip(readings)
+            .zip(self.mode.slots())
+            .enumerate()
+        {
             if cached
                 .as_ref()
                 .is_some_and(|value| value.displayed == *reading)
             {
                 continue;
             }
+            let number_format = match index {
+                2..=4 => &self.percent_format,
+                _ if self.mode == Layout::Taskbar => &self.compact_format,
+                _ => &self.number_format,
+            };
             let number = layout(
                 &self.fonts,
-                &self.number_format,
+                number_format,
                 &reading.number,
                 slot.number_end - slot.number_x,
             )?;
@@ -279,10 +355,20 @@ impl Panel {
                 )?;
             }
             let unit = layout(&self.fonts, &self.unit_format, reading.unit, 43.0)?;
+            let number_width = text_width(&number)?;
+            let gap = match reading.unit {
+                "" => 0.0,
+                "%" => PERCENT_GAP,
+                _ => UNIT_GAP,
+            };
+            let unit_x = slot.number_end - text_width(&unit)?;
+            let number_x = unit_x - gap - number_width;
             *cached = Some(TextReading {
                 displayed: reading.clone(),
                 number,
                 unit,
+                number_x,
+                unit_x,
             });
         }
         Ok(())
@@ -309,6 +395,52 @@ impl Panel {
             Ok(Target { window, brush })
         }
     }
+}
+
+// The first frame uses GDI before DirectWrite and the system counters are ready.
+pub fn paint_starting(hwnd: HWND, dc: HDC, dpi: u32, dark: bool) {
+    let mut rect = RECT::default();
+    if unsafe { GetClientRect(hwnd, &mut rect) }.is_err() {
+        return;
+    }
+    let colors = if dark { DARK } else { LIGHT };
+    let mut font = LOGFONTW {
+        lfHeight: -super::scale(14, dpi),
+        lfWeight: 400,
+        lfCharSet: DEFAULT_CHARSET,
+        ..Default::default()
+    };
+    for (dst, src) in font.lfFaceName.iter_mut().zip("Segoe UI".encode_utf16()) {
+        *dst = src;
+    }
+    let mut text: Vec<_> = "正在读取系统指标…".encode_utf16().collect();
+    unsafe {
+        let background = CreateSolidBrush(gdi_color(colors.surface));
+        if !background.is_invalid() {
+            FillRect(dc, &rect, background);
+            let _ = DeleteObject(HGDIOBJ(background.0));
+        }
+        let text_font = CreateFontIndirectW(&font);
+        let previous_font = SelectObject(dc, HGDIOBJ(text_font.0));
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, gdi_color(colors.number));
+        DrawTextW(
+            dc,
+            &mut text,
+            &mut rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        if !previous_font.is_invalid() {
+            SelectObject(dc, previous_font);
+        }
+        if !text_font.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(text_font.0));
+        }
+    }
+}
+
+fn gdi_color(rgb: u32) -> COLORREF {
+    COLORREF(((rgb & 0xff) << 16) | (rgb & 0xff00) | (rgb >> 16))
 }
 
 fn client_size(hwnd: HWND) -> Result<D2D_SIZE_U> {
@@ -351,25 +483,31 @@ fn layout(
     unsafe { fonts.CreateTextLayout(&utf16, format, width, ROW_HEIGHT) }
 }
 
-fn draw_arrow(target: &Target, slot: Slot, up: bool) {
-    let mid = slot.row_y + 13.0;
+fn text_width(text: &IDWriteTextLayout) -> Result<f32> {
+    let mut metrics = Default::default();
+    unsafe { text.GetMetrics(&mut metrics)? };
+    Ok(metrics.width)
+}
+
+fn draw_arrow(target: &Target, x: f32, row_y: f32, up: bool) {
+    let mid = row_y + 13.0;
     let tip = mid + if up { -4.5 } else { 4.5 };
     let tail = 2.0 * mid - tip;
-    let wing = tip + if up { 3.7 } else { -3.7 };
-    let center = point(slot.label_x, tip);
+    let wing = tip + if up { ARROW_WING } else { -ARROW_WING };
+    let center = point(x, tip);
     unsafe {
         target
             .window
-            .DrawLine(point(slot.label_x, tail), center, &target.brush, 1.45, None);
+            .DrawLine(point(x, tail), center, &target.brush, 1.45, None);
         target.window.DrawLine(
-            point(slot.label_x - 3.7, wing),
+            point(x - ARROW_WING, wing),
             center,
             &target.brush,
             1.45,
             None,
         );
         target.window.DrawLine(
-            point(slot.label_x + 3.7, wing),
+            point(x + ARROW_WING, wing),
             center,
             &target.brush,
             1.45,
@@ -378,7 +516,7 @@ fn draw_arrow(target: &Target, slot: Slot, up: bool) {
     }
 }
 
-fn point(x: f32, y: f32) -> Vector2 {
+const fn point(x: f32, y: f32) -> Vector2 {
     Vector2 { X: x, Y: y }
 }
 
@@ -397,31 +535,133 @@ mod tests {
     use crate::model::{Sample, readings};
 
     #[test]
-    fn text_fits_fixed_columns() {
+    fn text_fits_in_both_layouts() {
         let mut panel = Panel::new().unwrap();
         let sample = Sample {
-            upload: Some(999_000.0),
+            upload: Some(1.0),
             download: Some(9_990_000_000.0),
             cpu: Some(100.0),
             memory: Some(100.0),
             disk: Some(100.0),
             ..Default::default()
         };
-        panel
-            .update_text(&readings(sample, 999_990_000_000))
-            .unwrap();
-        for ((index, slot), text) in SLOTS.iter().enumerate().zip(panel.values.iter().flatten()) {
-            let mut number = Default::default();
-            let mut unit = Default::default();
-            unsafe {
-                text.number.GetMetrics(&mut number).unwrap();
-                text.unit.GetMetrics(&mut unit).unwrap();
+        for mode in [Layout::Floating, Layout::Taskbar] {
+            panel.set_layout(mode);
+            panel
+                .update_text(&readings(sample, 999_990_000_000))
+                .unwrap();
+            let slots = mode.slots();
+            for (index, (slot, text)) in slots
+                .into_iter()
+                .zip(panel.values.iter().flatten())
+                .enumerate()
+            {
+                let mut number = Default::default();
+                let mut unit = Default::default();
+                unsafe {
+                    text.number.GetMetrics(&mut number).unwrap();
+                    text.unit.GetMetrics(&mut unit).unwrap();
+                }
+                let right = match index {
+                    0 | 1 => mode.dividers()[0].0.X,
+                    2 | 3 => mode.dividers()[1].0.X,
+                    _ => mode.size().0 as f32,
+                };
+                assert!(
+                    text.number_x >= slot.number_x,
+                    "{mode:?} reading start {index}"
+                );
+                let unit_end = text.unit_x + unit.width;
+                assert!(
+                    (unit_end - slot.number_end).abs() < 0.01,
+                    "{mode:?} right alignment"
+                );
+                assert!(unit_end + 4.0 < right, "{mode:?} column margin {index}");
+                if index < 2 {
+                    let arrow_gap = text.number_x + number.left - (text.arrow_x() + ARROW_WING);
+                    assert!((arrow_gap - ARROW_GAP).abs() < 0.01, "{mode:?} arrow gap");
+                    assert!(text.arrow_x() - ARROW_WING >= 5.0, "{mode:?} arrow margin");
+                }
+                let expected_gap = if matches!(index, 2..=4) {
+                    PERCENT_GAP
+                } else {
+                    UNIT_GAP
+                };
+                let unit_gap = text.unit_x - (text.number_x + number.left + number.width);
+                assert!((unit_gap - expected_gap).abs() < 0.01, "{mode:?} unit gap");
+                assert_eq!(number.lineCount, 1);
+                assert_eq!(unit.lineCount, 1);
             }
-            let column_end = COLUMN_EDGES.get(index / 2).copied().unwrap_or(WIDTH as f32);
-            assert!(number.width <= slot.number_end - slot.number_x);
-            assert!(slot.number_end + 4.0 + unit.width + 5.0 < column_end);
-            assert_eq!(number.lineCount, 1);
-            assert_eq!(unit.lineCount, 1);
+            for (slot, label) in slots[2..].iter().zip(&panel.labels) {
+                let mut metrics = Default::default();
+                unsafe { label.GetMetrics(&mut metrics).unwrap() };
+                assert!(
+                    slot.label_x + metrics.width <= slot.number_x + 1.0,
+                    "{mode:?} label"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn draws_both_layouts_at_175_percent_scaling() {
+        use ::windows::{
+            Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos,
+                WINDOW_EX_STYLE, WS_POPUP,
+            },
+            core::PCWSTR,
+        };
+
+        let dpi = 168;
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("Static"),
+                PCWSTR::null(),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let _window = super::super::Window(hwnd);
+        let mut panel = Panel::new().unwrap();
+        let sample = Sample {
+            upload: Some(409_000.0),
+            download: Some(26_000.0),
+            cpu: Some(9.0),
+            memory: Some(56.0),
+            disk: Some(1.0),
+            ..Default::default()
+        };
+        let readings = readings(sample, 145_060_000);
+        for mode in [Layout::Floating, Layout::Taskbar] {
+            let (width, height) = mode.size();
+            let scale = super::super::scale;
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    scale(width, dpi),
+                    scale(height, dpi),
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER,
+                )
+            }
+            .unwrap();
+            panel.set_layout(mode);
+            panel.resize(hwnd, dpi);
+            for dark in [false, true] {
+                panel.paint(hwnd, dpi, dark, &readings).unwrap();
+            }
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::{env, fs, io, path::PathBuf};
+use std::{env, fs, io, path::PathBuf, time::Duration};
 
 use ::windows::{
     Win32::{
@@ -25,7 +25,7 @@ impl Theme {
         }
     }
 
-    pub fn is_dark(self) -> bool {
+    pub fn is_dark(self, taskbar: bool) -> bool {
         match self {
             Self::System => {
                 let mut light = 1u32;
@@ -34,7 +34,11 @@ impl Theme {
                     RegGetValueW(
                         HKEY_CURRENT_USER,
                         w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
-                        w!("AppsUseLightTheme"),
+                        if taskbar {
+                            w!("SystemUsesLightTheme")
+                        } else {
+                            w!("AppsUseLightTheme")
+                        },
                         RRF_RT_REG_DWORD,
                         None,
                         Some((&mut light as *mut u32).cast()),
@@ -49,11 +53,70 @@ impl Theme {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Refresh {
+    #[default]
+    One,
+    Two,
+    Three,
+    Five,
+}
+
+impl Refresh {
+    fn parse(value: &str) -> Self {
+        match value {
+            "2" => Self::Two,
+            "3" => Self::Three,
+            "5" => Self::Five,
+            _ => Self::One,
+        }
+    }
+
+    const fn seconds(self) -> u64 {
+        match self {
+            Self::One => 1,
+            Self::Two => 2,
+            Self::Three => 3,
+            Self::Five => 5,
+        }
+    }
+
+    pub const fn interval(self) -> Duration {
+        Duration::from_secs(self.seconds())
+    }
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub enum TaskbarSide {
+    Left,
+    #[default]
+    Right,
+}
+
+impl TaskbarSide {
+    fn parse(value: &str) -> Self {
+        match value {
+            "left" => Self::Left,
+            _ => Self::Right,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Settings {
     pub traffic: u64,
     pub theme: Theme,
     pub topmost: bool,
+    pub taskbar: bool,
+    pub taskbar_side: TaskbarSide,
+    pub refresh: Refresh,
     pub position: Option<POINT>,
 }
 
@@ -63,6 +126,9 @@ impl Default for Settings {
             traffic: 0,
             theme: Theme::System,
             topmost: true,
+            taskbar: false,
+            taskbar_side: TaskbarSide::default(),
+            refresh: Refresh::default(),
             position: None,
         }
     }
@@ -81,6 +147,9 @@ impl Settings {
                         "traffic" => settings.traffic = value.parse().unwrap_or_default(),
                         "theme" => settings.theme = Theme::parse(value),
                         "topmost" => settings.topmost = value.parse().unwrap_or(true),
+                        "taskbar" => settings.taskbar = value.parse().unwrap_or(false),
+                        "taskbar_side" => settings.taskbar_side = TaskbarSide::parse(value),
+                        "refresh" => settings.refresh = Refresh::parse(value),
                         "position" => settings.position = parse_point(value),
                         _ => {}
                     }
@@ -110,8 +179,12 @@ impl Settings {
         fs::write(
             &temp,
             format!(
-                "traffic={}\ntheme={theme}\ntopmost={}\nposition={position}\n",
-                self.traffic, self.topmost
+                "traffic={}\ntheme={theme}\ntopmost={}\ntaskbar={}\ntaskbar_side={}\nrefresh={}\nposition={position}\n",
+                self.traffic,
+                self.topmost,
+                self.taskbar,
+                self.taskbar_side.as_str(),
+                self.refresh.seconds()
             ),
         )?;
         fs::rename(temp, file)

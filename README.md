@@ -1,28 +1,32 @@
-# Windows 系统监控
+# windows-monitor-x
 
-面向 Windows 10 1703 及以上和 Windows 11 x64 的双行监控浮窗。运行 `windows-monitor.exe` 即可使用。
+面向 Windows 10 1703 及以上和 Windows 11 x64 的桌面监控工具。运行 `windows-monitor-x.exe` 即可使用。程序使用当前 Windows 用户权限运行，启动时会先显示加载状态。
 
 - 浮窗默认位于主屏工作区右下角。拖动可调整位置，靠近屏幕边缘时会吸附。
-- 右键浮窗或托盘图标可切换主题、置顶、清零总流量和退出。单击托盘图标显示或隐藏浮窗。
-- CPU、内存、磁盘和网速每秒更新。硬盘显示最忙物理磁盘的活动时间比例。采样数据不可用时显示破折号。
+- 右键监控面板或托盘图标，在「设置」子菜单中调整自启、任务栏模式、置顶、刷新频率和主题。刷新间隔可选 1、2、3、5 秒，默认为 1 秒。右键主菜单还可清零总流量和退出，单击托盘图标可显示或隐藏面板。
+- 勾选「设置 → 开机自启」后，当前 Windows 用户登录时会启动监控。此项默认关闭。移动程序后可通过同一选项更新自启路径。
+- 勾选「嵌入任务栏」后，紧凑面板会对齐主屏水平任务栏的可用空位。在「设置 → 任务栏位置」可选「靠左」或「靠右」，默认靠右。任务栏空间不足、自动隐藏或垂直排列时使用浮窗。刷新间隔、任务栏模式和位置会随设置保存。
+- CPU、内存、磁盘和网速按所选间隔更新。磁盘显示最忙物理磁盘的活动时间比例。采样数据不可用时显示破折号。
 - 网速汇总在线的物理以太网和 Wi-Fi 网卡，包含局域网流量。总流量按工具运行期间的上传与下载累计，保存在 `%LOCALAPPDATA%\WindowsMonitor\state.ini`。
 
-## 构建
+## 打包
 
 Windows 上使用 Rust、MSVC Build Tools 和 Windows SDK。
 
 ```powershell
-cargo build --release --locked
+.\scripts\package.ps1
 ```
 
-产物在 `target\release\windows-monitor.exe`。
+打包脚本在 `dist` 生成「仓库名-x.exe」，EXE 的产品名称、文件描述和托盘名称使用同一名称。名称优先取 Git 的 `origin` 仓库名，没有远程时取本地仓库名。源码归档使用 Cargo 包名。仓库名已有 `-x` 或 `-X` 时统一为一个小写 `-x` 后缀。
 
 ## 验证
 
 ```powershell
 cargo test --locked
 cargo test --locked -- --ignored --nocapture
-.\scripts\smoke.ps1
+.\scripts\smoke.ps1 -Exe .\dist\windows-monitor-x.exe
 ```
 
 系统采样测试需要已启用的物理磁盘计数器。桌面冒烟测试需要登录到 Windows 桌面，覆盖浮窗尺寸、常用菜单操作、单实例、设置持久化与资源占用。
+
+桌面解锁且主屏水平任务栏有足够空位时，可运行 `.\scripts\smoke.ps1 -RequireTaskbar` 验证嵌入、重启恢复和退出嵌入。

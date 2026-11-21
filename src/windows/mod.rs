@@ -1,10 +1,12 @@
 mod panel;
 mod sampler;
+mod startup;
 mod state;
+mod taskbar;
 
 use std::{
     cell::RefCell,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex, OnceLock, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -16,7 +18,7 @@ use ::windows::{
             HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
         },
         Graphics::Gdi::{
-            BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, GetMonitorInfoW, HGDIOBJ,
+            BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, GetMonitorInfoW, HDC, HGDIOBJ,
             InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, PAINTSTRUCT,
             SetWindowRgn, UpdateWindow,
         },
@@ -34,19 +36,21 @@ use ::windows::{
 };
 
 use crate::model::{Reading, Sample, readings};
-use panel::Panel;
+use panel::{Layout, Panel};
 use sampler::Sampler;
-use state::{Settings, Theme};
+use state::{Refresh, Settings, TaskbarSide, Theme};
+use taskbar::{Placement, Taskbar};
 
 const CLASS: PCWSTR = w!("WindowsMonitor.Panel");
-const TITLE: PCWSTR = w!("系统监控");
+const PRODUCT_NAME: &str = env!("WINDOWS_MONITOR_PRODUCT_NAME");
 const SAMPLE_READY: u32 = WM_APP + 1;
 const TRAY_EVENT: u32 = WM_APP + 2;
 const REVEAL_WINDOW: u32 = WM_APP + 3;
+const DOCK_READY: u32 = WM_APP + 4;
 const TRAY_ID: u32 = 1;
 const ICON_ID: PCWSTR = PCWSTR(101usize as *const u16);
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
-const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const DOCK_INTERVAL: Duration = Duration::from_secs(1);
 const SAVE_INTERVAL: Duration = Duration::from_secs(60);
 
 const TOGGLE: usize = 101;
@@ -56,15 +60,38 @@ const LIGHT: usize = 104;
 const DARK: usize = 105;
 const RESET_TRAFFIC: usize = 106;
 const EXIT: usize = 107;
+const DOCK: usize = 108;
+const AUTOSTART: usize = 113;
+const DOCK_LEFT: usize = 114;
+const DOCK_RIGHT: usize = 115;
+const REFRESH_OPTIONS: [(usize, Refresh, PCWSTR); 4] = [
+    (109, Refresh::One, w!("1 秒")),
+    (110, Refresh::Two, w!("2 秒")),
+    (111, Refresh::Three, w!("3 秒")),
+    (112, Refresh::Five, w!("5 秒")),
+];
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
-type Feed = Arc<Mutex<Option<Sample>>>;
+#[derive(Default)]
+struct Mailbox {
+    sample: Option<Sample>,
+    dock: Option<(u64, Placement)>,
+}
+
+type Feed = Arc<Mutex<Mailbox>>;
+
+enum WorkerCommand {
+    Interval(Refresh),
+    Dock(Option<u64>, TaskbarSide),
+    RecheckDock,
+    Stop,
+}
 
 struct App {
-    panel: Panel,
+    panel: Option<Panel>,
     settings: Settings,
     dark: bool,
     dpi: u32,
@@ -72,16 +99,27 @@ struct App {
     tray_ready: bool,
     taskbar_created: u32,
     feed: Feed,
+    worker: mpsc::Sender<WorkerCommand>,
+    shown: bool,
+    dock_generation: u64,
+    placement: Placement,
     sample: Sample,
+    waiting_sample: bool,
     displayed: [Reading; 6],
     starting_traffic: u64,
     traffic_at_reset: u64,
     last_save: Instant,
+    save_pending: bool,
     paint_error: Option<Error>,
 }
 
 impl App {
-    fn new(settings: Settings, icon: HICON, feed: Feed) -> Result<Self> {
+    fn new(
+        settings: Settings,
+        icon: HICON,
+        feed: Feed,
+        worker: mpsc::Sender<WorkerCommand>,
+    ) -> Self {
         let mut tray = NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
             uID: TRAY_ID,
@@ -90,32 +128,69 @@ impl App {
             hIcon: icon,
             ..Default::default()
         };
-        for (dst, src) in tray.szTip.iter_mut().zip("系统监控".encode_utf16()) {
+        for (dst, src) in tray.szTip[..127]
+            .iter_mut()
+            .zip(PRODUCT_NAME.encode_utf16())
+        {
             *dst = src;
         }
         let sample = Sample::default();
-        Ok(Self {
-            panel: Panel::new()?,
+        Self {
+            panel: None,
             settings,
-            dark: settings.theme.is_dark(),
+            dark: settings.theme.is_dark(false),
             dpi: 96,
             tray,
             tray_ready: false,
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             feed,
+            worker,
+            shown: true,
+            dock_generation: 0,
+            placement: Placement::Floating,
             sample,
+            waiting_sample: true,
             displayed: readings(sample, settings.traffic),
             starting_traffic: settings.traffic,
             traffic_at_reset: 0,
             last_save: Instant::now(),
+            save_pending: false,
             paint_error: None,
-        })
+        }
     }
 
-    fn take_sample(&mut self) {
-        if let Some(sample) = self.feed.lock().unwrap().take() {
+    fn take_sample(&mut self) -> bool {
+        if let Some(sample) = self.feed.lock().unwrap().sample.take() {
             self.sample = sample;
+            return std::mem::replace(&mut self.waiting_sample, false);
         }
+        false
+    }
+
+    fn layout(&self) -> Layout {
+        if matches!(self.placement, Placement::Docked(_)) {
+            Layout::Taskbar
+        } else {
+            Layout::Floating
+        }
+    }
+
+    fn request_dock(&mut self) {
+        self.dock_generation = self.dock_generation.wrapping_add(1);
+        let generation = self.settings.taskbar.then_some(self.dock_generation);
+        let _ = self
+            .worker
+            .send(WorkerCommand::Dock(generation, self.settings.taskbar_side));
+    }
+
+    fn refresh_theme(&mut self) -> bool {
+        let dark = self
+            .settings
+            .theme
+            .is_dark(self.layout() == Layout::Taskbar);
+        let changed = dark != self.dark;
+        self.dark = dark;
+        changed
     }
 
     fn total(&self) -> u64 {
@@ -138,7 +213,8 @@ impl App {
             traffic,
             ..self.settings
         };
-        if settings.save().is_ok() {
+        self.save_pending = settings.save().is_err();
+        if !self.save_pending {
             self.settings.traffic = traffic;
         }
         self.last_save = Instant::now();
@@ -153,60 +229,138 @@ impl App {
         }
     }
 
-    fn paint(&mut self, hwnd: HWND) {
-        let mut painted = self.panel.paint(hwnd, self.dpi, self.dark, &self.displayed);
+    fn resize_panel(&mut self, hwnd: HWND) {
+        if let Some(panel) = &mut self.panel {
+            panel.resize(hwnd, self.dpi);
+        }
+    }
+
+    fn paint(&mut self, hwnd: HWND, dc: HDC) {
+        if self.waiting_sample {
+            panel::paint_starting(hwnd, dc, self.dpi, self.dark);
+            return;
+        }
+
+        let initializing = self.panel.is_none();
+        let result = self.paint_metrics(hwnd);
+        if initializing {
+            self.paint_error = result.err();
+        }
+    }
+
+    fn paint_metrics(&mut self, hwnd: HWND) -> Result<()> {
+        if self.panel.is_none() {
+            let mut panel = Panel::new()?;
+            panel.set_layout(self.layout());
+            self.panel = Some(panel);
+        }
+        let panel = self.panel.as_mut().expect("panel initialized");
+        let mut painted = panel.paint(hwnd, self.dpi, self.dark, &self.displayed);
         if painted
             .as_ref()
             .is_err_and(|error| error.code() == D2DERR_RECREATE_TARGET)
         {
-            painted = self.panel.paint(hwnd, self.dpi, self.dark, &self.displayed);
+            painted = panel.paint(hwnd, self.dpi, self.dark, &self.displayed);
         }
-        self.paint_error = painted.err();
+        painted
     }
 }
 
 struct SamplerWorker {
-    stop: mpsc::Sender<()>,
+    control: mpsc::Sender<WorkerCommand>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl SamplerWorker {
-    fn start(hwnd: HWND, feed: Feed) -> std::io::Result<Self> {
+    fn start(
+        hwnd: HWND,
+        feed: Feed,
+        settings: Settings,
+        (control, commands): (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerCommand>),
+    ) -> std::io::Result<Self> {
         let handle = hwnd.0 as usize;
-        let (stop, stopped) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("monitor-sampler".into())
             .spawn(move || {
                 let hwnd = HWND(handle as *mut _);
                 let mut sampler = Sampler::new();
+                let mut last_sample = Instant::now();
+                let mut next_sample = last_sample;
+                let mut interval = settings.refresh.interval();
+                let mut dock = settings.taskbar.then_some((0, next_sample));
+                let mut taskbar_side = settings.taskbar_side;
+                let mut taskbar = None;
+                let mut last_placement = None;
                 loop {
-                    let next = Instant::now() + SAMPLE_INTERVAL;
-                    let sample = sampler.poll();
-                    let should_notify = feed.lock().unwrap().replace(sample).is_none();
-                    if should_notify
-                        && unsafe { PostMessageW(Some(hwnd), SAMPLE_READY, WPARAM(0), LPARAM(0)) }
-                            .is_err()
-                    {
-                        break;
+                    let now = Instant::now();
+                    if now >= next_sample {
+                        last_sample = now;
+                        next_sample = now + interval;
+                        let sample = sampler.poll(interval);
+                        let pending = feed.lock().unwrap().sample.replace(sample).is_some();
+                        if !pending && !notify(hwnd, SAMPLE_READY) {
+                            break;
+                        }
                     }
-                    if !matches!(
-                        stopped.recv_timeout(next.saturating_duration_since(Instant::now())),
-                        Err(mpsc::RecvTimeoutError::Timeout)
-                    ) {
-                        break;
+                    if let Some((generation, deadline)) = dock
+                        && now >= deadline
+                    {
+                        if taskbar.is_none() {
+                            taskbar = Taskbar::new().ok();
+                        }
+                        let placement = taskbar
+                            .as_mut()
+                            .map_or(Placement::Floating, |bar| bar.placement(hwnd, taskbar_side));
+                        if last_placement != Some(placement) {
+                            last_placement = Some(placement);
+                            let pending = feed
+                                .lock()
+                                .unwrap()
+                                .dock
+                                .replace((generation, placement))
+                                .is_some();
+                            if !pending && !notify(hwnd, DOCK_READY) {
+                                break;
+                            }
+                        }
+                        dock = Some((generation, Instant::now() + DOCK_INTERVAL));
+                    }
+                    let wake = dock.map_or(next_sample, |(_, deadline)| deadline.min(next_sample));
+                    match commands.recv_timeout(wake.saturating_duration_since(Instant::now())) {
+                        Ok(WorkerCommand::Interval(refresh)) => {
+                            interval = refresh.interval();
+                            next_sample = last_sample + interval;
+                        }
+                        Ok(WorkerCommand::Dock(generation, side)) => {
+                            taskbar_side = side;
+                            dock = generation.map(|id| (id, Instant::now()));
+                            if dock.is_none() {
+                                taskbar = None;
+                            }
+                            last_placement = None;
+                        }
+                        Ok(WorkerCommand::RecheckDock) => {
+                            dock = dock.map(|(id, _)| (id, Instant::now()));
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        _ => break,
                     }
                 }
             })?;
         Ok(Self {
-            stop,
+            control,
             thread: Some(thread),
         })
     }
 }
 
+fn notify(hwnd: HWND, message: u32) -> bool {
+    unsafe { PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(0)) }.is_ok()
+}
+
 impl Drop for SamplerWorker {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
+        let _ = self.control.send(WorkerCommand::Stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -248,46 +402,57 @@ pub fn run() -> Result<()> {
     let feed = Feed::default();
     let module = unsafe { HINSTANCE(GetModuleHandleW(PCWSTR::null())?.0) };
     let icon = unsafe { LoadIconW(Some(module), ICON_ID)? };
-    let app = App::new(settings, icon, feed.clone())?;
+    let worker = mpsc::channel();
+    let app = App::new(settings, icon, feed.clone(), worker.0.clone());
     APP.with(|state| *state.borrow_mut() = Some(app));
 
-    let window = Window(create_window(module, icon, settings.position)?);
+    let window = Window(create_window(CLASS, module, icon, settings.position)?);
     let hwnd = window.0;
-    let dpi = window_dpi(hwnd);
-    with_app(|app| {
-        app.dpi = dpi;
-        app.add_tray(hwnd);
-    });
-    place(hwnd, settings.position, dpi, false);
-    set_topmost(hwnd, settings.topmost);
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        let _ = UpdateWindow(hwnd);
-    }
-    if let Some(error) = with_app(|app| app.paint_error.take()).flatten() {
-        return Err(error);
-    }
+    let _ = show_starting_panel(hwnd);
 
-    let _sampler = SamplerWorker::start(hwnd, feed).map_err(Error::from)?;
+    let _sampler = SamplerWorker::start(hwnd, feed, settings, worker).map_err(Error::from)?;
+    with_app(|app| app.add_tray(hwnd));
     let mut message = MSG::default();
     loop {
         match unsafe { GetMessageW(&mut message, None, 0, 0) }.0 {
             -1 => return Err(Error::from_thread()),
             0 => return Ok(()),
-            _ => unsafe {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
-            },
+            _ => {
+                unsafe {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+                if let Some(error) = with_app(|app| app.paint_error.take()).flatten() {
+                    return Err(error);
+                }
+            }
         }
     }
 }
 
-pub fn show_error(error: &Error) {
-    let message = HSTRING::from(format!("系统监控启动失败。\n\n{error}"));
-    unsafe { MessageBoxW(None, &message, TITLE, MB_OK | MB_ICONERROR) };
+fn app_title() -> &'static HSTRING {
+    static TITLE: OnceLock<HSTRING> = OnceLock::new();
+    TITLE.get_or_init(|| HSTRING::from(PRODUCT_NAME))
 }
 
-fn create_window(module: HINSTANCE, icon: HICON, requested: Option<POINT>) -> Result<HWND> {
+pub fn show_error(error: &Error) {
+    let message = HSTRING::from(format!("系统监控启动失败。\n\n{error}"));
+    unsafe { MessageBoxW(None, &message, app_title(), MB_OK | MB_ICONERROR) };
+}
+
+fn show_starting_panel(hwnd: HWND) -> bool {
+    let dpi = window_dpi(hwnd);
+    with_app(|app| app.dpi = dpi);
+    apply_placement(hwnd);
+    unsafe { UpdateWindow(hwnd).as_bool() }
+}
+
+fn create_window(
+    class_name: PCWSTR,
+    module: HINSTANCE,
+    icon: HICON,
+    requested: Option<POINT>,
+) -> Result<HWND> {
     let position = requested.unwrap_or_default();
     unsafe {
         let class = WNDCLASSEXW {
@@ -298,21 +463,22 @@ fn create_window(module: HINSTANCE, icon: HICON, requested: Option<POINT>) -> Re
             hIcon: icon,
             hIconSm: icon,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            lpszClassName: CLASS,
+            lpszClassName: class_name,
             ..Default::default()
         };
         if RegisterClassExW(&class) == 0 {
             return Err(Error::from_thread());
         }
+        let (width, height) = Layout::Floating.size();
         CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            CLASS,
-            TITLE,
+            class_name,
+            app_title(),
             WS_POPUP,
             position.x,
             position.y,
-            panel::WIDTH,
-            panel::HEIGHT,
+            width,
+            height,
             None,
             None,
             Some(module),
@@ -334,52 +500,58 @@ unsafe extern "system" fn window_proc(
     match msg {
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
-            unsafe { BeginPaint(hwnd, &mut paint) };
-            with_app(|app| app.paint(hwnd));
+            let dc = unsafe { BeginPaint(hwnd, &mut paint) };
+            with_app(|app| app.paint(hwnd, dc));
             let _ = unsafe { EndPaint(hwnd, &paint) };
         }
         WM_ERASEBKGND => return LRESULT(1),
-        WM_NCHITTEST => return LRESULT(HTCAPTION as isize),
+        WM_NCHITTEST => {
+            let hit = if with_app(|app| app.layout()) == Some(Layout::Taskbar) {
+                HTCLIENT
+            } else {
+                HTCAPTION
+            };
+            return LRESULT(hit as isize);
+        }
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_SIZE => {
-            with_app(|app| app.panel.resize(hwnd, app.dpi));
+            with_app(|app| app.resize_panel(hwnd));
         }
         WM_DPICHANGED => {
             let dpi = (wparam.0 & 0xffff) as u32;
             let suggested = unsafe { &*(lparam.0 as *const RECT) };
-            with_app(|app| {
+            let layout = with_app(|app| {
                 app.dpi = dpi;
-                app.panel.resize(hwnd, dpi);
-            });
+                app.resize_panel(hwnd);
+                app.layout()
+            })
+            .unwrap_or_default();
+            let (width, height) = layout.size();
             let _ = unsafe {
                 SetWindowPos(
                     hwnd,
                     None,
                     suggested.left,
                     suggested.top,
-                    scale(panel::WIDTH, dpi),
-                    scale(panel::HEIGHT, dpi),
+                    scale(width, dpi),
+                    scale(height, dpi),
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 )
             };
-            round_window(hwnd, dpi);
+            round_window(hwnd, dpi, layout.radius());
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
-            if let Some((changed, position)) = with_app(|app| {
-                let dark = app.settings.theme.is_dark();
-                let changed = dark != app.dark;
-                app.dark = dark;
-                (changed, app.settings.position)
-            }) {
-                if changed {
-                    invalidate(hwnd);
-                }
-                if msg == WM_DISPLAYCHANGE || wparam.0 == SPI_SETWORKAREA.0 as usize {
-                    place(hwnd, position, window_dpi(hwnd), false);
-                }
+            if with_app(|app| app.refresh_theme()) == Some(true) {
+                invalidate(hwnd);
+            }
+            if msg == WM_DISPLAYCHANGE || wparam.0 == SPI_SETWORKAREA.0 as usize {
+                recheck_placement(hwnd);
             }
         }
         WM_EXITSIZEMOVE => {
+            if with_app(|app| app.layout()) == Some(Layout::Taskbar) {
+                return LRESULT(0);
+            }
             let mut rect = RECT::default();
             if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() {
                 let position = POINT {
@@ -403,19 +575,38 @@ unsafe extern "system" fn window_proc(
         WM_COMMAND => command(hwnd, wparam.0 & 0xffff),
         SAMPLE_READY => {
             let changed = with_app(|app| {
-                app.take_sample();
-                if app.last_save.elapsed() >= SAVE_INTERVAL && app.total() != app.settings.traffic {
+                let first_sample = app.take_sample();
+                if app.save_pending
+                    || (app.last_save.elapsed() >= SAVE_INTERVAL
+                        && app.total() != app.settings.traffic)
+                {
                     app.save();
                 }
-                app.update_display()
+                app.update_display() || first_sample
             });
             if changed == Some(true) && unsafe { IsWindowVisible(hwnd).as_bool() } {
                 invalidate(hwnd);
             }
         }
+        DOCK_READY => {
+            let applied = with_app(|app| {
+                let latest = app.feed.lock().unwrap().dock.take();
+                if let Some((generation, placement)) = latest
+                    && app.settings.taskbar
+                    && app.dock_generation == generation
+                {
+                    app.placement = placement;
+                    return true;
+                }
+                false
+            });
+            if applied == Some(true) {
+                apply_placement(hwnd);
+            }
+        }
         REVEAL_WINDOW => {
-            let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
-            invalidate(hwnd);
+            with_app(|app| app.shown = true);
+            apply_visibility(hwnd);
         }
         WM_CLOSE => {
             let _ = unsafe { DestroyWindow(hwnd) };
@@ -443,11 +634,14 @@ unsafe extern "system" fn window_proc(
             {
                 let ready = with_app(|app| {
                     app.add_tray(hwnd);
+                    if !app.tray_ready {
+                        app.shown = true;
+                    }
                     app.tray_ready
                 });
-                if ready == Some(false) {
-                    let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
-                    invalidate(hwnd);
+                if ready.is_some() {
+                    recheck_placement(hwnd);
+                    apply_visibility(hwnd);
                 }
             } else {
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
@@ -455,6 +649,95 @@ unsafe extern "system" fn window_proc(
         }
     }
     LRESULT(0)
+}
+
+fn apply_placement(hwnd: HWND) {
+    let Some((placement, position, topmost, layout)) = with_app(|app| {
+        let layout = app.layout();
+        if let Some(panel) = &mut app.panel {
+            panel.set_layout(layout);
+        }
+        app.refresh_theme();
+        (
+            app.placement,
+            app.settings.position,
+            app.settings.topmost,
+            layout,
+        )
+    }) else {
+        return;
+    };
+    let shadow_changed = set_panel_shadow(hwnd, layout == Layout::Floating);
+    match placement {
+        Placement::Floating => {
+            place(hwnd, position, window_dpi(hwnd), false);
+            set_topmost(hwnd, topmost);
+        }
+        Placement::Docked(rect) => {
+            let _ = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOACTIVATE,
+                )
+            };
+            round_window(hwnd, window_dpi(hwnd), layout.radius());
+        }
+        Placement::Hidden => {}
+    }
+    if shadow_changed {
+        let _ = unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+            )
+        };
+    }
+    apply_visibility(hwnd);
+}
+
+fn set_panel_shadow(hwnd: HWND, enabled: bool) -> bool {
+    unsafe {
+        let style = GetClassLongPtrW(hwnd, GCL_STYLE);
+        let shadow = CS_DROPSHADOW.0 as usize;
+        let updated = if enabled {
+            style | shadow
+        } else {
+            style & !shadow
+        };
+        updated != style && SetClassLongPtrW(hwnd, GCL_STYLE, updated as isize) != 0
+    }
+}
+
+fn apply_visibility(hwnd: HWND) {
+    let shown = with_app(|app| app.shown && app.placement != Placement::Hidden) == Some(true);
+    if shown != unsafe { IsWindowVisible(hwnd).as_bool() } {
+        let _ = unsafe { ShowWindow(hwnd, if shown { SW_SHOWNOACTIVATE } else { SW_HIDE }) };
+    }
+    if shown {
+        invalidate(hwnd);
+    }
+}
+
+fn recheck_placement(hwnd: HWND) {
+    let dock = with_app(|app| {
+        if app.settings.taskbar {
+            let _ = app.worker.send(WorkerCommand::RecheckDock);
+        }
+        app.settings.taskbar
+    });
+    if dock == Some(false) {
+        apply_placement(hwnd);
+    }
 }
 
 fn window_dpi(hwnd: HWND) -> u32 {
@@ -467,7 +750,8 @@ fn scale(dip: i32, dpi: u32) -> i32 {
 }
 
 fn place(hwnd: HWND, requested: Option<POINT>, dpi: u32, snap: bool) -> Option<POINT> {
-    let (width, height) = (scale(panel::WIDTH, dpi), scale(panel::HEIGHT, dpi));
+    let (width, height) = Layout::Floating.size();
+    let (width, height) = (scale(width, dpi), scale(height, dpi));
     let reference = requested
         .map(|position| POINT {
             x: position.x.saturating_add(width / 2),
@@ -514,7 +798,7 @@ fn place(hwnd: HWND, requested: Option<POINT>, dpi: u32, snap: bool) -> Option<P
         )
         .ok()?;
     }
-    round_window(hwnd, window_dpi(hwnd));
+    round_window(hwnd, window_dpi(hwnd), Layout::Floating.radius());
     Some(position)
 }
 
@@ -531,11 +815,11 @@ fn snap_coordinate(value: i32, min: i32, max: i32, margin: i32) -> i32 {
     }
 }
 
-fn round_window(hwnd: HWND, dpi: u32) {
+fn round_window(hwnd: HWND, dpi: u32, radius: i32) {
     let mut rect = RECT::default();
     unsafe {
         if GetClientRect(hwnd, &mut rect).is_ok() {
-            let diameter = scale(panel::RADIUS * 2, dpi);
+            let diameter = scale(radius * 2, dpi);
             let region =
                 CreateRoundRectRgn(0, 0, rect.right + 1, rect.bottom + 1, diameter, diameter);
             if !region.is_invalid() && SetWindowRgn(hwnd, Some(region), true) == 0 {
@@ -581,6 +865,29 @@ fn message_point(value: LPARAM) -> POINT {
 }
 
 struct Menu(HMENU);
+
+impl Menu {
+    fn new() -> Result<Self> {
+        Ok(Self(unsafe { CreatePopupMenu()? }))
+    }
+
+    fn item(&self, id: usize, label: PCWSTR, flags: MENU_ITEM_FLAGS) -> Result<()> {
+        unsafe { AppendMenuW(self.0, MF_STRING | flags, id, label) }
+    }
+
+    fn separator(&self) -> Result<()> {
+        unsafe { AppendMenuW(self.0, MF_SEPARATOR, 0, PCWSTR::null()) }
+    }
+
+    fn submenu(&self, label: PCWSTR, child: Self) -> Result<()> {
+        let handle = child.0;
+        unsafe { AppendMenuW(self.0, MF_POPUP | MF_STRING, handle.0 as usize, label)? };
+        // The parent menu now owns the submenu.
+        std::mem::forget(child);
+        Ok(())
+    }
+}
+
 impl Drop for Menu {
     fn drop(&mut self) {
         let _ = unsafe { DestroyMenu(self.0) };
@@ -588,11 +895,18 @@ impl Drop for Menu {
 }
 
 fn open_menu(hwnd: HWND, at: POINT) {
-    let Some((settings, tray_ready)) = with_app(|app| (app.settings, app.tray_ready)) else {
+    let Some((settings, tray_ready, shown, placement)) =
+        with_app(|app| (app.settings, app.tray_ready, app.shown, app.placement))
+    else {
         return;
     };
-    let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
-    if let Ok(menu) = make_menu(settings, tray_ready, visible) {
+    if let Ok(menu) = make_menu(
+        settings,
+        tray_ready,
+        shown,
+        placement,
+        startup::status().ok(),
+    ) {
         let selection = unsafe {
             let _ = SetForegroundWindow(hwnd);
             let result = TrackPopupMenu(
@@ -611,60 +925,137 @@ fn open_menu(hwnd: HWND, at: POINT) {
     }
 }
 
-fn make_menu(settings: Settings, tray_ready: bool, visible: bool) -> Result<Menu> {
-    let menu = Menu(unsafe { CreatePopupMenu()? });
+fn make_menu(
+    settings: Settings,
+    tray_ready: bool,
+    shown: bool,
+    placement: Placement,
+    startup: Option<startup::Status>,
+) -> Result<Menu> {
+    let menu = Menu::new()?;
+    let visibility = if shown {
+        w!("隐藏监控")
+    } else {
+        w!("显示监控")
+    };
+    let available = if tray_ready { MF_ENABLED } else { MF_GRAYED };
+    menu.item(TOGGLE, visibility, available)?;
+    menu.submenu(
+        w!("设置"),
+        make_settings_menu(settings, placement, startup)?,
+    )?;
+    menu.separator()?;
+    menu.item(RESET_TRAFFIC, w!("清零总流量"), MF_ENABLED)?;
+    menu.item(EXIT, w!("退出"), MF_ENABLED)?;
+    Ok(menu)
+}
+
+fn make_settings_menu(
+    settings: Settings,
+    placement: Placement,
+    startup: Option<startup::Status>,
+) -> Result<Menu> {
+    let menu = Menu::new()?;
     let checked = |condition| if condition { MF_CHECKED } else { MF_UNCHECKED };
-    unsafe {
-        let visibility = if visible {
-            w!("隐藏浮窗")
-        } else {
-            w!("显示浮窗")
-        };
-        let available = if tray_ready { MF_ENABLED } else { MF_GRAYED };
-        AppendMenuW(menu.0, MF_STRING | available, TOGGLE, visibility)?;
-        AppendMenuW(
-            menu.0,
-            MF_STRING | checked(settings.topmost),
-            TOPMOST,
-            w!("窗口置顶"),
-        )?;
-        AppendMenuW(menu.0, MF_SEPARATOR, 0, PCWSTR::null())?;
-        AppendMenuW(
-            menu.0,
-            MF_STRING | checked(settings.theme == Theme::System),
-            FOLLOW_SYSTEM,
-            w!("跟随系统"),
-        )?;
-        AppendMenuW(
-            menu.0,
-            MF_STRING | checked(settings.theme == Theme::Light),
-            LIGHT,
-            w!("浅色"),
-        )?;
-        AppendMenuW(
-            menu.0,
-            MF_STRING | checked(settings.theme == Theme::Dark),
-            DARK,
-            w!("深色"),
-        )?;
-        AppendMenuW(menu.0, MF_SEPARATOR, 0, PCWSTR::null())?;
-        AppendMenuW(menu.0, MF_STRING, RESET_TRAFFIC, w!("清零总流量"))?;
-        AppendMenuW(menu.0, MF_STRING, EXIT, w!("退出"))?;
+    let startup_label = if startup == Some(startup::Status::OtherPath) {
+        w!("开机自启（更新路径）")
+    } else {
+        w!("开机自启")
+    };
+    let docked = matches!(placement, Placement::Docked(_));
+    let dock_label = if settings.taskbar && placement == Placement::Floating {
+        w!("嵌入任务栏（等候空位）")
+    } else {
+        w!("嵌入任务栏")
+    };
+    let topmost = if docked { MF_GRAYED } else { MF_ENABLED };
+    menu.item(
+        AUTOSTART,
+        startup_label,
+        checked(startup == Some(startup::Status::Enabled)),
+    )?;
+    menu.item(DOCK, dock_label, checked(settings.taskbar))?;
+    menu.item(
+        TOPMOST,
+        w!("窗口置顶"),
+        topmost | checked(settings.topmost || docked),
+    )?;
+    menu.separator()?;
+
+    let refresh = Menu::new()?;
+    for (id, interval, label) in REFRESH_OPTIONS {
+        refresh.item(id, label, checked(settings.refresh == interval))?;
     }
+    menu.submenu(w!("刷新频率"), refresh)?;
+
+    let theme = Menu::new()?;
+    for (id, choice, label) in [
+        (FOLLOW_SYSTEM, Theme::System, w!("跟随系统")),
+        (LIGHT, Theme::Light, w!("浅色")),
+        (DARK, Theme::Dark, w!("深色")),
+    ] {
+        theme.item(id, label, checked(settings.theme == choice))?;
+    }
+    menu.submenu(w!("主题"), theme)?;
+
+    let taskbar_position = Menu::new()?;
+    taskbar_position.item(
+        DOCK_LEFT,
+        w!("靠左"),
+        checked(settings.taskbar_side == TaskbarSide::Left),
+    )?;
+    taskbar_position.item(
+        DOCK_RIGHT,
+        w!("靠右"),
+        checked(settings.taskbar_side == TaskbarSide::Right),
+    )?;
+    menu.submenu(w!("任务栏位置"), taskbar_position)?;
     Ok(menu)
 }
 
 fn command(hwnd: HWND, selection: usize) {
     match selection {
-        TOGGLE => {
-            if with_app(|app| app.tray_ready) == Some(true) {
-                let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
-                let _ =
-                    unsafe { ShowWindow(hwnd, if visible { SW_HIDE } else { SW_SHOWNOACTIVATE }) };
-                if !visible {
-                    invalidate(hwnd);
-                }
+        AUTOSTART => {
+            if let Err(error) = startup::toggle() {
+                let message = HSTRING::from(format!("无法更改开机自启设置。\n\n{error}"));
+                unsafe { MessageBoxW(Some(hwnd), &message, app_title(), MB_OK | MB_ICONWARNING) };
             }
+        }
+        TOGGLE => {
+            let changed = with_app(|app| {
+                if app.tray_ready {
+                    app.shown = !app.shown;
+                }
+                app.tray_ready
+            });
+            if changed == Some(true) {
+                apply_visibility(hwnd);
+            }
+        }
+        DOCK => {
+            with_app(|app| {
+                app.settings.taskbar = !app.settings.taskbar;
+                app.request_dock();
+                app.placement = Placement::Floating;
+                app.save();
+            });
+            apply_placement(hwnd);
+        }
+        DOCK_LEFT | DOCK_RIGHT => {
+            let side = if selection == DOCK_LEFT {
+                TaskbarSide::Left
+            } else {
+                TaskbarSide::Right
+            };
+            with_app(|app| {
+                if app.settings.taskbar_side != side {
+                    app.settings.taskbar_side = side;
+                    if app.settings.taskbar {
+                        app.request_dock();
+                    }
+                    app.save();
+                }
+            });
         }
         TOPMOST => {
             if let Some(topmost) = with_app(|app| {
@@ -682,7 +1073,7 @@ fn command(hwnd: HWND, selection: usize) {
                     DARK => Theme::Dark,
                     _ => Theme::System,
                 };
-                app.dark = app.settings.theme.is_dark();
+                app.refresh_theme();
                 app.save();
             });
             invalidate(hwnd);
@@ -700,6 +1091,158 @@ fn command(hwnd: HWND, selection: usize) {
         EXIT => {
             let _ = unsafe { DestroyWindow(hwnd) };
         }
-        _ => {}
+        _ => {
+            if let Some((_, interval, _)) = REFRESH_OPTIONS
+                .into_iter()
+                .find(|(id, _, _)| *id == selection)
+            {
+                with_app(|app| {
+                    app.settings.refresh = interval;
+                    let _ = app.worker.send(WorkerCommand::Interval(interval));
+                    app.save();
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shows_feedback_before_sampling_with_saved_taskbar_mode() {
+        let settings = Settings {
+            taskbar: true,
+            ..Default::default()
+        };
+        let feed = Feed::default();
+        let (sender, _commands) = mpsc::channel();
+        let module = unsafe { HINSTANCE(GetModuleHandleW(PCWSTR::null()).unwrap().0) };
+        let icon = unsafe { LoadIconW(None, IDI_APPLICATION).unwrap() };
+        let started = Instant::now();
+        APP.with(|state| {
+            *state.borrow_mut() = Some(App::new(settings, icon, feed.clone(), sender))
+        });
+        let window = Window(
+            create_window(
+                w!("WindowsMonitor.StartupTest"),
+                module,
+                icon,
+                settings.position,
+            )
+            .unwrap(),
+        );
+        let painted = show_starting_panel(window.0);
+        let visible = unsafe { IsWindowVisible(window.0).as_bool() };
+        let status_visible = with_app(|app| app.waiting_sample && app.panel.is_none());
+        let elapsed = started.elapsed();
+
+        feed.lock().unwrap().sample = Some(Sample {
+            memory: Some(50.0),
+            ..Default::default()
+        });
+        unsafe {
+            window_proc(window.0, SAMPLE_READY, WPARAM(0), LPARAM(0));
+            let _ = UpdateWindow(window.0);
+        }
+        let metrics_visible =
+            with_app(|app| !app.waiting_sample && app.panel.is_some() && app.paint_error.is_none());
+
+        // This test owns a separate window and leaves the user's settings file alone.
+        APP.with(|state| state.borrow_mut().take());
+        assert!(painted && visible);
+        assert_eq!(status_visible, Some(true));
+        assert_eq!(metrics_visible, Some(true));
+        eprintln!(
+            "Initial window painted in {} ms before sampling",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn settings_menu_groups_preferences_and_shows_current_choices() {
+        let settings = Settings {
+            refresh: Refresh::Three,
+            theme: Theme::Dark,
+            ..Default::default()
+        };
+        let menu = make_menu(
+            settings,
+            true,
+            true,
+            Placement::Floating,
+            Some(startup::Status::Enabled),
+        )
+        .unwrap();
+        unsafe {
+            assert_eq!(GetMenuItemCount(Some(menu.0)), 5);
+            assert_eq!(GetMenuItemID(menu.0, 0), TOGGLE as u32);
+            let settings = GetSubMenu(menu.0, 1);
+            assert!(!settings.is_invalid());
+            let refresh = GetSubMenu(settings, 4);
+            let theme = GetSubMenu(settings, 5);
+            let position = GetSubMenu(settings, 6);
+            assert!(!refresh.is_invalid());
+            assert!(!theme.is_invalid());
+            assert!(!position.is_invalid());
+            for (submenu, command) in [
+                (settings, AUTOSTART),
+                (refresh, 111),
+                (theme, DARK),
+                (position, DOCK_RIGHT),
+            ] {
+                let flags = GetMenuState(submenu, command as u32, MF_BYCOMMAND);
+                assert_ne!(flags, u32::MAX);
+                assert_ne!(flags & MF_CHECKED.0, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn changing_interval_reschedules_the_running_sampler() {
+        let window = Window(
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("Static"),
+                    PCWSTR::null(),
+                    WINDOW_STYLE::default(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .unwrap(),
+        );
+        let settings = Settings {
+            refresh: Refresh::Three,
+            ..Default::default()
+        };
+        let feed = Feed::default();
+        let command = mpsc::channel();
+        let sender = command.0.clone();
+        let _worker = SamplerWorker::start(window.0, feed.clone(), settings, command).unwrap();
+        let wait_for_sample = || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if feed.lock().unwrap().sample.take().is_some() {
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        assert!(wait_for_sample());
+        sender.send(WorkerCommand::Interval(Refresh::Five)).unwrap();
+        thread::sleep(Duration::from_millis(2200));
+        assert!(feed.lock().unwrap().sample.is_none());
+        sender.send(WorkerCommand::Interval(Refresh::Two)).unwrap();
+        assert!(wait_for_sample());
     }
 }
