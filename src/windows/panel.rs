@@ -39,6 +39,8 @@ const UNIT_GAP: f32 = 4.0;
 const PERCENT_GAP: f32 = 2.5;
 const ARROW_WING: f32 = 3.7;
 const ARROW_GAP: f32 = 6.5;
+const MIN_ARROW_GAP: f32 = 3.0;
+const MIN_ARROW_INSET: f32 = 5.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Layout {
@@ -87,6 +89,7 @@ impl Layout {
                 (Self::Floating, true, _) => (178, 17.0, 76.0, 159.0),
                 (Self::Taskbar, true, _) => (162, 13.0, 70.0, 149.0),
                 (Self::Floating, false, true) => (112, 0.0, 25.0, 99.0),
+                (Self::Taskbar, false, true) if left == 0 => (82, 0.0, 5.0, 71.0),
                 (Self::Taskbar, false, true) => (96, 0.0, 19.0, 85.0),
                 (Self::Floating, false, false) => (130, 16.0, 54.0, 112.0),
                 (Self::Taskbar, false, false) => (102, 13.0, 48.0, 89.0),
@@ -213,8 +216,9 @@ struct TextReading {
 }
 
 impl TextReading {
-    fn arrow_x(&self) -> f32 {
-        self.number_x - ARROW_WING - ARROW_GAP
+    fn arrow_x(&self, label_x: f32) -> f32 {
+        let available_gap = self.number_x - label_x - MIN_ARROW_INSET - 2.0 * ARROW_WING;
+        self.number_x - ARROW_WING - available_gap.clamp(MIN_ARROW_GAP, ARROW_GAP)
     }
 }
 
@@ -378,7 +382,7 @@ impl Panel {
                     } else {
                         colors.download
                     }));
-                    draw_arrow(target, text.arrow_x(), slot.row_y, upload);
+                    draw_arrow(target, text.arrow_x(slot.label_x), slot.row_y, upload);
                 }
                 brush.SetColor(&color(colors.number));
                 window.DrawTextLayout(
@@ -620,7 +624,7 @@ mod tests {
         let mut panel = Panel::new().unwrap();
         let sample = Sample {
             upload: Some(1.0),
-            download: Some(9_990_000_000.0),
+            download: Some(999_000_000.0),
             cpu: Some(100.0),
             memory: Some(100.0),
             disk: Some(100.0),
@@ -631,7 +635,7 @@ mod tests {
             ..Default::default()
         };
         let selections = [
-            (Metrics::default(), [420, 360]),
+            (Metrics::default(), [420, 346]),
             (
                 Metrics::parse(
                     "uptime,upload,available_memory,cpu_frequency,battery,download,traffic",
@@ -676,7 +680,17 @@ mod tests {
                             "{mode:?} overlapping {metric:?}"
                         );
                     } else {
-                        assert!(text.arrow_x() - ARROW_WING >= slot.label_x + 5.0);
+                        let arrow_x = text.arrow_x(slot.label_x);
+                        let inset = arrow_x - ARROW_WING - slot.label_x;
+                        let gap = text.number_x - arrow_x - ARROW_WING;
+                        assert!(
+                            inset + 0.01 >= MIN_ARROW_INSET,
+                            "{mode:?} {metric:?} arrow inset: {inset}"
+                        );
+                        assert!(
+                            gap + 0.01 >= MIN_ARROW_GAP,
+                            "{mode:?} {metric:?} arrow gap: {gap}"
+                        );
                     }
                 }
             }
@@ -722,9 +736,13 @@ mod tests {
             ..Default::default()
         };
         let readings = readings(sample, 145_060_000);
-        for mode in [Layout::Floating, Layout::Taskbar] {
-            let metrics =
-                Metrics::parse("cpu_frequency,upload,battery,uptime,memory,available_memory");
+        let custom_metrics =
+            Metrics::parse("cpu_frequency,upload,battery,uptime,memory,available_memory");
+        for (mode, metrics) in [
+            (Layout::Floating, custom_metrics),
+            (Layout::Taskbar, custom_metrics),
+            (Layout::Taskbar, Metrics::default()),
+        ] {
             let (width, height) = mode.size(metrics);
             let scale = super::super::scale;
             unsafe {
