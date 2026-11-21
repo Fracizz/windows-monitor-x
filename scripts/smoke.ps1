@@ -170,7 +170,7 @@ try {
     $dpi = [MonitorSmoke.Native]::GetDpiForWindow($window)
     $width = $rect.Right - $rect.Left
     $height = $rect.Bottom - $rect.Top
-    Assert-True ($width -eq [math]::Floor((420 * $dpi + 48) / 96)) 'Incorrect DPI-scaled panel width.'
+    Assert-True ($width -eq [math]::Floor((381 * $dpi + 48) / 96)) 'Incorrect DPI-scaled panel width.'
     Assert-True ($height -eq [math]::Floor((68 * $dpi + 48) / 96)) 'Incorrect DPI-scaled panel height.'
     $dpiContext = [MonitorSmoke.Native]::GetWindowDpiAwarenessContext($window)
     Assert-True ([MonitorSmoke.Native]::AreDpiAwarenessContextsEqual($dpiContext, [intptr](-4))) 'Per-monitor V2 DPI awareness must be enabled.'

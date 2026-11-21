@@ -68,40 +68,52 @@ impl Layout {
         }
     }
 
+    fn column_padding(self) -> i32 {
+        match self {
+            Self::Floating => 18,
+            Self::Taskbar => 13,
+        }
+    }
+
+    fn content_width(self, metric: Metric) -> i32 {
+        let (floating, taskbar) = match metric {
+            Metric::Upload | Metric::Download => (77, 71),
+            Metric::Cpu | Metric::Memory | Metric::Disk | Metric::Battery => (94, 76),
+            Metric::Traffic | Metric::AvailableMemory => (120, 114),
+            Metric::CpuFrequency => (126, 120),
+            Metric::Uptime => (142, 136),
+        };
+        match self {
+            Self::Floating => floating,
+            Self::Taskbar => taskbar,
+        }
+    }
+
     fn columns(self, metrics: Metrics) -> impl Iterator<Item = Column> {
         let mut selected = metrics.iter();
         let mut left = 0;
+        let padding = self.column_padding();
         std::iter::from_fn(move || {
             let first = selected.next()?;
             let second = selected.next();
-            let pair = [Some(first), second];
-            let wide = pair.into_iter().flatten().any(|metric| {
-                matches!(
-                    metric,
-                    Metric::Traffic
-                        | Metric::AvailableMemory
-                        | Metric::CpuFrequency
-                        | Metric::Uptime
-                )
-            });
-            let arrows = pair.into_iter().flatten().all(is_network_rate);
-            let (width, label_x, number_x, number_end) = match (self, wide, arrows) {
-                (Self::Floating, true, _) => (178, 17.0, 76.0, 159.0),
-                (Self::Taskbar, true, _) => (162, 13.0, 70.0, 149.0),
-                (Self::Floating, false, true) => (112, 0.0, 25.0, 99.0),
-                (Self::Taskbar, false, true) if left == 0 => (82, 0.0, 5.0, 71.0),
-                (Self::Taskbar, false, true) => (96, 0.0, 19.0, 85.0),
-                (Self::Floating, false, false) => (130, 16.0, 54.0, 112.0),
-                (Self::Taskbar, false, false) => (102, 13.0, 48.0, 89.0),
+            let content_width = self
+                .content_width(first)
+                .max(second.map_or(0, |metric| self.content_width(metric)));
+            // At the outer edge, the network reading already leaves room for its arrow.
+            let inset = if left == 0 && is_network_rate(first) && second.is_none_or(is_network_rate)
+            {
+                0
+            } else {
+                padding
             };
+            let width = inset + content_width + padding;
             let column = Column {
                 left,
                 width,
                 first,
                 second,
-                label_x,
-                number_x,
-                number_end,
+                inset,
+                content_width,
             };
             left += width;
             Some(column)
@@ -145,18 +157,18 @@ struct Column {
     width: i32,
     first: Metric,
     second: Option<Metric>,
-    label_x: f32,
-    number_x: f32,
-    number_end: f32,
+    inset: i32,
+    content_width: i32,
 }
 
 impl Column {
     fn slot(&self, row_y: f32) -> Slot {
-        let left = self.left as f32;
+        let label_x = (self.left + self.inset) as f32;
+        let content_width = self.content_width as f32;
         Slot {
-            label_x: left + self.label_x,
-            number_x: left + self.number_x,
-            number_end: left + self.number_end,
+            label_x,
+            content_width,
+            number_end: label_x + content_width,
             row_y,
         }
     }
@@ -164,7 +176,7 @@ impl Column {
 
 struct Slot {
     label_x: f32,
-    number_x: f32,
+    content_width: f32,
     number_end: f32,
     row_y: f32,
 }
@@ -428,7 +440,7 @@ impl Panel {
                 &self.fonts,
                 number_format,
                 &reading.number,
-                slot.number_end - slot.number_x,
+                slot.content_width,
             )?;
             unsafe {
                 number.SetTypography(
@@ -635,12 +647,16 @@ mod tests {
             ..Default::default()
         };
         let selections = [
-            (Metrics::default(), [420, 346]),
+            (Metrics::default(), [381, 326]),
             (
                 Metrics::parse(
                     "uptime,upload,available_memory,cpu_frequency,battery,download,traffic",
                 ),
-                [664, 588],
+                [626, 550],
+            ),
+            (
+                Metrics::parse("traffic,disk,upload,download,cpu_frequency,available_memory"),
+                [431, 383],
             ),
             (Metrics::parse(""), [132, 112]),
         ];
@@ -695,6 +711,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn taskbar_traffic_gap_is_close_to_the_middle_column() {
+        let mode = Layout::Taskbar;
+        let metrics = Metrics::default();
+        let mut panel = Panel::new().unwrap();
+        panel.set_layout(mode, metrics);
+        let sample = Sample {
+            cpu: Some(9.0),
+            memory: Some(55.0),
+            disk: Some(3.0),
+            ..Default::default()
+        };
+        panel.update_text(&readings(sample, 16_000_000)).unwrap();
+
+        let label_gap = |metric: Metric| {
+            let (_, slot) = mode
+                .slots(metrics)
+                .find(|(item, _)| *item == metric)
+                .unwrap();
+            let label = panel.labels[metric.index()].as_ref().unwrap();
+            let value = panel.values[metric.index()].as_ref().unwrap();
+            value.number_x - slot.label_x - text_width(label).unwrap()
+        };
+        let traffic_gap = label_gap(Metric::Traffic);
+        let memory_gap = label_gap(Metric::Memory);
+        let cpu_gap = label_gap(Metric::Cpu);
+        assert!(
+            (memory_gap..=cpu_gap).contains(&traffic_gap),
+            "traffic gap {traffic_gap} is outside the middle-column range {memory_gap} to {cpu_gap}"
+        );
     }
 
     #[test]
