@@ -18,12 +18,14 @@ use ::windows::{
         },
         System::{
             Performance::{
-                PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE,
+                PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT, PDH_FMT_COUNTERVALUE,
                 PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY,
                 PDH_MORE_DATA, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
                 PdhGetFormattedCounterArrayW, PdhGetFormattedCounterValue, PdhOpenQueryW,
             },
-            SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
+            Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS},
+            Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW},
+            SystemInformation::{GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX},
             Threading::{GetActiveProcessorCount, GetSystemTimes},
         },
     },
@@ -32,13 +34,16 @@ use ::windows::{
 
 use crate::model::{Bytes, CpuTime, Sample, rate, traffic_delta};
 
+// The SDK flag is not exposed by windows 0.62.
+const PDH_DOUBLE_UNCAPPED: PDH_FMT = PDH_FMT(PDH_FMT_DOUBLE.0 | 0x0000_8000);
+
 pub struct Sampler {
     previous_network: HashMap<u64, Bytes>,
     network: HashMap<u64, Bytes>,
     network_time: Option<(Instant, Duration)>,
     traffic: u64,
     previous_cpu: Option<CpuTime>,
-    disk: Option<PerformanceQuery>,
+    performance: Option<PerformanceQuery>,
     many_processors: bool,
     retry_at: Instant,
 }
@@ -52,7 +57,7 @@ impl Sampler {
             network_time: None,
             traffic: 0,
             previous_cpu: None,
-            disk: PerformanceQuery::new(many_processors),
+            performance: PerformanceQuery::new(many_processors),
             many_processors,
             retry_at: Instant::now() + super::SAVE_INTERVAL,
         }
@@ -77,17 +82,27 @@ impl Sampler {
         }
 
         sample.traffic = self.traffic;
-        sample.memory = memory_percent();
-        if self.disk.is_none() && now >= self.retry_at {
-            self.disk = PerformanceQuery::new(self.many_processors);
+        if let Some(memory) = memory_status() {
+            sample.memory = Some(f64::from(memory.dwMemoryLoad));
+            sample.available_memory = Some(memory.ullAvailPhys);
+        }
+        sample.battery = battery_percent();
+        sample.uptime = Some(Duration::from_millis(unsafe { GetTickCount64() }));
+        if now >= self.retry_at {
+            if let Some(query) = &mut self.performance {
+                query.add_missing_counters(self.many_processors);
+            } else {
+                self.performance = PerformanceQuery::new(self.many_processors);
+            }
             self.retry_at = now + super::SAVE_INTERVAL;
         }
-        if let Some(query) = &mut self.disk
+        if let Some(query) = &mut self.performance
             && query.collect()
         {
             sample.disk = query.disk_activity();
+            sample.cpu_mhz = query.cpu_frequency();
             if let Some(cpu) = query.cpu {
-                sample.cpu = counter_value(cpu);
+                sample.cpu = counter_value(cpu, PDH_FMT_DOUBLE);
             }
         }
         if !self.many_processors
@@ -160,19 +175,29 @@ fn cpu_times() -> Option<CpuTime> {
     })
 }
 
-fn memory_percent() -> Option<f64> {
+fn memory_status() -> Option<MEMORYSTATUSEX> {
     let mut memory = MEMORYSTATUSEX {
         dwLength: size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
     };
     unsafe { GlobalMemoryStatusEx(&mut memory) }.ok()?;
-    Some(f64::from(memory.dwMemoryLoad))
+    Some(memory)
+}
+
+fn battery_percent() -> Option<f64> {
+    let mut status = SYSTEM_POWER_STATUS::default();
+    unsafe { GetSystemPowerStatus(&mut status) }.ok()?;
+    (status.BatteryFlag & 128 == 0 && status.BatteryLifePercent <= 100)
+        .then(|| f64::from(status.BatteryLifePercent))
 }
 
 struct PerformanceQuery {
     handle: PDH_HQUERY,
     disk: Option<PDH_HCOUNTER>,
     cpu: Option<PDH_HCOUNTER>,
+    frequency: Option<PDH_HCOUNTER>,
+    processor_performance: Option<PDH_HCOUNTER>,
+    nominal_mhz: Option<f64>,
     buffer: Vec<PDH_FMT_COUNTERVALUE_ITEM_W>,
 }
 
@@ -182,20 +207,52 @@ impl PerformanceQuery {
         if unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &mut handle) } != 0 {
             return None;
         }
-        let query = Self {
+        let mut query = Self {
             handle,
-            disk: add_counter(handle, w!(r"\PhysicalDisk(*)\% Idle Time")),
-            cpu: many_processors
-                .then(|| {
-                    add_counter(
-                        handle,
-                        w!(r"\Processor Information(_Total)\% Processor Time"),
-                    )
-                })
-                .flatten(),
+            disk: None,
+            cpu: None,
+            frequency: None,
+            processor_performance: None,
+            nominal_mhz: nominal_cpu_mhz(),
             buffer: Vec::new(),
         };
-        (query.disk.is_some() || query.cpu.is_some()).then_some(query)
+        query.add_missing_counters(many_processors);
+        Some(query)
+    }
+
+    fn add_missing_counters(&mut self, many_processors: bool) {
+        if self.disk.is_none() {
+            self.disk = add_counter(self.handle, w!(r"\PhysicalDisk(*)\% Idle Time"));
+        }
+        if many_processors && self.cpu.is_none() {
+            self.cpu = add_counter(
+                self.handle,
+                w!(r"\Processor Information(_Total)\% Processor Time"),
+            );
+        }
+        if self.frequency.is_none() {
+            self.frequency = add_counter(
+                self.handle,
+                w!(r"\Processor Information(_Total)\Processor Frequency"),
+            );
+        }
+        if self.nominal_mhz.is_some() && self.processor_performance.is_none() {
+            self.processor_performance = add_counter(
+                self.handle,
+                w!(r"\Processor Information(_Total)\% Processor Performance"),
+            );
+        }
+    }
+
+    fn cpu_frequency(&self) -> Option<f64> {
+        if let (Some(nominal), Some(performance)) = (self.nominal_mhz, self.processor_performance)
+            && let Some(percent) = counter_value(performance, PDH_DOUBLE_UNCAPPED)
+            && percent > 0.0
+        {
+            // The performance percentage reflects boost on systems that report a fixed MHz counter.
+            return Some(nominal * percent / 100.0);
+        }
+        counter_value(self.frequency?, PDH_FMT_DOUBLE)
     }
 
     fn collect(&self) -> bool {
@@ -255,9 +312,26 @@ fn add_counter(query: PDH_HQUERY, path: PCWSTR) -> Option<PDH_HCOUNTER> {
     (unsafe { PdhAddEnglishCounterW(query, path, 0, &mut counter) } == 0).then_some(counter)
 }
 
-fn counter_value(counter: PDH_HCOUNTER) -> Option<f64> {
+fn nominal_cpu_mhz() -> Option<f64> {
+    let mut mhz = 0u32;
+    let mut size = size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"),
+            w!("~MHz"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut mhz as *mut u32).cast()),
+            Some(&mut size),
+        )
+    };
+    (status == ERROR_SUCCESS && mhz > 0).then(|| f64::from(mhz))
+}
+
+fn counter_value(counter: PDH_HCOUNTER, format: PDH_FMT) -> Option<f64> {
     let mut value = PDH_FMT_COUNTERVALUE::default();
-    if unsafe { PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, None, &mut value) } != 0 {
+    if unsafe { PdhGetFormattedCounterValue(counter, format, None, &mut value) } != 0 {
         return None;
     }
     valid_value(value)
@@ -291,5 +365,12 @@ mod tests {
         }
         assert!(sample.upload.is_some_and(|value| value >= 0.0));
         assert!(sample.download.is_some_and(|value| value >= 0.0));
+        assert!(sample.available_memory.is_some());
+        assert!(sample.cpu_mhz.is_none_or(|mhz| mhz >= 0.0));
+        assert!(
+            sample
+                .uptime
+                .is_some_and(|uptime| uptime >= Duration::from_secs(1))
+        );
     }
 }

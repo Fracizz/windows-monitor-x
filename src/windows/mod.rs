@@ -1,3 +1,4 @@
+mod editor;
 mod panel;
 mod sampler;
 mod startup;
@@ -35,7 +36,7 @@ use ::windows::{
     core::{Error, HSTRING, PCWSTR, Result, w},
 };
 
-use crate::model::{Reading, Sample, readings};
+use crate::model::{Metric, Metrics, Reading, Sample, readings};
 use panel::{Layout, Panel};
 use sampler::Sampler;
 use state::{Refresh, Settings, TaskbarSide, Theme};
@@ -64,6 +65,7 @@ const DOCK: usize = 108;
 const AUTOSTART: usize = 113;
 const DOCK_LEFT: usize = 114;
 const DOCK_RIGHT: usize = 115;
+const EDIT_METRICS: usize = 116;
 const REFRESH_OPTIONS: [(usize, Refresh, PCWSTR); 4] = [
     (109, Refresh::One, w!("1 秒")),
     (110, Refresh::Two, w!("2 秒")),
@@ -85,7 +87,7 @@ type Feed = Arc<Mutex<Mailbox>>;
 
 enum WorkerCommand {
     Interval(Refresh),
-    Dock(Option<u64>, TaskbarSide),
+    Dock(Option<u64>, TaskbarSide, Metrics),
     RecheckDock,
     Stop,
 }
@@ -105,7 +107,8 @@ struct App {
     placement: Placement,
     sample: Sample,
     waiting_sample: bool,
-    displayed: [Reading; 6],
+    displayed: [Reading; Metric::ALL.len()],
+    display_metrics: Metrics,
     starting_traffic: u64,
     traffic_at_reset: u64,
     last_save: Instant,
@@ -151,6 +154,7 @@ impl App {
             sample,
             waiting_sample: true,
             displayed: readings(sample, settings.traffic),
+            display_metrics: settings.metrics,
             starting_traffic: settings.traffic,
             traffic_at_reset: 0,
             last_save: Instant::now(),
@@ -178,9 +182,11 @@ impl App {
     fn request_dock(&mut self) {
         self.dock_generation = self.dock_generation.wrapping_add(1);
         let generation = self.settings.taskbar.then_some(self.dock_generation);
-        let _ = self
-            .worker
-            .send(WorkerCommand::Dock(generation, self.settings.taskbar_side));
+        let _ = self.worker.send(WorkerCommand::Dock(
+            generation,
+            self.settings.taskbar_side,
+            self.settings.metrics,
+        ));
     }
 
     fn refresh_theme(&mut self) -> bool {
@@ -200,11 +206,12 @@ impl App {
 
     fn update_display(&mut self) -> bool {
         let displayed = readings(self.sample, self.total());
-        if self.displayed == displayed {
-            return false;
-        }
+        let changed = self
+            .display_metrics
+            .iter()
+            .any(|metric| self.displayed[metric.index()] != displayed[metric.index()]);
         self.displayed = displayed;
-        true
+        changed
     }
 
     fn save(&mut self) {
@@ -251,7 +258,7 @@ impl App {
     fn paint_metrics(&mut self, hwnd: HWND) -> Result<()> {
         if self.panel.is_none() {
             let mut panel = Panel::new()?;
-            panel.set_layout(self.layout());
+            panel.set_layout(self.layout(), self.display_metrics);
             self.panel = Some(panel);
         }
         let panel = self.panel.as_mut().expect("panel initialized");
@@ -289,6 +296,7 @@ impl SamplerWorker {
                 let mut interval = settings.refresh.interval();
                 let mut dock = settings.taskbar.then_some((0, next_sample));
                 let mut taskbar_side = settings.taskbar_side;
+                let mut metrics = settings.metrics;
                 let mut taskbar = None;
                 let mut last_placement = None;
                 loop {
@@ -308,9 +316,9 @@ impl SamplerWorker {
                         if taskbar.is_none() {
                             taskbar = Taskbar::new().ok();
                         }
-                        let placement = taskbar
-                            .as_mut()
-                            .map_or(Placement::Floating, |bar| bar.placement(hwnd, taskbar_side));
+                        let placement = taskbar.as_mut().map_or(Placement::Floating, |bar| {
+                            bar.placement(hwnd, taskbar_side, metrics)
+                        });
                         if last_placement != Some(placement) {
                             last_placement = Some(placement);
                             let pending = feed
@@ -331,8 +339,9 @@ impl SamplerWorker {
                             interval = refresh.interval();
                             next_sample = last_sample + interval;
                         }
-                        Ok(WorkerCommand::Dock(generation, side)) => {
+                        Ok(WorkerCommand::Dock(generation, side, selected)) => {
                             taskbar_side = side;
+                            metrics = selected;
                             dock = generation.map(|id| (id, Instant::now()));
                             if dock.is_none() {
                                 taskbar = None;
@@ -406,7 +415,7 @@ pub fn run() -> Result<()> {
     let app = App::new(settings, icon, feed.clone(), worker.0.clone());
     APP.with(|state| *state.borrow_mut() = Some(app));
 
-    let window = Window(create_window(CLASS, module, icon, settings.position)?);
+    let window = Window(create_window(CLASS, module, icon, settings)?);
     let hwnd = window.0;
     let _ = show_starting_panel(hwnd);
 
@@ -418,6 +427,9 @@ pub fn run() -> Result<()> {
             -1 => return Err(Error::from_thread()),
             0 => return Ok(()),
             _ => {
+                if editor::handle_dialog_message(&message) {
+                    continue;
+                }
                 unsafe {
                     let _ = TranslateMessage(&message);
                     DispatchMessageW(&message);
@@ -451,9 +463,9 @@ fn create_window(
     class_name: PCWSTR,
     module: HINSTANCE,
     icon: HICON,
-    requested: Option<POINT>,
+    settings: Settings,
 ) -> Result<HWND> {
-    let position = requested.unwrap_or_default();
+    let position = settings.position.unwrap_or_default();
     unsafe {
         let class = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
@@ -469,7 +481,7 @@ fn create_window(
         if RegisterClassExW(&class) == 0 {
             return Err(Error::from_thread());
         }
-        let (width, height) = Layout::Floating.size();
+        let (width, height) = Layout::Floating.size(settings.metrics);
         CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class_name,
@@ -520,13 +532,13 @@ unsafe extern "system" fn window_proc(
         WM_DPICHANGED => {
             let dpi = (wparam.0 & 0xffff) as u32;
             let suggested = unsafe { &*(lparam.0 as *const RECT) };
-            let layout = with_app(|app| {
+            let (layout, metrics) = with_app(|app| {
                 app.dpi = dpi;
                 app.resize_panel(hwnd);
-                app.layout()
+                (app.layout(), app.display_metrics)
             })
             .unwrap_or_default();
-            let (width, height) = layout.size();
+            let (width, height) = layout.size(metrics);
             let _ = unsafe {
                 SetWindowPos(
                     hwnd,
@@ -558,8 +570,9 @@ unsafe extern "system" fn window_proc(
                     x: rect.left,
                     y: rect.top,
                 };
-                let position =
-                    place(hwnd, Some(position), window_dpi(hwnd), true).unwrap_or(position);
+                let metrics = with_app(|app| app.display_metrics).unwrap_or_default();
+                let position = place(hwnd, Some(position), window_dpi(hwnd), metrics, true)
+                    .unwrap_or(position);
                 with_app(|app| {
                     app.settings.position = Some(position);
                     app.save();
@@ -587,6 +600,7 @@ unsafe extern "system" fn window_proc(
             if changed == Some(true) && unsafe { IsWindowVisible(hwnd).as_bool() } {
                 invalidate(hwnd);
             }
+            editor::refresh_preview();
         }
         DOCK_READY => {
             let applied = with_app(|app| {
@@ -652,10 +666,11 @@ unsafe extern "system" fn window_proc(
 }
 
 fn apply_placement(hwnd: HWND) {
-    let Some((placement, position, topmost, layout)) = with_app(|app| {
+    let Some((placement, position, topmost, layout, metrics)) = with_app(|app| {
         let layout = app.layout();
+        app.display_metrics = app.settings.metrics;
         if let Some(panel) = &mut app.panel {
-            panel.set_layout(layout);
+            panel.set_layout(layout, app.display_metrics);
         }
         app.refresh_theme();
         (
@@ -663,6 +678,7 @@ fn apply_placement(hwnd: HWND) {
             app.settings.position,
             app.settings.topmost,
             layout,
+            app.display_metrics,
         )
     }) else {
         return;
@@ -670,7 +686,7 @@ fn apply_placement(hwnd: HWND) {
     let shadow_changed = set_panel_shadow(hwnd, layout == Layout::Floating);
     match placement {
         Placement::Floating => {
-            place(hwnd, position, window_dpi(hwnd), false);
+            place(hwnd, position, window_dpi(hwnd), metrics, false);
             set_topmost(hwnd, topmost);
         }
         Placement::Docked(rect) => {
@@ -749,8 +765,14 @@ fn scale(dip: i32, dpi: u32) -> i32 {
     (dip * dpi as i32 + 48) / 96
 }
 
-fn place(hwnd: HWND, requested: Option<POINT>, dpi: u32, snap: bool) -> Option<POINT> {
-    let (width, height) = Layout::Floating.size();
+fn place(
+    hwnd: HWND,
+    requested: Option<POINT>,
+    dpi: u32,
+    metrics: Metrics,
+    snap: bool,
+) -> Option<POINT> {
+    let (width, height) = Layout::Floating.size(metrics);
     let (width, height) = (scale(width, dpi), scale(height, dpi));
     let reference = requested
         .map(|position| POINT {
@@ -1010,11 +1032,54 @@ fn make_settings_menu(
         checked(settings.taskbar_side == TaskbarSide::Right),
     )?;
     menu.submenu(w!("任务栏位置"), taskbar_position)?;
+    menu.item(EDIT_METRICS, w!("编辑监控项…"), MF_ENABLED)?;
     Ok(menu)
+}
+
+fn metric_name(metric: Metric) -> &'static str {
+    match metric {
+        Metric::Upload => "上传速度",
+        Metric::Download => "下载速度",
+        Metric::Cpu => "CPU 使用率",
+        Metric::Memory => "内存使用率",
+        Metric::Disk => "磁盘活动率",
+        Metric::Traffic => "累计流量",
+        Metric::AvailableMemory => "可用内存",
+        Metric::CpuFrequency => "CPU 当前频率",
+        Metric::Uptime => "运行时长",
+        Metric::Battery => "电池电量",
+    }
+}
+
+fn set_metrics(hwnd: HWND, metrics: Metrics) {
+    let apply_now = with_app(|app| {
+        if app.settings.metrics == metrics {
+            return false;
+        }
+        let size = Layout::Taskbar.size(metrics);
+        let resize_dock =
+            app.settings.taskbar && size != Layout::Taskbar.size(app.settings.metrics);
+        app.settings.metrics = metrics;
+        if resize_dock {
+            app.request_dock();
+        }
+        app.save();
+        // Keep the current panel in its slot until the worker has checked the new width.
+        app.layout() != Layout::Taskbar || size == Layout::Taskbar.size(app.display_metrics)
+    });
+    if apply_now == Some(true) {
+        apply_placement(hwnd);
+    }
 }
 
 fn command(hwnd: HWND, selection: usize) {
     match selection {
+        EDIT_METRICS => {
+            if let Err(error) = editor::open(hwnd) {
+                let message = HSTRING::from(format!("无法打开监控项编辑器。\n\n{error}"));
+                unsafe { MessageBoxW(Some(hwnd), &message, app_title(), MB_OK | MB_ICONWARNING) };
+            }
+        }
         AUTOSTART => {
             if let Err(error) = startup::toggle() {
                 let message = HSTRING::from(format!("无法更改开机自启设置。\n\n{error}"));
@@ -1087,6 +1152,7 @@ fn command(hwnd: HWND, selection: usize) {
                 app.save();
             });
             invalidate(hwnd);
+            editor::refresh_preview();
         }
         EXIT => {
             let _ = unsafe { DestroyWindow(hwnd) };
@@ -1125,13 +1191,7 @@ mod tests {
             *state.borrow_mut() = Some(App::new(settings, icon, feed.clone(), sender))
         });
         let window = Window(
-            create_window(
-                w!("WindowsMonitor.StartupTest"),
-                module,
-                icon,
-                settings.position,
-            )
-            .unwrap(),
+            create_window(w!("WindowsMonitor.StartupTest"), module, icon, settings).unwrap(),
         );
         let painted = show_starting_panel(window.0);
         let visible = unsafe { IsWindowVisible(window.0).as_bool() };
@@ -1183,6 +1243,7 @@ mod tests {
             let refresh = GetSubMenu(settings, 4);
             let theme = GetSubMenu(settings, 5);
             let position = GetSubMenu(settings, 6);
+            assert_eq!(GetMenuItemID(settings, 7), EDIT_METRICS as u32);
             assert!(!refresh.is_invalid());
             assert!(!theme.is_invalid());
             assert!(!position.is_invalid());

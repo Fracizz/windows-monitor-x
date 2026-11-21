@@ -15,8 +15,9 @@ use ::windows::{
                 DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, DWRITE_FONT_STRETCH_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_LINE_SPACING_METHOD_UNIFORM,
-                DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory,
-                IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, IDWriteTypography,
+                DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP,
+                DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
+                IDWriteTypography,
             },
             Gdi::{
                 CreateFontIndirectW, CreateSolidBrush, DEFAULT_CHARSET, DT_CENTER, DT_NOPREFIX,
@@ -30,7 +31,7 @@ use ::windows::{
 };
 use windows_numerics::Vector2;
 
-use crate::model::Reading;
+use crate::model::{Metric, Metrics, Reading};
 
 const ROW_HEIGHT: f32 = 24.0;
 const ROW_BASELINE: f32 = 17.0;
@@ -47,10 +48,14 @@ pub enum Layout {
 }
 
 impl Layout {
-    pub const fn size(self) -> (i32, i32) {
+    pub fn size(self, metrics: Metrics) -> (i32, i32) {
+        let width = self
+            .columns(metrics)
+            .last()
+            .map(|column| column.left + column.width);
         match self {
-            Self::Floating => (420, 68),
-            Self::Taskbar => (360, 36),
+            Self::Floating => (width.unwrap_or(132), 68),
+            Self::Taskbar => (width.unwrap_or(112), 36),
         }
     }
 
@@ -61,42 +66,99 @@ impl Layout {
         }
     }
 
-    const fn slots(self) -> [Slot; 6] {
-        match self {
-            Self::Floating => [
-                Slot::new(0.0, 25.0, 99.0, 9.0),
-                Slot::new(0.0, 25.0, 99.0, 35.0),
-                Slot::new(128.0, 166.0, 224.0, 9.0),
-                Slot::new(128.0, 166.0, 224.0, 35.0),
-                Slot::new(259.0, 312.0, 401.0, 9.0),
-                Slot::new(259.0, 312.0, 401.0, 35.0),
-            ],
-            Self::Taskbar => [
-                Slot::new(0.0, 19.0, 85.0, -3.0),
-                Slot::new(0.0, 19.0, 85.0, 14.0),
-                Slot::new(109.0, 144.0, 185.0, -3.0),
-                Slot::new(109.0, 144.0, 185.0, 14.0),
-                Slot::new(211.0, 263.0, 347.0, -3.0),
-                Slot::new(211.0, 263.0, 347.0, 14.0),
-            ],
-        }
+    fn columns(self, metrics: Metrics) -> impl Iterator<Item = Column> {
+        let mut selected = metrics.iter();
+        let mut left = 0;
+        std::iter::from_fn(move || {
+            let first = selected.next()?;
+            let second = selected.next();
+            let pair = [Some(first), second];
+            let wide = pair.into_iter().flatten().any(|metric| {
+                matches!(
+                    metric,
+                    Metric::Traffic
+                        | Metric::AvailableMemory
+                        | Metric::CpuFrequency
+                        | Metric::Uptime
+                )
+            });
+            let arrows = pair.into_iter().flatten().all(is_network_rate);
+            let (width, label_x, number_x, number_end) = match (self, wide, arrows) {
+                (Self::Floating, true, _) => (178, 17.0, 76.0, 159.0),
+                (Self::Taskbar, true, _) => (162, 13.0, 70.0, 149.0),
+                (Self::Floating, false, true) => (112, 0.0, 25.0, 99.0),
+                (Self::Taskbar, false, true) => (96, 0.0, 19.0, 85.0),
+                (Self::Floating, false, false) => (130, 16.0, 54.0, 112.0),
+                (Self::Taskbar, false, false) => (102, 13.0, 48.0, 89.0),
+            };
+            let column = Column {
+                left,
+                width,
+                first,
+                second,
+                label_x,
+                number_x,
+                number_end,
+            };
+            left += width;
+            Some(column)
+        })
     }
 
-    const fn dividers(self) -> [(Vector2, Vector2); 2] {
-        match self {
-            Self::Floating => [
-                (point(112.0, 12.0), point(112.0, 56.0)),
-                (point(242.0, 12.0), point(242.0, 56.0)),
-            ],
-            Self::Taskbar => [
-                (point(96.0, 5.0), point(96.0, 31.0)),
-                (point(198.0, 5.0), point(198.0, 31.0)),
-            ],
+    fn slots(self, metrics: Metrics) -> impl Iterator<Item = (Metric, Slot)> {
+        self.columns(metrics).flat_map(move |column| {
+            let (top, bottom) = match self {
+                Self::Floating => (9.0, 35.0),
+                Self::Taskbar => (-3.0, 14.0),
+            };
+            let first_row = if column.second.is_some() {
+                top
+            } else {
+                (top + bottom) / 2.0
+            };
+            [
+                Some((column.first, column.slot(first_row))),
+                column.second.map(|metric| (metric, column.slot(bottom))),
+            ]
+            .into_iter()
+            .flatten()
+        })
+    }
+
+    fn dividers(self, metrics: Metrics) -> impl Iterator<Item = (Vector2, Vector2)> {
+        let (top, bottom) = match self {
+            Self::Floating => (12.0, 56.0),
+            Self::Taskbar => (5.0, 31.0),
+        };
+        self.columns(metrics).skip(1).map(move |column| {
+            let x = column.left as f32;
+            (point(x, top), point(x, bottom))
+        })
+    }
+}
+
+struct Column {
+    left: i32,
+    width: i32,
+    first: Metric,
+    second: Option<Metric>,
+    label_x: f32,
+    number_x: f32,
+    number_end: f32,
+}
+
+impl Column {
+    fn slot(&self, row_y: f32) -> Slot {
+        let left = self.left as f32;
+        Slot {
+            label_x: left + self.label_x,
+            number_x: left + self.number_x,
+            number_end: left + self.number_end,
+            row_y,
         }
     }
 }
 
-#[derive(Clone, Copy)]
 struct Slot {
     label_x: f32,
     number_x: f32,
@@ -104,15 +166,8 @@ struct Slot {
     row_y: f32,
 }
 
-impl Slot {
-    const fn new(label_x: f32, number_x: f32, number_end: f32, row_y: f32) -> Self {
-        Self {
-            label_x,
-            number_x,
-            number_end,
-            row_y,
-        }
-    }
+fn is_network_rate(metric: Metric) -> bool {
+    matches!(metric, Metric::Upload | Metric::Download)
 }
 
 struct Colors {
@@ -172,8 +227,10 @@ pub struct Panel {
     unit_format: IDWriteTextFormat,
     tabular: IDWriteTypography,
     mode: Layout,
-    labels: [IDWriteTextLayout; 4],
-    values: [Option<TextReading>; 6],
+    metrics: Metrics,
+    labels: [Option<IDWriteTextLayout>; Metric::ALL.len()],
+    empty_label: IDWriteTextLayout,
+    values: [Option<TextReading>; Metric::ALL.len()],
     target: Option<Target>,
 }
 
@@ -194,12 +251,23 @@ impl Panel {
             })?;
             typography
         };
-        let labels = [
-            layout(&fonts, &label_format, "CPU", 38.0)?,
-            layout(&fonts, &label_format, "内存", 42.0)?,
-            layout(&fonts, &label_format, "磁盘", 47.0)?,
-            layout(&fonts, &label_format, "累计流量", 80.0)?,
-        ];
+        let mut labels = [const { None }; Metric::ALL.len()];
+        for metric in Metric::ALL
+            .into_iter()
+            .filter(|&metric| !is_network_rate(metric))
+        {
+            let label = match metric {
+                Metric::Cpu => "CPU",
+                Metric::Memory => "内存",
+                Metric::Disk => "磁盘",
+                Metric::CpuFrequency => "CPU 频率",
+                Metric::Battery => "电量",
+                _ => super::metric_name(metric),
+            };
+            labels[metric.index()] = Some(layout(&fonts, &label_format, label, 80.0)?);
+        }
+        let empty_label = layout(&fonts, &label_format, "未选择监控项", 112.0)?;
+        unsafe { empty_label.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)? };
         Ok(Self {
             factory,
             fonts,
@@ -209,16 +277,19 @@ impl Panel {
             unit_format,
             tabular,
             mode: Layout::Floating,
+            metrics: Metrics::default(),
             labels,
-            values: [const { None }; 6],
+            empty_label,
+            values: [const { None }; Metric::ALL.len()],
             target: None,
         })
     }
 
-    pub fn set_layout(&mut self, mode: Layout) {
-        if self.mode != mode {
+    pub fn set_layout(&mut self, mode: Layout, metrics: Metrics) {
+        if self.mode != mode || self.metrics != metrics {
             self.mode = mode;
-            self.values = [const { None }; 6];
+            self.metrics = metrics;
+            self.values = [const { None }; Metric::ALL.len()];
         }
     }
 
@@ -239,7 +310,7 @@ impl Panel {
         hwnd: HWND,
         dpi: u32,
         dark: bool,
-        readings: &[Reading; 6],
+        readings: &[Reading; Metric::ALL.len()],
     ) -> Result<()> {
         self.update_text(readings)?;
         if self.target.is_none() {
@@ -247,14 +318,13 @@ impl Panel {
         }
         let target = self.target.as_ref().expect("render target initialized");
         let colors = if dark { DARK } else { LIGHT };
-        let slots = self.mode.slots();
+        let (width, height) = self.mode.size(self.metrics);
         let result = unsafe {
             let window = &target.window;
             let brush = &target.brush;
             window.BeginDraw();
             window.Clear(Some(&color(colors.surface)));
             if self.mode == Layout::Floating {
-                let (width, height) = self.mode.size();
                 let radius = self.mode.radius() as f32 - 0.5;
                 brush.SetColor(&color(colors.border));
                 window.DrawRoundedRectangle(
@@ -274,22 +344,35 @@ impl Panel {
                 );
             }
             brush.SetColor(&color(colors.divider));
-            for (start, end) in self.mode.dividers() {
+            for (start, end) in self.mode.dividers(self.metrics) {
                 window.DrawLine(start, end, brush, 1.0, None);
             }
-            brush.SetColor(&color(colors.label));
-            for (slot, label) in slots[2..].iter().zip(&self.labels) {
+            if self.metrics.iter().next().is_none() {
+                brush.SetColor(&color(colors.label));
+                let x = (width as f32 - 112.0) / 2.0;
+                let y = (height as f32 - ROW_HEIGHT) / 2.0;
                 window.DrawTextLayout(
-                    point(slot.label_x, slot.row_y),
-                    label,
+                    point(x, y),
+                    &self.empty_label,
                     brush,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
             }
-            for (index, (slot, text)) in slots.iter().zip(self.values.iter().flatten()).enumerate()
-            {
-                if index < 2 {
-                    let upload = index == 0;
+            for (metric, slot) in self.mode.slots(self.metrics) {
+                let index = metric.index();
+                let text = self.values[index]
+                    .as_ref()
+                    .expect("visible reading initialized");
+                if let Some(label) = &self.labels[index] {
+                    brush.SetColor(&color(colors.label));
+                    window.DrawTextLayout(
+                        point(slot.label_x, slot.row_y),
+                        label,
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    );
+                } else {
+                    let upload = metric == Metric::Upload;
                     brush.SetColor(&color(if upload {
                         colors.upload
                     } else {
@@ -320,22 +403,20 @@ impl Panel {
         result
     }
 
-    fn update_text(&mut self, readings: &[Reading; 6]) -> Result<()> {
-        for (index, ((cached, reading), slot)) in self
-            .values
-            .iter_mut()
-            .zip(readings)
-            .zip(self.mode.slots())
-            .enumerate()
-        {
+    fn update_text(&mut self, readings: &[Reading; Metric::ALL.len()]) -> Result<()> {
+        for (metric, slot) in self.mode.slots(self.metrics) {
+            let cached = &mut self.values[metric.index()];
+            let reading = &readings[metric.index()];
             if cached
                 .as_ref()
                 .is_some_and(|value| value.displayed == *reading)
             {
                 continue;
             }
-            let number_format = match index {
-                2..=4 => &self.percent_format,
+            let number_format = match metric {
+                Metric::Cpu | Metric::Memory | Metric::Disk | Metric::Battery | Metric::Uptime => {
+                    &self.percent_format
+                }
                 _ if self.mode == Layout::Taskbar => &self.compact_format,
                 _ => &self.number_format,
             };
@@ -543,62 +624,61 @@ mod tests {
             cpu: Some(100.0),
             memory: Some(100.0),
             disk: Some(100.0),
+            available_memory: Some(999_400_000_000),
+            cpu_mhz: Some(5670.0),
+            uptime: Some(std::time::Duration::from_secs(999 * 86_400 + 23 * 3_600)),
+            battery: Some(100.0),
             ..Default::default()
         };
-        for mode in [Layout::Floating, Layout::Taskbar] {
-            panel.set_layout(mode);
-            panel
-                .update_text(&readings(sample, 999_990_000_000))
-                .unwrap();
-            let slots = mode.slots();
-            for (index, (slot, text)) in slots
+        let selections = [
+            (Metrics::default(), [420, 360]),
+            (
+                Metrics::parse(
+                    "uptime,upload,available_memory,cpu_frequency,battery,download,traffic",
+                ),
+                [664, 588],
+            ),
+            (Metrics::parse(""), [132, 112]),
+        ];
+        for (metrics, expected_widths) in selections {
+            for (mode, expected_width) in [Layout::Floating, Layout::Taskbar]
                 .into_iter()
-                .zip(panel.values.iter().flatten())
-                .enumerate()
+                .zip(expected_widths)
             {
-                let mut number = Default::default();
-                let mut unit = Default::default();
-                unsafe {
-                    text.number.GetMetrics(&mut number).unwrap();
-                    text.unit.GetMetrics(&mut unit).unwrap();
+                panel.set_layout(mode, metrics);
+                panel
+                    .update_text(&readings(sample, 999_990_000_000))
+                    .unwrap();
+                assert_eq!(mode.size(metrics).0, expected_width);
+                assert!(
+                    mode.slots(metrics)
+                        .map(|(metric, _)| metric)
+                        .eq(metrics.iter())
+                );
+                for (metric, slot) in mode.slots(metrics) {
+                    let text = panel.values[metric.index()].as_ref().unwrap();
+                    let gap = if text.displayed.unit == "%" {
+                        PERCENT_GAP
+                    } else {
+                        UNIT_GAP
+                    };
+                    let number_width = text_width(&text.number).unwrap();
+                    let unit_width = text_width(&text.unit).unwrap();
+                    assert!((text.unit_x + unit_width - slot.number_end).abs() < 0.01);
+                    if text.displayed.unit.is_empty() {
+                        assert!((text.number_x + number_width - text.unit_x).abs() < 0.01);
+                    } else {
+                        assert!((text.number_x + number_width + gap - text.unit_x).abs() < 0.01);
+                    }
+                    if let Some(label) = &panel.labels[metric.index()] {
+                        assert!(
+                            slot.label_x + text_width(label).unwrap() + 3.0 <= text.number_x,
+                            "{mode:?} overlapping {metric:?}"
+                        );
+                    } else {
+                        assert!(text.arrow_x() - ARROW_WING >= slot.label_x + 5.0);
+                    }
                 }
-                let right = match index {
-                    0 | 1 => mode.dividers()[0].0.X,
-                    2 | 3 => mode.dividers()[1].0.X,
-                    _ => mode.size().0 as f32,
-                };
-                assert!(
-                    text.number_x >= slot.number_x,
-                    "{mode:?} reading start {index}"
-                );
-                let unit_end = text.unit_x + unit.width;
-                assert!(
-                    (unit_end - slot.number_end).abs() < 0.01,
-                    "{mode:?} right alignment"
-                );
-                assert!(unit_end + 4.0 < right, "{mode:?} column margin {index}");
-                if index < 2 {
-                    let arrow_gap = text.number_x + number.left - (text.arrow_x() + ARROW_WING);
-                    assert!((arrow_gap - ARROW_GAP).abs() < 0.01, "{mode:?} arrow gap");
-                    assert!(text.arrow_x() - ARROW_WING >= 5.0, "{mode:?} arrow margin");
-                }
-                let expected_gap = if matches!(index, 2..=4) {
-                    PERCENT_GAP
-                } else {
-                    UNIT_GAP
-                };
-                let unit_gap = text.unit_x - (text.number_x + number.left + number.width);
-                assert!((unit_gap - expected_gap).abs() < 0.01, "{mode:?} unit gap");
-                assert_eq!(number.lineCount, 1);
-                assert_eq!(unit.lineCount, 1);
-            }
-            for (slot, label) in slots[2..].iter().zip(&panel.labels) {
-                let mut metrics = Default::default();
-                unsafe { label.GetMetrics(&mut metrics).unwrap() };
-                assert!(
-                    slot.label_x + metrics.width <= slot.number_x + 1.0,
-                    "{mode:?} label"
-                );
             }
         }
     }
@@ -643,7 +723,9 @@ mod tests {
         };
         let readings = readings(sample, 145_060_000);
         for mode in [Layout::Floating, Layout::Taskbar] {
-            let (width, height) = mode.size();
+            let metrics =
+                Metrics::parse("cpu_frequency,upload,battery,uptime,memory,available_memory");
+            let (width, height) = mode.size(metrics);
             let scale = super::super::scale;
             unsafe {
                 SetWindowPos(
@@ -657,7 +739,7 @@ mod tests {
                 )
             }
             .unwrap();
-            panel.set_layout(mode);
+            panel.set_layout(mode, metrics);
             panel.resize(hwnd, dpi);
             for dark in [false, true] {
                 panel.paint(hwnd, dpi, dark, &readings).unwrap();

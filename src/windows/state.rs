@@ -8,6 +8,8 @@ use ::windows::{
     core::w,
 };
 
+use crate::model::Metrics;
+
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub enum Theme {
     #[default]
@@ -117,6 +119,7 @@ pub struct Settings {
     pub taskbar: bool,
     pub taskbar_side: TaskbarSide,
     pub refresh: Refresh,
+    pub metrics: Metrics,
     pub position: Option<POINT>,
 }
 
@@ -129,6 +132,7 @@ impl Default for Settings {
             taskbar: false,
             taskbar_side: TaskbarSide::default(),
             refresh: Refresh::default(),
+            metrics: Metrics::default(),
             position: None,
         }
     }
@@ -150,6 +154,7 @@ impl Settings {
                         "taskbar" => settings.taskbar = value.parse().unwrap_or(false),
                         "taskbar_side" => settings.taskbar_side = TaskbarSide::parse(value),
                         "refresh" => settings.refresh = Refresh::parse(value),
+                        "metrics" => settings.metrics = Metrics::parse(value),
                         "position" => settings.position = parse_point(value),
                         _ => {}
                     }
@@ -175,11 +180,12 @@ impl Settings {
             .position
             .map(|point| format!("{},{}", point.x, point.y))
             .unwrap_or_default();
+        let metrics = self.metrics.to_config();
         let temp = file.with_extension("tmp");
         fs::write(
             &temp,
             format!(
-                "traffic={}\ntheme={theme}\ntopmost={}\ntaskbar={}\ntaskbar_side={}\nrefresh={}\nposition={position}\n",
+                "traffic={}\ntheme={theme}\ntopmost={}\ntaskbar={}\ntaskbar_side={}\nrefresh={}\nposition={position}\nmetrics={metrics}\n",
                 self.traffic,
                 self.topmost,
                 self.taskbar,
