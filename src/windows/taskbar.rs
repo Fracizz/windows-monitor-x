@@ -18,9 +18,7 @@ use ::windows::{
     core::{Interface, PCWSTR, Result, w},
 };
 
-use crate::model::Metrics;
-
-use super::{panel::Layout, scale, state::TaskbarSide, window_dpi};
+use super::{scale, state::TaskbarSide, window_dpi};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Placement {
@@ -82,9 +80,9 @@ impl Taskbar {
         &mut self,
         own_window: HWND,
         side: TaskbarSide,
-        metrics: Metrics,
+        size: (i32, i32),
     ) -> Placement {
-        self.find_position(own_window, side, metrics)
+        self.find_position(own_window, side, size)
             .unwrap_or(Placement::Floating)
     }
 
@@ -92,7 +90,7 @@ impl Taskbar {
         &mut self,
         own_window: HWND,
         side: TaskbarSide,
-        metrics: Metrics,
+        (width, height): (i32, i32),
     ) -> Option<Placement> {
         let bar = unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) }.ok()?;
         let mut info = APPBARDATA {
@@ -110,7 +108,6 @@ impl Taskbar {
             return Some(Placement::Hidden);
         }
         let dpi = window_dpi(bar);
-        let (width, height) = Layout::Taskbar.size(metrics);
         let (width, height) = (scale(width, dpi), scale(height, dpi));
         let padding = scale(3, dpi);
         if height + scale(4, dpi) > bounds.bottom - bounds.top {

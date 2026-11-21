@@ -32,7 +32,7 @@ use ::windows::{
     core::{PCWSTR, w},
 };
 
-use crate::model::{Bytes, CpuTime, Sample, rate, traffic_delta};
+use crate::model::{Bytes, CpuTime, PhysicalMemory, Sample, rate, traffic_delta};
 
 // The SDK flag is not exposed by windows 0.62.
 const PDH_DOUBLE_UNCAPPED: PDH_FMT = PDH_FMT(PDH_FMT_DOUBLE.0 | 0x0000_8000);
@@ -82,10 +82,7 @@ impl Sampler {
         }
 
         sample.traffic = self.traffic;
-        if let Some(memory) = memory_status() {
-            sample.memory = Some(f64::from(memory.dwMemoryLoad));
-            sample.available_memory = Some(memory.ullAvailPhys);
-        }
+        sample.memory = memory_status();
         sample.battery = battery_percent();
         sample.uptime = Some(Duration::from_millis(unsafe { GetTickCount64() }));
         if now >= self.retry_at {
@@ -175,13 +172,16 @@ fn cpu_times() -> Option<CpuTime> {
     })
 }
 
-fn memory_status() -> Option<MEMORYSTATUSEX> {
+fn memory_status() -> Option<PhysicalMemory> {
     let mut memory = MEMORYSTATUSEX {
         dwLength: size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
     };
     unsafe { GlobalMemoryStatusEx(&mut memory) }.ok()?;
-    Some(memory)
+    Some(PhysicalMemory {
+        total: memory.ullTotalPhys,
+        available: memory.ullAvailPhys,
+    })
 }
 
 fn battery_percent() -> Option<f64> {
@@ -360,12 +360,16 @@ mod tests {
             "{sample:?}, {} active physical adapters",
             sampler.previous_network.len()
         );
-        for value in [sample.cpu, sample.memory, sample.disk] {
+        for value in [sample.cpu, sample.disk] {
             assert!(value.is_some_and(|value| (0.0..=100.0).contains(&value)));
         }
         assert!(sample.upload.is_some_and(|value| value >= 0.0));
         assert!(sample.download.is_some_and(|value| value >= 0.0));
-        assert!(sample.available_memory.is_some());
+        assert!(
+            sample
+                .memory
+                .is_some_and(|memory| memory.available <= memory.total && memory.total > 0)
+        );
         assert!(sample.cpu_mhz.is_none_or(|mhz| mhz >= 0.0));
         assert!(
             sample

@@ -29,8 +29,9 @@ use ::windows::{
     },
     core::{Result, w},
 };
-use windows_numerics::Vector2;
+use windows_numerics::{Matrix3x2, Vector2};
 
+use super::state::{DisplayOptions, TextSize};
 use crate::model::{Metric, Metrics, Reading};
 
 const ROW_HEIGHT: f32 = 24.0;
@@ -50,7 +51,15 @@ pub enum Layout {
 }
 
 impl Layout {
-    pub fn size(self, metrics: Metrics) -> (i32, i32) {
+    pub fn size(self, display: DisplayOptions) -> (i32, i32) {
+        let (width, height) = self.base_size(display.metrics);
+        (
+            display.text_size.scale(width),
+            display.text_size.scale(height),
+        )
+    }
+
+    fn base_size(self, metrics: Metrics) -> (i32, i32) {
         let width = self
             .columns(metrics)
             .last()
@@ -61,7 +70,11 @@ impl Layout {
         }
     }
 
-    pub const fn radius(self) -> i32 {
+    pub fn radius(self, text_size: TextSize) -> i32 {
+        text_size.scale(self.base_radius())
+    }
+
+    fn base_radius(self) -> i32 {
         match self {
             Self::Floating => 12,
             Self::Taskbar => 6,
@@ -79,7 +92,9 @@ impl Layout {
         let (floating, taskbar) = match metric {
             Metric::Upload | Metric::Download => (77, 71),
             Metric::Cpu | Metric::Memory | Metric::Disk | Metric::Battery => (94, 76),
-            Metric::Traffic | Metric::AvailableMemory => (120, 114),
+            Metric::Traffic => (120, 114),
+            Metric::AvailableMemory | Metric::UsedMemory => (135, 131),
+            Metric::AvailableMemoryPercent => (112, 106),
             Metric::CpuFrequency => (126, 120),
             Metric::Uptime => (142, 136),
         };
@@ -243,7 +258,7 @@ pub struct Panel {
     unit_format: IDWriteTextFormat,
     tabular: IDWriteTypography,
     mode: Layout,
-    metrics: Metrics,
+    display: DisplayOptions,
     labels: [Option<IDWriteTextLayout>; Metric::ALL.len()],
     empty_label: IDWriteTextLayout,
     values: [Option<TextReading>; Metric::ALL.len()],
@@ -255,7 +270,11 @@ impl Panel {
         let factory = unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
         let fonts = unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED)? };
         let label_format = text_format(&fonts, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?;
-        let number_format = text_format(&fonts, 16.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+        let number_format = text_format(
+            &fonts,
+            TextSize::DEFAULT as f32,
+            DWRITE_FONT_WEIGHT_SEMI_BOLD,
+        )?;
         let compact_format = text_format(&fonts, 15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
         let percent_format = text_format(&fonts, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
         let unit_format = text_format(&fonts, 11.5, DWRITE_FONT_WEIGHT_NORMAL)?;
@@ -275,6 +294,8 @@ impl Panel {
             let label = match metric {
                 Metric::Cpu => "CPU",
                 Metric::Memory => "内存",
+                Metric::AvailableMemory | Metric::AvailableMemoryPercent => "可用内存",
+                Metric::UsedMemory => "已用内存",
                 Metric::Disk => "磁盘",
                 Metric::CpuFrequency => "CPU 频率",
                 Metric::Battery => "电量",
@@ -293,7 +314,7 @@ impl Panel {
             unit_format,
             tabular,
             mode: Layout::Floating,
-            metrics: Metrics::default(),
+            display: DisplayOptions::default(),
             labels,
             empty_label,
             values: [const { None }; Metric::ALL.len()],
@@ -301,12 +322,12 @@ impl Panel {
         })
     }
 
-    pub fn set_layout(&mut self, mode: Layout, metrics: Metrics) {
-        if self.mode != mode || self.metrics != metrics {
-            self.mode = mode;
-            self.metrics = metrics;
+    pub fn set_layout(&mut self, mode: Layout, display: DisplayOptions) {
+        if self.mode != mode || self.display.metrics != display.metrics {
             self.values = [const { None }; Metric::ALL.len()];
         }
+        self.mode = mode;
+        self.display = display;
     }
 
     pub fn resize(&mut self, hwnd: HWND, dpi: u32) {
@@ -334,14 +355,16 @@ impl Panel {
         }
         let target = self.target.as_ref().expect("render target initialized");
         let colors = if dark { DARK } else { LIGHT };
-        let (width, height) = self.mode.size(self.metrics);
+        let (width, height) = self.mode.base_size(self.display.metrics);
+        let factor = self.display.text_size.factor();
         let result = unsafe {
             let window = &target.window;
             let brush = &target.brush;
             window.BeginDraw();
             window.Clear(Some(&color(colors.surface)));
+            window.SetTransform(&Matrix3x2::scale(factor, factor));
             if self.mode == Layout::Floating {
-                let radius = self.mode.radius() as f32 - 0.5;
+                let radius = self.mode.base_radius() as f32 - 0.5;
                 brush.SetColor(&color(colors.border));
                 window.DrawRoundedRectangle(
                     &D2D1_ROUNDED_RECT {
@@ -360,10 +383,10 @@ impl Panel {
                 );
             }
             brush.SetColor(&color(colors.divider));
-            for (start, end) in self.mode.dividers(self.metrics) {
+            for (start, end) in self.mode.dividers(self.display.metrics) {
                 window.DrawLine(start, end, brush, 1.0, None);
             }
-            if self.metrics.iter().next().is_none() {
+            if self.display.metrics.iter().next().is_none() {
                 brush.SetColor(&color(colors.label));
                 let x = (width as f32 - 112.0) / 2.0;
                 let y = (height as f32 - ROW_HEIGHT) / 2.0;
@@ -374,7 +397,7 @@ impl Panel {
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
             }
-            for (metric, slot) in self.mode.slots(self.metrics) {
+            for (metric, slot) in self.mode.slots(self.display.metrics) {
                 let index = metric.index();
                 let text = self.values[index]
                     .as_ref()
@@ -420,7 +443,7 @@ impl Panel {
     }
 
     fn update_text(&mut self, readings: &[Reading; Metric::ALL.len()]) -> Result<()> {
-        for (metric, slot) in self.mode.slots(self.metrics) {
+        for (metric, slot) in self.mode.slots(self.display.metrics) {
             let cached = &mut self.values[metric.index()];
             let reading = &readings[metric.index()];
             if cached
@@ -430,9 +453,12 @@ impl Panel {
                 continue;
             }
             let number_format = match metric {
-                Metric::Cpu | Metric::Memory | Metric::Disk | Metric::Battery | Metric::Uptime => {
-                    &self.percent_format
-                }
+                Metric::Cpu
+                | Metric::Memory
+                | Metric::Disk
+                | Metric::Battery
+                | Metric::Uptime
+                | Metric::AvailableMemoryPercent => &self.percent_format,
                 _ if self.mode == Layout::Taskbar => &self.compact_format,
                 _ => &self.number_format,
             };
@@ -495,14 +521,14 @@ impl Panel {
 }
 
 // The first frame uses GDI before DirectWrite and the system counters are ready.
-pub fn paint_starting(hwnd: HWND, dc: HDC, dpi: u32, dark: bool) {
+pub fn paint_starting(hwnd: HWND, dc: HDC, dpi: u32, dark: bool, text_size: TextSize) {
     let mut rect = RECT::default();
     if unsafe { GetClientRect(hwnd, &mut rect) }.is_err() {
         return;
     }
     let colors = if dark { DARK } else { LIGHT };
     let mut font = LOGFONTW {
-        lfHeight: -super::scale(14, dpi),
+        lfHeight: -super::scale(text_size.scale(14), dpi),
         lfWeight: 400,
         lfCharSet: DEFAULT_CHARSET,
         ..Default::default()
@@ -629,7 +655,7 @@ fn color(rgb: u32) -> D2D1_COLOR_F {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Sample, readings};
+    use crate::model::{PhysicalMemory, Sample, readings};
 
     #[test]
     fn text_fits_in_both_layouts() {
@@ -638,9 +664,11 @@ mod tests {
             upload: Some(1.0),
             download: Some(999_000_000.0),
             cpu: Some(100.0),
-            memory: Some(100.0),
+            memory: Some(PhysicalMemory {
+                total: 2_000_000_000_000,
+                available: 999_400_000_000,
+            }),
             disk: Some(100.0),
-            available_memory: Some(999_400_000_000),
             cpu_mhz: Some(5670.0),
             uptime: Some(std::time::Duration::from_secs(999 * 86_400 + 23 * 3_600)),
             battery: Some(100.0),
@@ -652,11 +680,15 @@ mod tests {
                 Metrics::parse(
                     "uptime,upload,available_memory,cpu_frequency,battery,download,traffic",
                 ),
-                [626, 550],
+                [635, 561],
             ),
             (
                 Metrics::parse("traffic,disk,upload,download,cpu_frequency,available_memory"),
-                [431, 383],
+                [440, 394],
+            ),
+            (
+                Metrics::parse("available_memory_percent,used_memory,available_memory"),
+                [342, 314],
             ),
             (Metrics::parse(""), [132, 112]),
         ];
@@ -665,11 +697,15 @@ mod tests {
                 .into_iter()
                 .zip(expected_widths)
             {
-                panel.set_layout(mode, metrics);
+                let display = DisplayOptions {
+                    metrics,
+                    ..Default::default()
+                };
+                panel.set_layout(mode, display);
                 panel
                     .update_text(&readings(sample, 999_990_000_000))
                     .unwrap();
-                assert_eq!(mode.size(metrics).0, expected_width);
+                assert_eq!(mode.size(display).0, expected_width);
                 assert!(
                     mode.slots(metrics)
                         .map(|(metric, _)| metric)
@@ -718,10 +754,13 @@ mod tests {
         let mode = Layout::Taskbar;
         let metrics = Metrics::default();
         let mut panel = Panel::new().unwrap();
-        panel.set_layout(mode, metrics);
+        panel.set_layout(mode, DisplayOptions::default());
         let sample = Sample {
             cpu: Some(9.0),
-            memory: Some(55.0),
+            memory: Some(PhysicalMemory {
+                total: 100,
+                available: 45,
+            }),
             disk: Some(3.0),
             ..Default::default()
         };
@@ -779,19 +818,30 @@ mod tests {
             upload: Some(409_000.0),
             download: Some(26_000.0),
             cpu: Some(9.0),
-            memory: Some(56.0),
+            memory: Some(PhysicalMemory {
+                total: 100,
+                available: 44,
+            }),
             disk: Some(1.0),
             ..Default::default()
         };
         let readings = readings(sample, 145_060_000);
-        let custom_metrics =
-            Metrics::parse("cpu_frequency,upload,battery,uptime,memory,available_memory");
-        for (mode, metrics) in [
-            (Layout::Floating, custom_metrics),
-            (Layout::Taskbar, custom_metrics),
-            (Layout::Taskbar, Metrics::default()),
+        let custom = DisplayOptions {
+            metrics: Metrics::parse(
+                "cpu_frequency,upload,battery,uptime,used_memory,available_memory,available_memory_percent",
+            ),
+            text_size: TextSize::new(TextSize::MAX).unwrap(),
+        };
+        let compact = DisplayOptions {
+            text_size: TextSize::new(TextSize::MIN).unwrap(),
+            ..custom
+        };
+        for (mode, display) in [
+            (Layout::Floating, custom),
+            (Layout::Taskbar, compact),
+            (Layout::Taskbar, DisplayOptions::default()),
         ] {
-            let (width, height) = mode.size(metrics);
+            let (width, height) = mode.size(display);
             let scale = super::super::scale;
             unsafe {
                 SetWindowPos(
@@ -805,7 +855,7 @@ mod tests {
                 )
             }
             .unwrap();
-            panel.set_layout(mode, metrics);
+            panel.set_layout(mode, display);
             panel.resize(hwnd, dpi);
             for dark in [false, true] {
                 panel.paint(hwnd, dpi, dark, &readings).unwrap();

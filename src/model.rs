@@ -5,13 +5,24 @@ pub struct Sample {
     pub upload: Option<f64>,
     pub download: Option<f64>,
     pub cpu: Option<f64>,
-    pub memory: Option<f64>,
+    pub memory: Option<PhysicalMemory>,
     pub disk: Option<f64>,
     pub traffic: u64,
-    pub available_memory: Option<u64>,
     pub cpu_mhz: Option<f64>,
     pub battery: Option<f64>,
     pub uptime: Option<Duration>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PhysicalMemory {
+    pub total: u64,
+    pub available: u64,
+}
+
+impl PhysicalMemory {
+    fn percent(self, bytes: u64) -> f64 {
+        100.0 * bytes as f64 / self.total as f64
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,10 +37,12 @@ pub enum Metric {
     CpuFrequency,
     Uptime,
     Battery,
+    AvailableMemoryPercent,
+    UsedMemory,
 }
 
 impl Metric {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::Upload,
         Self::Download,
         Self::Cpu,
@@ -40,6 +53,8 @@ impl Metric {
         Self::CpuFrequency,
         Self::Uptime,
         Self::Battery,
+        Self::AvailableMemoryPercent,
+        Self::UsedMemory,
     ];
 
     pub const fn index(self) -> usize {
@@ -58,6 +73,8 @@ impl Metric {
             Self::CpuFrequency => "cpu_frequency",
             Self::Battery => "battery",
             Self::Uptime => "uptime",
+            Self::AvailableMemoryPercent => "available_memory_percent",
+            Self::UsedMemory => "used_memory",
         }
     }
 }
@@ -238,6 +255,13 @@ impl Reading {
         Self::scale(bytes as f64, &["B", "KB", "MB", "GB", "TB", "PB", "EB"])
     }
 
+    fn gigabytes(bytes: Option<u64>) -> Self {
+        bytes.map_or_else(Self::unavailable, |bytes| Self {
+            number: format!("{:.2}", bytes as f64 / 1_000_000_000.0),
+            unit: "GB",
+        })
+    }
+
     fn uptime(duration: Duration) -> Self {
         let seconds = duration.as_secs();
         let days = seconds / 86_400;
@@ -296,21 +320,29 @@ impl Reading {
 }
 
 pub fn readings(sample: Sample, total: u64) -> [Reading; Metric::ALL.len()] {
+    let memory = sample
+        .memory
+        .filter(|memory| memory.total > 0 && memory.available <= memory.total);
+    let used = memory.map(|memory| memory.total - memory.available);
     Metric::ALL.map(|metric| match metric {
         Metric::Upload => Reading::rate(sample.upload),
         Metric::Download => Reading::rate(sample.download),
         Metric::Cpu => Reading::percent(sample.cpu),
-        Metric::Memory => Reading::percent(sample.memory),
+        Metric::Memory => {
+            Reading::percent(memory.zip(used).map(|(memory, used)| memory.percent(used)))
+        }
         Metric::Disk => Reading::percent(sample.disk),
         Metric::Traffic => Reading::bytes(total),
-        Metric::AvailableMemory => sample
-            .available_memory
-            .map_or_else(Reading::unavailable, Reading::bytes),
+        Metric::AvailableMemory => Reading::gigabytes(memory.map(|memory| memory.available)),
         Metric::CpuFrequency => Reading::frequency(sample.cpu_mhz),
         Metric::Battery => Reading::percent(sample.battery),
         Metric::Uptime => sample
             .uptime
             .map_or_else(Reading::unavailable, Reading::uptime),
+        Metric::AvailableMemoryPercent => {
+            Reading::percent(memory.map(|memory| memory.percent(memory.available)))
+        }
+        Metric::UsedMemory => Reading::gigabytes(used),
     })
 }
 
@@ -370,10 +402,12 @@ mod tests {
             upload: Some(999_900.0),
             download: Some(21_000.0),
             cpu: Some(12.3),
-            memory: Some(57.0),
+            memory: Some(PhysicalMemory {
+                total: 20_000_000_000,
+                available: 8_530_000_000,
+            }),
             disk: None,
             traffic: 16_360_000_000,
-            available_memory: Some(8_530_000_000),
             cpu_mhz: Some(3424.0),
             battery: None,
             uptime: Some(Duration::from_secs(86_400 + 3_600)),
@@ -391,12 +425,40 @@ mod tests {
                 ("57", "%"),
                 ("—", ""),
                 ("16", "GB"),
-                ("9", "GB"),
+                ("8.53", "GB"),
                 ("3.42", "GHz"),
                 ("1天 1时", ""),
                 ("—", ""),
+                ("43", "%"),
+                ("11.47", "GB"),
             ]
         );
+    }
+
+    #[test]
+    fn memory_readings_keep_gigabytes_at_zero_and_handle_invalid_samples() {
+        let sample = |total, available| Sample {
+            memory: Some(PhysicalMemory { total, available }),
+            ..Default::default()
+        };
+        let full = readings(sample(20_000_000_000, 0), 0);
+        assert_eq!(full[Metric::AvailableMemory.index()].number, "0.00");
+        assert_eq!(full[Metric::AvailableMemory.index()].unit, "GB");
+        assert_eq!(full[Metric::UsedMemory.index()].number, "20.00");
+        let empty = readings(sample(20_000_000_000, 20_000_000_000), 0);
+        assert_eq!(empty[Metric::UsedMemory.index()].number, "0.00");
+        assert_eq!(empty[Metric::AvailableMemoryPercent.index()].number, "100");
+        for sample in [Sample::default(), sample(0, 0), sample(1, 2)] {
+            let values = readings(sample, 0);
+            for metric in [
+                Metric::Memory,
+                Metric::AvailableMemory,
+                Metric::AvailableMemoryPercent,
+                Metric::UsedMemory,
+            ] {
+                assert_eq!(values[metric.index()], Reading::unavailable());
+            }
+        }
     }
 
     #[test]

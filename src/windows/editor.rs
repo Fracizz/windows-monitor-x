@@ -21,8 +21,9 @@ use ::windows::{
 };
 
 use super::panel::{Layout, Panel};
-use super::{Window, invalidate, metric_name, scale, set_metrics, window_dpi, with_app};
-use crate::model::{Metric, Metrics};
+use super::state::{DisplayOptions, TextSize};
+use super::{Window, invalidate, metric_name, scale, set_display, window_dpi, with_app};
+use crate::model::Metric;
 
 const CLASS: PCWSTR = w!("WindowsMonitor.MetricsEditor");
 const PREVIEW_CLASS: PCWSTR = w!("WindowsMonitor.MetricsPreview");
@@ -32,6 +33,7 @@ const LIST: usize = 10;
 const UP: usize = 11;
 const DOWN: usize = 12;
 const PREVIEW_MODE: usize = 13;
+const TEXT_SIZE: usize = 14;
 
 thread_local! {
     static EDITOR: RefCell<Option<Editor>> = const { RefCell::new(None) };
@@ -45,11 +47,13 @@ struct Editor {
     up: HWND,
     down: HWND,
     mode: HWND,
+    size_label: HWND,
+    size: HWND,
     preview: HWND,
     apply: HWND,
     cancel: HWND,
     panel: Panel,
-    metrics: Metrics,
+    display: DisplayOptions,
     layout: Layout,
     preview_dpi: u32,
     drag: Option<usize>,
@@ -62,13 +66,13 @@ pub fn open(owner: HWND) -> Result<()> {
         }
         return Ok(());
     }
-    let Some((metrics, layout, icon)) = with_app(|app| {
+    let Some((display, layout, icon)) = with_app(|app| {
         let layout = if app.settings.taskbar {
             Layout::Taskbar
         } else {
             Layout::Floating
         };
-        (app.settings.metrics, layout, app.tray.hIcon)
+        (app.settings.display, layout, app.tray.hIcon)
     }) else {
         return Ok(());
     };
@@ -128,7 +132,7 @@ pub fn open(owner: HWND) -> Result<()> {
             None,
         )?
     });
-    let editor = Editor::new(window.0, owner, metrics, layout)?;
+    let editor = Editor::new(window.0, owner, display, layout)?;
     let hwnd = window.0;
     let list = editor.list;
     EDITOR.with(|slot| *slot.borrow_mut() = Some(editor));
@@ -172,7 +176,7 @@ fn register_class(
 }
 
 impl Editor {
-    fn new(hwnd: HWND, owner: HWND, metrics: Metrics, layout: Layout) -> Result<Self> {
+    fn new(hwnd: HWND, owner: HWND, display: DisplayOptions, layout: Layout) -> Result<Self> {
         let hint = control(hwnd, WC_STATICW, w!("勾选显示项，拖动调整顺序。"), 0, 0)?;
         let list = control(
             hwnd,
@@ -206,6 +210,14 @@ impl Editor {
             PCWSTR::null(),
             WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32,
             PREVIEW_MODE,
+        )?;
+        let size_label = control(hwnd, WC_STATICW, w!("显示大小"), 0, 0)?;
+        let size = control(
+            hwnd,
+            WC_COMBOBOXW,
+            PCWSTR::null(),
+            WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
+            TEXT_SIZE,
         )?;
         let preview = control(hwnd, PREVIEW_CLASS, PCWSTR::null(), 0, 0)?;
         let apply = control(
@@ -242,6 +254,16 @@ impl Editor {
             usize::from(layout == Layout::Taskbar),
             0,
         );
+        for pixels in TextSize::MIN..=TextSize::MAX {
+            let text = format!("{pixels} px\0").encode_utf16().collect::<Vec<_>>();
+            send(size, CB_ADDSTRING, 0, text.as_ptr() as isize);
+        }
+        send(
+            size,
+            CB_SETCURSEL,
+            (display.text_size.pixels() - TextSize::MIN) as usize,
+            0,
+        );
         let editor = Self {
             hwnd,
             owner,
@@ -250,16 +272,18 @@ impl Editor {
             up,
             down,
             mode,
+            size_label,
+            size,
             preview,
             apply,
             cancel,
             panel: Panel::new()?,
-            metrics,
+            display,
             layout,
             preview_dpi: window_dpi(hwnd),
             drag: None,
         };
-        for (index, metric) in metrics.ordered().into_iter().enumerate() {
+        for (index, metric) in display.metrics.ordered().into_iter().enumerate() {
             editor.write_item(index, metric, LVM_INSERTITEMW);
         }
         editor.select(0);
@@ -312,6 +336,20 @@ impl Editor {
                 scale(130, dpi),
             ),
             (
+                self.size_label,
+                preview_left,
+                scale(54, dpi),
+                scale(64, dpi),
+                scale(20, dpi),
+            ),
+            (
+                self.size,
+                preview_left + scale(68, dpi),
+                scale(49, dpi),
+                scale(86, dpi),
+                scale(240, dpi),
+            ),
+            (
                 self.apply,
                 bounds.right - margin - 2 * button - gap,
                 buttons_top,
@@ -342,7 +380,7 @@ impl Editor {
         let margin = scale(16, dpi);
         let left = scale(214, dpi).min(bounds.right / 2) + 2 * margin;
         let available = (bounds.right - left - margin).max(1);
-        let (width, height) = self.layout.size(self.metrics);
+        let (width, height) = self.layout.size(self.display);
         self.preview_dpi = dpi.min(((i64::from(available) * 96) / i64::from(width)).max(1) as u32);
         let (width, height) = (
             scale(width, self.preview_dpi).max(1),
@@ -355,9 +393,13 @@ impl Editor {
             width,
             height,
         );
-        self.panel.set_layout(self.layout, self.metrics);
+        self.panel.set_layout(self.layout, self.display);
         self.panel.resize(self.preview, self.preview_dpi);
-        super::round_window(self.preview, self.preview_dpi, self.layout.radius());
+        super::round_window(
+            self.preview,
+            self.preview_dpi,
+            self.layout.radius(self.display.text_size),
+        );
         invalidate(self.preview);
     }
 
@@ -371,7 +413,7 @@ impl Editor {
         };
         send(self.list, message, 0, &item as *const _ as isize);
         let check = LVITEMW {
-            state: LIST_VIEW_ITEM_STATE_FLAGS(if self.metrics.contains(metric) {
+            state: LIST_VIEW_ITEM_STATE_FLAGS(if self.display.metrics.contains(metric) {
                 0x2000
             } else {
                 0x1000
@@ -407,8 +449,9 @@ impl Editor {
         if from == to {
             return;
         }
-        self.metrics.move_to(from, to);
+        self.display.metrics.move_to(from, to);
         for (index, metric) in self
+            .display
             .metrics
             .ordered()
             .into_iter()
@@ -469,7 +512,13 @@ impl Editor {
         if info.hdr.hwndFrom != self.list {
             return;
         }
-        let Some(metric) = self.metrics.ordered().get(info.iItem as usize).copied() else {
+        let Some(metric) = self
+            .display
+            .metrics
+            .ordered()
+            .get(info.iItem as usize)
+            .copied()
+        else {
             return;
         };
         match info.hdr.code {
@@ -482,7 +531,7 @@ impl Editor {
             LVN_ITEMCHANGED if info.uChanged.0 & LVIF_STATE.0 != 0 => {
                 let state = info.uNewState & LVIS_STATEIMAGEMASK.0;
                 if state != info.uOldState & LVIS_STATEIMAGEMASK.0 && state != 0 {
-                    self.metrics.set_visible(metric, state == 0x2000);
+                    self.display.metrics.set_visible(metric, state == 0x2000);
                     self.arrange_preview();
                 }
             }
@@ -556,9 +605,9 @@ unsafe extern "system" fn editor_proc(
         DM_GETDEFID => return LRESULT(((DC_HASDEFID << 16) | IDOK.0 as u32) as isize),
         WM_COMMAND => match wparam.0 & 0xffff {
             id if id == IDOK.0 as usize => {
-                if let Some((owner, metrics)) = with_editor(|editor| (editor.owner, editor.metrics))
+                if let Some((owner, display)) = with_editor(|editor| (editor.owner, editor.display))
                 {
-                    set_metrics(owner, metrics);
+                    set_display(owner, display);
                 }
                 unsafe {
                     let _ = DestroyWindow(hwnd);
@@ -579,6 +628,17 @@ unsafe extern "system" fn editor_proc(
                         Layout::Floating
                     };
                     editor.arrange_preview();
+                });
+            }
+            TEXT_SIZE if wparam.0 >> 16 == CBN_SELCHANGE as usize => {
+                with_editor(|editor| {
+                    let index = send(editor.size, CB_GETCURSEL, 0, 0);
+                    if index >= 0
+                        && let Some(size) = TextSize::new(index as i32 + TextSize::MIN)
+                    {
+                        editor.display.text_size = size;
+                        editor.arrange_preview();
+                    }
                 });
             }
             _ => {}
@@ -699,8 +759,8 @@ mod tests {
             ));
         });
         open(owner.0).unwrap();
-        let (hwnd, list, preview) =
-            with_editor(|editor| (editor.hwnd, editor.list, editor.preview)).unwrap();
+        let (hwnd, list, preview, size) =
+            with_editor(|editor| (editor.hwnd, editor.list, editor.preview, editor.size)).unwrap();
         let initial_width = client_width(preview);
         let initial_dpi = with_editor(|editor| editor.preview_dpi).unwrap();
         assert!(initial_width > 0);
@@ -726,7 +786,7 @@ mod tests {
         };
         send(list, LVM_SETITEMSTATE, memory, &item as *const _ as isize);
         assert_eq!(
-            with_editor(|editor| editor.metrics.contains(Metric::AvailableMemory)),
+            with_editor(|editor| editor.display.metrics.contains(Metric::AvailableMemory)),
             Some(true)
         );
         assert!(
@@ -759,10 +819,10 @@ mod tests {
         let mouse = (points[0].x as u16 as isize) | ((points[0].y as u16 as isize) << 16);
         send(hwnd, WM_MOUSEMOVE, 0, mouse);
         assert_eq!(
-            with_editor(|editor| editor.metrics.iter().next()),
+            with_editor(|editor| editor.display.metrics.iter().next()),
             Some(Some(Metric::AvailableMemory))
         );
-        assert_eq!(with_app(|app| app.settings.metrics), Some(settings.metrics));
+        assert_eq!(with_app(|app| app.settings.display), Some(settings.display));
         send(hwnd, WM_LBUTTONUP, 0, mouse);
 
         let mode = with_editor(|editor| editor.mode).unwrap();
@@ -774,15 +834,33 @@ mod tests {
             mode.0 as isize,
         );
         assert_eq!(with_editor(|editor| editor.layout), Some(Layout::Taskbar));
+        let preview_height = client_bounds(preview).bottom;
+        send(size, CB_SETCURSEL, 0, 0);
+        send(
+            hwnd,
+            WM_COMMAND,
+            TEXT_SIZE | ((CBN_SELCHANGE as usize) << 16),
+            size.0 as isize,
+        );
+        assert_eq!(
+            with_editor(|editor| editor.display.text_size.pixels()),
+            Some(TextSize::MIN)
+        );
+        assert!(client_bounds(preview).bottom < preview_height);
+        assert_eq!(with_app(|app| app.settings.display), Some(settings.display));
         send(hwnd, WM_COMMAND, IDCANCEL.0 as usize, 0);
         assert_eq!(with_editor(|editor| editor.hwnd), None);
-        assert_eq!(with_app(|app| app.settings.metrics), Some(settings.metrics));
+        assert_eq!(with_app(|app| app.settings.display), Some(settings.display));
         super::super::APP.with(|app| app.borrow_mut().take());
     }
 
     fn client_width(hwnd: HWND) -> i32 {
+        client_bounds(hwnd).right
+    }
+
+    fn client_bounds(hwnd: HWND) -> RECT {
         let mut bounds = RECT::default();
         unsafe { GetClientRect(hwnd, &mut bounds) }.unwrap();
-        bounds.right
+        bounds
     }
 }

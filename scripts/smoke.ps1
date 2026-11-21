@@ -125,7 +125,7 @@ function Test-TaskbarPlacement {
     $taskbarDpi = [MonitorSmoke.Native]::GetDpiForWindow($taskbar)
     return (
         [MonitorSmoke.Native]::IsWindowVisible($window) -and
-        ($panel.Right - $panel.Left) -eq [math]::Floor((360 * $taskbarDpi + 48) / 96) -and
+        ($panel.Right - $panel.Left) -eq [math]::Floor((326 * $taskbarDpi + 48) / 96) -and
         ($panel.Bottom - $panel.Top) -eq [math]::Floor((36 * $taskbarDpi + 48) / 96) -and
         $panel.Left -ge $bar.Left -and $panel.Right -le $bar.Right -and
         $panel.Top -ge $bar.Top -and $panel.Bottom -le $bar.Bottom
@@ -253,7 +253,7 @@ try {
             Wait-For { Test-TaskbarPlacement } 'Dock preference was not restored after restart.'
         } else {
             Wait-For { Test-Setting 'taskbar=true' } 'Dock preference was not preserved after restart.'
-            Assert-True (-not [MonitorSmoke.Native]::IsWindowVisible($window)) 'The restarted panel should be hidden.'
+            Wait-For { -not [MonitorSmoke.Native]::IsWindowVisible($window) } 'The restarted panel should become hidden.'
         }
         Send-Panel 0x111 108
         Wait-For {

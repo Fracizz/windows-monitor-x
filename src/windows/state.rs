@@ -119,7 +119,7 @@ pub struct Settings {
     pub taskbar: bool,
     pub taskbar_side: TaskbarSide,
     pub refresh: Refresh,
-    pub metrics: Metrics,
+    pub display: DisplayOptions,
     pub position: Option<POINT>,
 }
 
@@ -132,7 +132,7 @@ impl Default for Settings {
             taskbar: false,
             taskbar_side: TaskbarSide::default(),
             refresh: Refresh::default(),
-            metrics: Metrics::default(),
+            display: DisplayOptions::default(),
             position: None,
         }
     }
@@ -154,7 +154,14 @@ impl Settings {
                         "taskbar" => settings.taskbar = value.parse().unwrap_or(false),
                         "taskbar_side" => settings.taskbar_side = TaskbarSide::parse(value),
                         "refresh" => settings.refresh = Refresh::parse(value),
-                        "metrics" => settings.metrics = Metrics::parse(value),
+                        "metrics" => settings.display.metrics = Metrics::parse(value),
+                        "text_size" => {
+                            settings.display.text_size = value
+                                .parse()
+                                .ok()
+                                .and_then(TextSize::new)
+                                .unwrap_or_default();
+                        }
                         "position" => settings.position = parse_point(value),
                         _ => {}
                     }
@@ -180,12 +187,13 @@ impl Settings {
             .position
             .map(|point| format!("{},{}", point.x, point.y))
             .unwrap_or_default();
-        let metrics = self.metrics.to_config();
+        let metrics = self.display.metrics.to_config();
+        let text_size = self.display.text_size.pixels();
         let temp = file.with_extension("tmp");
         fs::write(
             &temp,
             format!(
-                "traffic={}\ntheme={theme}\ntopmost={}\ntaskbar={}\ntaskbar_side={}\nrefresh={}\nposition={position}\nmetrics={metrics}\n",
+                "traffic={}\ntheme={theme}\ntopmost={}\ntaskbar={}\ntaskbar_side={}\nrefresh={}\nposition={position}\nmetrics={metrics}\ntext_size={text_size}\n",
                 self.traffic,
                 self.topmost,
                 self.taskbar,
@@ -194,6 +202,45 @@ impl Settings {
             ),
         )?;
         fs::rename(temp, file)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DisplayOptions {
+    pub metrics: Metrics,
+    pub text_size: TextSize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextSize(i32);
+
+impl TextSize {
+    pub const MIN: i32 = 10;
+    pub const MAX: i32 = 24;
+    pub const DEFAULT: i32 = 16;
+
+    pub fn new(pixels: i32) -> Option<Self> {
+        (Self::MIN..=Self::MAX)
+            .contains(&pixels)
+            .then_some(Self(pixels))
+    }
+
+    pub fn pixels(self) -> i32 {
+        self.0
+    }
+
+    pub fn factor(self) -> f32 {
+        self.0 as f32 / Self::DEFAULT as f32
+    }
+
+    pub fn scale(self, length: i32) -> i32 {
+        (length * self.0 + Self::DEFAULT - 1) / Self::DEFAULT
+    }
+}
+
+impl Default for TextSize {
+    fn default() -> Self {
+        Self(Self::DEFAULT)
     }
 }
 
