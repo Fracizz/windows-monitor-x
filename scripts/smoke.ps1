@@ -279,6 +279,7 @@ try {
     if ($RequireTaskbar -or $ExpectDockHidden) {
         if ($RequireTaskbar) {
             Wait-For { Test-TaskbarPlacement } 'Dock preference was not restored after restart.'
+            Wait-For { Test-PanelOnTopAtCenter } 'Explorer covered the taskbar panel after restart.'
         } else {
             Wait-For { Test-Setting 'taskbar=true' } 'Dock preference was not preserved after restart.'
             Wait-For { -not [MonitorSmoke.Native]::IsWindowVisible($window) } 'The restarted panel should become hidden.'

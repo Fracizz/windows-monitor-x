@@ -18,9 +18,11 @@ use ::windows::{
             Accessibility::*,
             Shell::{ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage},
             WindowsAndMessaging::{
-                FindWindowExW, FindWindowW, GA_ROOT, GW_HWNDPREV, GWL_EXSTYLE, GetAncestor,
-                GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetWindow,
-                GetWindowLongPtrW, GetWindowRect, IsWindowVisible, WS_EX_LAYERED, WindowFromPoint,
+                FindWindowExW, FindWindowW, GA_ROOT, GA_ROOTOWNER, GUI_INMENUMODE,
+                GUI_POPUPMENUMODE, GUITHREADINFO, GW_HWNDPREV, GWL_EXSTYLE, GetAncestor,
+                GetDesktopWindow, GetForegroundWindow, GetGUIThreadInfo, GetShellWindow, GetWindow,
+                GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
+                WS_EX_LAYERED, WindowFromPoint,
             },
         },
     },
@@ -37,9 +39,15 @@ pub enum Placement {
     Docked(RECT),
 }
 
+pub enum Observation {
+    Placement(Placement),
+    NoRoom,
+    MenuOpen,
+}
+
 #[derive(Default)]
 pub struct DockPlacement {
-    current: Placement,
+    current: Option<Placement>,
     pending: Option<(Placement, Instant)>,
     preferred_x: Option<i32>,
 }
@@ -54,15 +62,20 @@ impl DockPlacement {
         self.pending = None;
     }
 
+    pub fn hold(&mut self) -> Option<Placement> {
+        self.pending = None;
+        self.current
+    }
+
     pub fn resolve(&mut self, observed: Option<Placement>, now: Instant) -> Option<Placement> {
         let next = observed.unwrap_or_default();
         // Explorer's layout and foreground bounds can be in transition for one poll.
-        let needs_confirmation = next != self.current
+        let needs_confirmation = Some(next) != self.current
             && (observed.is_none()
                 || next == Placement::Hidden
                 || matches!(
                     (self.current, next),
-                    (Placement::Docked(_), Placement::Docked(_))
+                    (Some(Placement::Docked(_)), Placement::Docked(_))
                 ));
         if needs_confirmation {
             let since = match self.pending {
@@ -77,7 +90,7 @@ impl DockPlacement {
             }
         }
         self.pending = None;
-        self.current = next;
+        self.current = Some(next);
         if let Placement::Docked(rect) = next {
             self.preferred_x = Some(rect.left);
         }
@@ -133,33 +146,33 @@ impl Taskbar {
         }
     }
 
-    pub fn placement(
+    pub fn observe(
         &mut self,
+        bar: HWND,
         own_window: HWND,
         side: TaskbarSide,
         (width, height): (i32, i32),
         preferred_x: Option<i32>,
-    ) -> Option<Placement> {
-        let bar = unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) }.ok()?;
+    ) -> Option<Observation> {
         let mut info = APPBARDATA {
             cbSize: size_of::<APPBARDATA>() as u32,
             ..Default::default()
         };
         if unsafe { SHAppBarMessage(ABM_GETSTATE, &mut info) } & ABS_AUTOHIDE as usize != 0 {
-            return Some(Placement::Floating);
+            return Some(Observation::Placement(Placement::Floating));
         }
         let bounds = window_rect(bar)?;
         if bounds.right - bounds.left <= bounds.bottom - bounds.top {
-            return Some(Placement::Floating);
+            return Some(Observation::Placement(Placement::Floating));
         }
         if !unsafe { IsWindowVisible(bar).as_bool() } || fullscreen_on_bar(bar, own_window) {
-            return Some(Placement::Hidden);
+            return Some(Observation::Placement(Placement::Hidden));
         }
         let dpi = window_dpi(bar);
         let (width, height) = (scale(width, dpi), scale(height, dpi));
         let padding = scale(3, dpi);
         if height + scale(4, dpi) > bounds.bottom - bounds.top {
-            return Some(Placement::Floating);
+            return Some(Observation::Placement(Placement::Floating));
         }
 
         let tray =
@@ -183,10 +196,13 @@ impl Taskbar {
                     continue;
                 }
                 let rect = child.CachedBoundingRectangle().ok()?;
+                let kind = child.CachedControlType().ok()?;
+                if popup_menu(kind, rect, bounds) {
+                    return Some(Observation::MenuOpen);
+                }
                 if !valid_on_bar(rect, bounds) || rect.left >= tray.left {
                     continue;
                 }
-                let kind = child.CachedControlType().ok()?;
                 if is_button(kind) {
                     has_app_buttons = true;
                 } else if kind != UIA_PaneControlTypeId
@@ -210,7 +226,7 @@ impl Taskbar {
         if !has_app_buttons {
             return None;
         }
-        let x = taskbar_gap(
+        let Some(x) = taskbar_gap(
             bounds.left,
             bounds.right,
             &mut self.occupied,
@@ -218,22 +234,44 @@ impl Taskbar {
             padding,
             side,
             preferred_x,
-        )?;
+        ) else {
+            return Some(Observation::NoRoom);
+        };
         let y = bounds.top + (bounds.bottom - bounds.top - height) / 2;
-        Some(Placement::Docked(RECT {
+        Some(Observation::Placement(Placement::Docked(RECT {
             left: x,
             top: y,
             right: x + width,
             bottom: y + height,
-        }))
+        })))
     }
+}
+
+pub fn primary_taskbar() -> Option<HWND> {
+    unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) }.ok()
+}
+
+pub fn taskbar_has_focus(bar: HWND) -> bool {
+    let foreground = unsafe { GetForegroundWindow() };
+    foreground == bar || unsafe { GetAncestor(foreground, GA_ROOTOWNER) == bar }
+}
+
+pub fn taskbar_menu_open(bar: HWND) -> bool {
+    let thread = unsafe { GetWindowThreadProcessId(bar, None) };
+    let mut info = GUITHREADINFO {
+        cbSize: size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    thread != 0
+        && unsafe { GetGUIThreadInfo(thread, &mut info) }.is_ok()
+        && (info.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)).0 != 0
 }
 
 pub fn covered_by_taskbar(window: HWND, rect: RECT) -> bool {
     if !unsafe { IsWindowVisible(window).as_bool() } || window_rect(window) != Some(rect) {
         return false;
     }
-    let Ok(bar) = (unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) }) else {
+    let Some(bar) = primary_taskbar() else {
         return false;
     };
     let center = POINT {
@@ -268,12 +306,21 @@ fn window_rect(hwnd: HWND) -> Option<RECT> {
 }
 
 fn valid_on_bar(rect: RECT, bar: RECT) -> bool {
+    let row_center = bar.top + (bar.bottom - bar.top) / 2;
     rect.left < rect.right
+        && rect.right > bar.left
+        && rect.left < bar.right
+        && rect.top <= row_center
+        && rect.bottom > row_center
+}
+
+fn popup_menu(kind: UIA_CONTROLTYPE_ID, rect: RECT, bar: RECT) -> bool {
+    (kind == UIA_MenuControlTypeId || kind == UIA_MenuItemControlTypeId)
+        && rect.left < rect.right
         && rect.top < rect.bottom
         && rect.right > bar.left
         && rect.left < bar.right
-        && rect.bottom > bar.top
-        && rect.top < bar.bottom
+        && (rect.top < bar.top || rect.bottom > bar.bottom)
 }
 
 fn is_button(kind: UIA_CONTROLTYPE_ID) -> bool {
@@ -298,6 +345,7 @@ fn fullscreen_on_bar(bar: HWND, own_window: HWND) -> bool {
         || foreground == own_window
         || foreground == unsafe { GetShellWindow() }
         || foreground == unsafe { GetDesktopWindow() }
+        || unsafe { GetAncestor(foreground, GA_ROOTOWNER) == bar }
     {
         return false;
     }
@@ -421,7 +469,11 @@ mod tests {
         });
         let mut placement = DockPlacement::default();
 
-        assert_eq!(placement.resolve(Some(docked), start), Some(docked));
+        assert_eq!(placement.resolve(None, start), None);
+        assert_eq!(
+            placement.resolve(Some(docked), start + second / 2),
+            Some(docked)
+        );
         assert_eq!(placement.resolve(None, start + second), None);
         assert_eq!(
             placement.resolve(Some(Placement::Hidden), start + second * 2),
@@ -433,6 +485,9 @@ mod tests {
             Some(docked)
         );
 
+        assert_eq!(placement.resolve(Some(moved), start + second * 5), None);
+        assert_eq!(placement.hold(), Some(docked));
+        assert_eq!(placement.preferred_x(), Some(80));
         assert_eq!(placement.resolve(Some(moved), start + second * 5), None);
         assert_eq!(
             placement.resolve(Some(moved), start + second * 6),
@@ -457,5 +512,32 @@ mod tests {
             placement.resolve(None, start + second * 11),
             Some(Placement::Floating)
         );
+    }
+
+    #[test]
+    fn a_popup_touching_the_taskbar_edge_does_not_occupy_a_slot() {
+        let bar = RECT {
+            left: 0,
+            top: 800,
+            right: 1000,
+            bottom: 840,
+        };
+        let popup = RECT {
+            left: 30,
+            top: 730,
+            right: 180,
+            bottom: 806,
+        };
+        let button = RECT {
+            left: 30,
+            top: 806,
+            right: 80,
+            bottom: 836,
+        };
+        assert!(!valid_on_bar(popup, bar));
+        assert!(valid_on_bar(button, bar));
+        assert!(popup_menu(UIA_MenuItemControlTypeId, popup, bar));
+        assert!(!popup_menu(UIA_MenuItemControlTypeId, button, bar));
+        assert!(!popup_menu(UIA_ButtonControlTypeId, popup, bar));
     }
 }

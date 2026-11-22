@@ -26,6 +26,7 @@ use ::windows::{
         },
         System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
         UI::{
+            Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             HiDpi::GetDpiForWindow,
             Shell::{
                 NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION,
@@ -41,7 +42,10 @@ use crate::model::{Metric, Reading, Sample, readings};
 use panel::{Appearance, Layout, Panel};
 use sampler::Sampler;
 use state::{DisplayOptions, Refresh, Settings, TaskbarSide, TextSize, Theme};
-use taskbar::{DockPlacement, Placement, Taskbar, covered_by_taskbar};
+use taskbar::{
+    DockPlacement, Observation, Placement, Taskbar, covered_by_taskbar, primary_taskbar,
+    taskbar_has_focus, taskbar_menu_open,
+};
 
 const CLASS: PCWSTR = w!("WindowsMonitor.Panel");
 const PRODUCT_NAME: &str = env!("WINDOWS_MONITOR_PRODUCT_NAME");
@@ -50,6 +54,7 @@ const TRAY_EVENT: u32 = WM_APP + 2;
 const REVEAL_WINDOW: u32 = WM_APP + 3;
 const DOCK_READY: u32 = WM_APP + 4;
 const UPDATE_READY: u32 = WM_APP + 5;
+const TASKBAR_INTERACTION: u32 = WM_APP + 6;
 const TRAY_ID: u32 = 1;
 const ICON_ID: PCWSTR = PCWSTR(101usize as *const u16);
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
@@ -93,6 +98,7 @@ enum WorkerCommand {
     Interval(Refresh),
     Dock(Option<u64>, TaskbarSide, (i32, i32)),
     RecheckDock,
+    TaskbarInteraction,
     Stop,
 }
 
@@ -108,7 +114,7 @@ struct App {
     worker: mpsc::Sender<WorkerCommand>,
     shown: bool,
     dock_generation: u64,
-    placement: Placement,
+    placement: Option<Placement>,
     sample: Sample,
     waiting_sample: bool,
     displayed: [Reading; Metric::ALL.len()],
@@ -155,7 +161,7 @@ impl App {
             worker,
             shown: true,
             dock_generation: 0,
-            placement: Placement::Floating,
+            placement: (!settings.taskbar).then_some(Placement::Floating),
             sample,
             waiting_sample: true,
             displayed: readings(sample, settings.traffic),
@@ -176,11 +182,15 @@ impl App {
     }
 
     fn layout(&self) -> Layout {
-        if matches!(self.placement, Placement::Docked(_)) {
+        if matches!(self.placement, Some(Placement::Docked(_))) {
             Layout::Taskbar
         } else {
             Layout::Floating
         }
+    }
+
+    fn panel_topmost(&self) -> bool {
+        self.settings.topmost || self.placement != Some(Placement::Floating)
     }
 
     fn request_dock(&mut self) {
@@ -324,13 +334,31 @@ impl SamplerWorker {
                     if let Some((generation, deadline)) = dock
                         && now >= deadline
                     {
-                        if taskbar.is_none() {
-                            taskbar = Taskbar::new().ok();
-                        }
-                        let observed = taskbar.as_mut().and_then(|bar| {
-                            bar.placement(hwnd, taskbar_side, dock_size, dock_placement.preferred_x())
-                        });
-                        if let Some(placement) = dock_placement.resolve(observed, Instant::now())
+                        let bar = primary_taskbar();
+                        let observed = if bar.is_some_and(taskbar_menu_open) {
+                            Some(Observation::MenuOpen)
+                        } else {
+                            if taskbar.is_none() {
+                                taskbar = Taskbar::new().ok();
+                            }
+                            bar.and_then(|bar| {
+                                taskbar.as_mut()?.observe(
+                                    bar, hwnd, taskbar_side, dock_size, dock_placement.preferred_x(),
+                                )
+                            })
+                        };
+                        let placement = match observed {
+                            Some(Observation::MenuOpen) => dock_placement.hold(),
+                            // The XAML menu temporarily replaces the taskbar's automation tree.
+                            None if bar.is_some_and(taskbar_has_focus) => dock_placement.hold(),
+                            Some(Observation::Placement(placement)) => {
+                                dock_placement.resolve(Some(placement), Instant::now())
+                            }
+                            Some(Observation::NoRoom) | None => {
+                                dock_placement.resolve(None, Instant::now())
+                            }
+                        };
+                        if let Some(placement) = placement
                             && (last_placement != Some(placement)
                                 || matches!(placement, Placement::Docked(rect) if covered_by_taskbar(hwnd, rect)))
                         {
@@ -367,6 +395,11 @@ impl SamplerWorker {
                         }
                         Ok(WorkerCommand::RecheckDock) => {
                             dock = dock.map(|(id, _)| (id, Instant::now()));
+                        }
+                        Ok(WorkerCommand::TaskbarInteraction) => {
+                            // Keep the current slot while Explorer rearranges its popup controls.
+                            dock_placement.hold();
+                            dock = dock.map(|(id, _)| (id, Instant::now() + DOCK_INTERVAL));
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         _ => break,
@@ -409,6 +442,56 @@ impl Drop for Window {
     }
 }
 
+struct TaskbarEvents(HWINEVENTHOOK);
+
+impl TaskbarEvents {
+    fn watch() -> Self {
+        Self(unsafe {
+            SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_MENUPOPUPEND,
+                None,
+                Some(taskbar_event),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        })
+    }
+}
+
+impl Drop for TaskbarEvents {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            let _ = unsafe { UnhookWinEvent(self.0) };
+        }
+    }
+}
+
+unsafe extern "system" fn taskbar_event(
+    _: HWINEVENTHOOK,
+    event: u32,
+    window: HWND,
+    _: i32,
+    _: i32,
+    thread: u32,
+    _: u32,
+) {
+    let Some(panel) = with_app(|app| app.settings.taskbar.then_some(app.tray.hWnd)).flatten()
+    else {
+        return;
+    };
+    let Some(bar) = primary_taskbar() else {
+        return;
+    };
+    let menu_event = event != EVENT_SYSTEM_FOREGROUND
+        && thread != 0
+        && thread == unsafe { GetWindowThreadProcessId(bar, None) };
+    if window == bar || menu_event || unsafe { GetAncestor(window, GA_ROOTOWNER) == bar } {
+        let _ = notify(panel, TASKBAR_INTERACTION);
+    }
+}
+
 pub fn run() -> Result<()> {
     if let Some(result) = updater::handle_startup_args() {
         if let Err(error) = result {
@@ -444,6 +527,7 @@ pub fn run() -> Result<()> {
 
     let _sampler = SamplerWorker::start(hwnd, feed, settings, worker).map_err(Error::from)?;
     with_app(|app| app.add_tray(hwnd));
+    let _taskbar_events = TaskbarEvents::watch();
     let mut message = MSG::default();
     loop {
         match unsafe { GetMessageW(&mut message, None, 0, 0) }.0 {
@@ -505,8 +589,13 @@ fn create_window(
             return Err(Error::from_thread());
         }
         let (width, height) = Layout::Floating.size(settings.display);
+        // Windows can ignore a background process's request to promote an existing window.
+        let mut ex_style = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+        if settings.taskbar || settings.topmost {
+            ex_style |= WS_EX_TOPMOST;
+        }
         CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            ex_style,
             class_name,
             app_title(),
             WS_POPUP,
@@ -644,13 +733,25 @@ unsafe extern "system" fn window_proc(
                     && app.settings.taskbar
                     && app.dock_generation == generation
                 {
-                    app.placement = placement;
+                    app.placement = Some(placement);
                     return true;
                 }
                 false
             });
             if applied == Some(true) {
                 apply_placement(hwnd);
+            }
+        }
+        TASKBAR_INTERACTION => {
+            let slot = with_app(|app| {
+                let _ = app.worker.send(WorkerCommand::TaskbarInteraction);
+                app.placement.filter(|_| app.shown)
+            })
+            .flatten();
+            if let Some(Placement::Docked(rect)) = slot
+                && covered_by_taskbar(hwnd, rect)
+            {
+                set_topmost(hwnd, true);
             }
         }
         UPDATE_READY => finish_update(hwnd),
@@ -711,9 +812,9 @@ fn apply_placement(hwnd: HWND) {
             }
             app.refresh_theme();
             (
-                app.placement,
+                app.placement.unwrap_or_default(),
                 app.settings.position,
-                app.settings.topmost,
+                app.panel_topmost(),
                 layout,
                 app.display,
                 app.waiting_sample,
@@ -795,7 +896,7 @@ fn set_panel_shadow(hwnd: HWND, enabled: bool) -> bool {
 }
 
 fn apply_visibility(hwnd: HWND) {
-    let shown = with_app(|app| app.shown && app.placement != Placement::Hidden) == Some(true);
+    let shown = with_app(|app| app.shown && app.placement != Some(Placement::Hidden)) == Some(true);
     if shown != unsafe { IsWindowVisible(hwnd).as_bool() } {
         let _ = unsafe { ShowWindow(hwnd, if shown { SW_SHOWNOACTIVATE } else { SW_HIDE }) };
     }
@@ -1018,7 +1119,7 @@ fn open_menu(hwnd: HWND, at: POINT) {
             app.settings,
             app.tray_ready,
             app.shown,
-            app.placement,
+            app.placement.unwrap_or_default(),
             app.update.is_some(),
         )
     }) else {
@@ -1279,7 +1380,7 @@ fn command(hwnd: HWND, selection: usize) {
             with_app(|app| {
                 app.settings.taskbar = !app.settings.taskbar;
                 app.request_dock();
-                app.placement = Placement::Floating;
+                app.placement = (!app.settings.taskbar).then_some(Placement::Floating);
                 app.save();
             });
             apply_placement(hwnd);
@@ -1304,7 +1405,7 @@ fn command(hwnd: HWND, selection: usize) {
             if let Some(topmost) = with_app(|app| {
                 app.settings.topmost = !app.settings.topmost;
                 app.save();
-                app.settings.topmost
+                app.panel_topmost()
             }) {
                 set_topmost(hwnd, topmost);
             }
@@ -1375,6 +1476,7 @@ mod tests {
         };
         let settings = Settings {
             taskbar: true,
+            topmost: false,
             theme: Theme::Transparent,
             position: Some(position),
             ..Default::default()
@@ -1390,6 +1492,8 @@ mod tests {
         let window = Window(
             create_window(w!("WindowsMonitor.StartupTest"), module, icon, settings).unwrap(),
         );
+        let created_topmost =
+            unsafe { GetWindowLongPtrW(window.0, GWL_EXSTYLE) } & WS_EX_TOPMOST.0 as isize;
         let painted = show_starting_panel(window.0);
         let visible = unsafe { IsWindowVisible(window.0).as_bool() };
         let status_visible = with_app(|app| app.waiting_sample && app.panel.is_none());
@@ -1412,6 +1516,8 @@ mod tests {
             with_app(|app| !app.waiting_sample && app.panel.is_some() && app.paint_error.is_none());
         let layered =
             unsafe { GetWindowLongPtrW(window.0, GWL_EXSTYLE) } & WS_EX_LAYERED.0 as isize;
+        let pending_topmost =
+            unsafe { GetWindowLongPtrW(window.0, GWL_EXSTYLE) } & WS_EX_TOPMOST.0 as isize;
         let mut panel_rect = RECT::default();
         unsafe { GetWindowRect(window.0, &mut panel_rect).unwrap() };
 
@@ -1421,6 +1527,8 @@ mod tests {
         assert_eq!(status_visible, Some(true));
         assert_eq!(metrics_visible, Some(true));
         assert_ne!(layered, 0);
+        assert_ne!(created_topmost, 0);
+        assert_ne!(pending_topmost, 0);
         let screen = monitor.rcMonitor;
         assert!((starting_rect.left + starting_rect.right - screen.left - screen.right).abs() <= 1);
         assert!((starting_rect.top + starting_rect.bottom - screen.top - screen.bottom).abs() <= 1);
