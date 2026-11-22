@@ -963,6 +963,13 @@ unsafe extern "system" fn preview_proc(
             }
             with_app(|app| {
                 with_editor(|editor| {
+                    if editor
+                        .panel
+                        .set_label_bold(app.settings.label_bold)
+                        .is_err()
+                    {
+                        return;
+                    }
                     let dark = app.settings.theme.is_dark(editor.layout == Layout::Taskbar);
                     let appearance = if app.settings.theme == Theme::Transparent {
                         Appearance::TransparentPreview { dark }

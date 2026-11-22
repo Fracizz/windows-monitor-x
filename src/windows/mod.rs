@@ -1,5 +1,6 @@
 mod editor;
 mod panel;
+mod panel_input;
 mod sampler;
 mod startup;
 mod state;
@@ -19,10 +20,16 @@ use ::windows::{
             CloseHandle, D2DERR_RECREATE_TARGET, ERROR_ALREADY_EXISTS, GetLastError, HANDLE,
             HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
         },
-        Graphics::Gdi::{
-            BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, GetMonitorInfoW, HDC, HGDIOBJ,
-            InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
-            MonitorFromWindow, PAINTSTRUCT, SetWindowRgn, UpdateWindow,
+        Graphics::{
+            Dwm::{
+                DWMNCRP_DISABLED, DWMNCRP_USEWINDOWSTYLE, DWMWA_BORDER_COLOR, DWMWA_COLOR_DEFAULT,
+                DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY, DwmSetWindowAttribute,
+            },
+            Gdi::{
+                BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, GetMonitorInfoW, HDC,
+                HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+                MonitorFromWindow, PAINTSTRUCT, SetWindowRgn, UpdateWindow,
+            },
         },
         System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
         UI::{
@@ -40,6 +47,7 @@ use ::windows::{
 
 use crate::model::{Metric, Reading, Sample, readings};
 use panel::{Appearance, Layout, Panel};
+use panel_input::PanelInput;
 use sampler::Sampler;
 use state::{DisplayOptions, Refresh, Settings, TaskbarSide, TextSize, Theme};
 use taskbar::{
@@ -75,6 +83,7 @@ const DOCK_RIGHT: usize = 115;
 const EDIT_METRICS: usize = 116;
 const CHECK_UPDATE: usize = 117;
 const TRANSPARENT_THEME: usize = 118;
+const LABEL_BOLD: usize = 119;
 const REFRESH_OPTIONS: [(usize, Refresh, PCWSTR); 4] = [
     (109, Refresh::One, w!("1 秒")),
     (110, Refresh::Two, w!("2 秒")),
@@ -104,6 +113,7 @@ enum WorkerCommand {
 
 struct App {
     panel: Option<Panel>,
+    panel_input: PanelInput,
     settings: Settings,
     dark: bool,
     dpi: u32,
@@ -151,6 +161,7 @@ impl App {
         let sample = Sample::default();
         Self {
             panel: None,
+            panel_input: PanelInput::default(),
             settings,
             dark: settings.theme.is_dark(false),
             dpi: 96,
@@ -282,6 +293,7 @@ impl App {
             self.panel = Some(panel);
         }
         let panel = self.panel.as_mut().expect("panel initialized");
+        panel.set_label_bold(self.settings.label_bold)?;
         let mut painted = panel.paint(hwnd, self.dpi, appearance, &self.displayed);
         if painted
             .as_ref()
@@ -576,7 +588,7 @@ fn create_window(
     unsafe {
         let class = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
+            style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(window_proc),
             hInstance: module,
             hIcon: icon,
@@ -615,6 +627,14 @@ fn with_app<T>(run: impl FnOnce(&mut App) -> T) -> Option<T> {
     APP.with(|app| app.try_borrow_mut().ok()?.as_mut().map(run))
 }
 
+fn panel_hit_test() -> u32 {
+    if with_app(|app| app.waiting_sample || app.layout() == Layout::Taskbar) == Some(true) {
+        HTCLIENT
+    } else {
+        HTCAPTION
+    }
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     msg: u32,
@@ -629,19 +649,14 @@ unsafe extern "system" fn window_proc(
             let _ = unsafe { EndPaint(hwnd, &paint) };
         }
         WM_ERASEBKGND => return LRESULT(1),
-        WM_NCHITTEST => {
-            let hit = if with_app(|app| app.waiting_sample || app.layout() == Layout::Taskbar)
-                == Some(true)
-            {
-                HTCLIENT
-            } else {
-                HTCAPTION
-            };
-            return LRESULT(hit as isize);
-        }
+        WM_NCHITTEST => return LRESULT(panel_hit_test() as isize),
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_SIZE => {
             with_app(|app| app.resize_panel(hwnd));
+        }
+        WM_WINDOWPOSCHANGED => {
+            sync_panel_input(hwnd);
+            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
         WM_DPICHANGED => {
             let dpi = (wparam.0 & 0xffff) as u32;
@@ -668,7 +683,7 @@ unsafe extern "system" fn window_proc(
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 )
             };
-            round_window(hwnd, dpi, layout.radius(display.text_size));
+            shape_panel(hwnd, dpi, layout.radius(display.text_size));
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_THEMECHANGED => {
             if with_app(|app| app.refresh_theme()) == Some(true) {
@@ -824,7 +839,6 @@ fn apply_placement(hwnd: HWND) {
     else {
         return;
     };
-    let shadow_changed = set_panel_shadow(hwnd, layout == Layout::Floating && !transparent);
     set_panel_layered(hwnd, transparent);
     match (waiting_sample, placement) {
         (true, _) => {
@@ -847,22 +861,9 @@ fn apply_placement(hwnd: HWND) {
                     SWP_NOACTIVATE,
                 )
             };
-            round_window(hwnd, window_dpi(hwnd), layout.radius(display.text_size));
+            shape_panel(hwnd, window_dpi(hwnd), layout.radius(display.text_size));
         }
         (false, Placement::Hidden) => {}
-    }
-    if shadow_changed {
-        let _ = unsafe {
-            SetWindowPos(
-                hwnd,
-                None,
-                0,
-                0,
-                0,
-                0,
-                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
-            )
-        };
     }
     apply_visibility(hwnd);
 }
@@ -878,20 +879,34 @@ fn set_panel_layered(hwnd: HWND, enabled: bool) {
         };
         if updated != style {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, updated);
+            set_panel_frame(hwnd, !enabled);
+            if enabled {
+                SetWindowRgn(hwnd, None, true);
+            }
         }
     }
 }
 
-fn set_panel_shadow(hwnd: HWND, enabled: bool) -> bool {
+fn set_panel_frame(hwnd: HWND, enabled: bool) {
+    let (rendering, border) = if enabled {
+        (DWMNCRP_USEWINDOWSTYLE, DWMWA_COLOR_DEFAULT)
+    } else {
+        (DWMNCRP_DISABLED, DWMWA_COLOR_NONE)
+    };
     unsafe {
-        let style = GetClassLongPtrW(hwnd, GCL_STYLE);
-        let shadow = CS_DROPSHADOW.0 as usize;
-        let updated = if enabled {
-            style | shadow
-        } else {
-            style & !shadow
-        };
-        updated != style && SetClassLongPtrW(hwnd, GCL_STYLE, updated as isize) != 0
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY,
+            (&raw const rendering).cast(),
+            size_of_val(&rendering) as u32,
+        );
+        // Suppressing the DWM border color is supported on Windows 11.
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&raw const border).cast(),
+            size_of_val(&border) as u32,
+        );
     }
 }
 
@@ -900,9 +915,18 @@ fn apply_visibility(hwnd: HWND) {
     if shown != unsafe { IsWindowVisible(hwnd).as_bool() } {
         let _ = unsafe { ShowWindow(hwnd, if shown { SW_SHOWNOACTIVATE } else { SW_HIDE }) };
     }
+    sync_panel_input(hwnd);
     if shown {
         invalidate(hwnd);
     }
+}
+
+fn sync_panel_input(hwnd: HWND) {
+    with_app(|app| {
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+        app.panel_input
+            .sync(hwnd, style & WS_EX_LAYERED.0 as isize != 0);
+    });
 }
 
 fn recheck_placement(hwnd: HWND) {
@@ -1013,7 +1037,7 @@ fn place(
         )
         .ok()?;
     }
-    round_window(
+    shape_panel(
         hwnd,
         window_dpi(hwnd),
         Layout::Floating.radius(display.text_size),
@@ -1031,6 +1055,12 @@ fn snap_coordinate(value: i32, min: i32, max: i32, margin: i32) -> i32 {
         max - margin
     } else {
         value
+    }
+}
+
+fn shape_panel(hwnd: HWND, dpi: u32, radius: i32) {
+    if unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } & WS_EX_LAYERED.0 as isize == 0 {
+        round_window(hwnd, dpi, radius);
     }
 }
 
@@ -1133,21 +1163,49 @@ fn open_menu(hwnd: HWND, at: POINT) {
         startup::status().ok(),
         update_busy,
     ) {
+        let menu_host = (settings.theme == Theme::Transparent)
+            .then(|| create_menu_host().ok())
+            .flatten();
+        let owner = menu_host.as_ref().map_or(hwnd, |window| window.0);
         let selection = unsafe {
-            let _ = SetForegroundWindow(hwnd);
+            let _ = SetForegroundWindow(owner);
             let result = TrackPopupMenu(
                 menu.0,
                 TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
                 at.x,
                 at.y,
                 None,
-                hwnd,
+                owner,
                 None,
             );
-            let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+            let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
             result.0 as usize
         };
         command(hwnd, selection);
+    }
+}
+
+fn create_menu_host() -> Result<Window> {
+    // Keep the painted panel out of the foreground while Windows tracks its menu.
+    unsafe {
+        let instance = HINSTANCE(GetModuleHandleW(PCWSTR::null())?.0);
+        let window = Window(CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
+            w!("Static"),
+            PCWSTR::null(),
+            WS_POPUP,
+            GetSystemMetrics(SM_XVIRTUALSCREEN).saturating_sub(32),
+            GetSystemMetrics(SM_YVIRTUALSCREEN).saturating_sub(32),
+            1,
+            1,
+            None,
+            None,
+            Some(instance),
+            None,
+        )?);
+        set_panel_frame(window.0, false);
+        let _ = ShowWindow(window.0, SW_SHOWNOACTIVATE);
+        Ok(window)
     }
 }
 
@@ -1226,6 +1284,7 @@ fn make_settings_menu(
         theme.item(id, label, checked(settings.theme == choice))?;
     }
     menu.submenu(w!("主题"), theme)?;
+    menu.item(LABEL_BOLD, w!("标签加粗"), checked(settings.label_bold))?;
 
     let taskbar_position = Menu::new()?;
     taskbar_position.item(
@@ -1423,6 +1482,14 @@ fn command(hwnd: HWND, selection: usize) {
             apply_placement(hwnd);
             editor::refresh_preview();
         }
+        LABEL_BOLD => {
+            with_app(|app| {
+                app.settings.label_bold = !app.settings.label_bold;
+                app.save();
+            });
+            invalidate(hwnd);
+            editor::refresh_preview();
+        }
         RESET_TRAFFIC => {
             with_app(|app| {
                 app.take_sample();
@@ -1455,6 +1522,7 @@ fn command(hwnd: HWND, selection: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::windows::Win32::Graphics::Gdi::GetWindowRgnBox;
 
     #[test]
     fn shows_feedback_before_sampling_with_saved_taskbar_mode() {
@@ -1494,12 +1562,16 @@ mod tests {
         );
         let created_topmost =
             unsafe { GetWindowLongPtrW(window.0, GWL_EXSTYLE) } & WS_EX_TOPMOST.0 as isize;
+        let initial_shadow =
+            unsafe { GetClassLongPtrW(window.0, GCL_STYLE) } & CS_DROPSHADOW.0 as usize;
         let painted = show_starting_panel(window.0);
         let visible = unsafe { IsWindowVisible(window.0).as_bool() };
         let status_visible = with_app(|app| app.waiting_sample && app.panel.is_none());
         let elapsed = started.elapsed();
         let mut starting_rect = RECT::default();
         unsafe { GetWindowRect(window.0, &mut starting_rect).unwrap() };
+        let mut region_bounds = RECT::default();
+        let startup_region = unsafe { GetWindowRgnBox(window.0, &mut region_bounds) };
 
         feed.lock().unwrap().sample = Some(Sample {
             memory: Some(crate::model::PhysicalMemory {
@@ -1520,6 +1592,7 @@ mod tests {
             unsafe { GetWindowLongPtrW(window.0, GWL_EXSTYLE) } & WS_EX_TOPMOST.0 as isize;
         let mut panel_rect = RECT::default();
         unsafe { GetWindowRect(window.0, &mut panel_rect).unwrap() };
+        let transparent_region = unsafe { GetWindowRgnBox(window.0, &mut region_bounds) };
 
         // This test owns a separate window and leaves the user's settings file alone.
         APP.with(|state| state.borrow_mut().take());
@@ -1527,7 +1600,10 @@ mod tests {
         assert_eq!(status_visible, Some(true));
         assert_eq!(metrics_visible, Some(true));
         assert_ne!(layered, 0);
+        assert_ne!(startup_region.0, 0);
+        assert_eq!(transparent_region.0, 0);
         assert_ne!(created_topmost, 0);
+        assert_eq!(initial_shadow, 0);
         assert_ne!(pending_topmost, 0);
         let screen = monitor.rcMonitor;
         assert!((starting_rect.left + starting_rect.right - screen.left - screen.right).abs() <= 1);
@@ -1562,14 +1638,16 @@ mod tests {
             assert!(!settings.is_invalid());
             let refresh = GetSubMenu(settings, 4);
             let theme = GetSubMenu(settings, 5);
-            let position = GetSubMenu(settings, 6);
-            assert_eq!(GetMenuItemID(settings, 7), EDIT_METRICS as u32);
-            assert_eq!(GetMenuItemID(settings, 8), CHECK_UPDATE as u32);
+            let position = GetSubMenu(settings, 7);
+            assert_eq!(GetMenuItemID(settings, 6), LABEL_BOLD as u32);
+            assert_eq!(GetMenuItemID(settings, 8), EDIT_METRICS as u32);
+            assert_eq!(GetMenuItemID(settings, 9), CHECK_UPDATE as u32);
             assert!(!refresh.is_invalid());
             assert!(!theme.is_invalid());
             assert!(!position.is_invalid());
             for (submenu, command) in [
                 (settings, AUTOSTART),
+                (settings, LABEL_BOLD),
                 (refresh, 111),
                 (theme, TRANSPARENT_THEME),
                 (position, DOCK_RIGHT),

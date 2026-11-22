@@ -38,6 +38,8 @@ namespace MonitorSmoke {
         [DllImport("user32.dll")]
         public static extern bool GetGUIThreadInfo(uint thread, ref ThreadInfo info);
         [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")]
         public static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
         [DllImport("user32.dll")]
         public static extern IntPtr WindowFromPoint(Point point);
@@ -138,7 +140,7 @@ function Test-TaskbarPlacement {
     $taskbarDpi = [MonitorSmoke.Native]::GetDpiForWindow($taskbar)
     return (
         [MonitorSmoke.Native]::IsWindowVisible($window) -and
-        ($panel.Right - $panel.Left) -eq [math]::Floor((281 * $taskbarDpi + 48) / 96) -and
+        ($panel.Right - $panel.Left) -eq [math]::Floor((283 * $taskbarDpi + 48) / 96) -and
         ($panel.Bottom - $panel.Top) -eq [math]::Floor((36 * $taskbarDpi + 48) / 96) -and
         $panel.Left -ge $bar.Left -and $panel.Right -le $bar.Right -and
         $panel.Top -ge $bar.Top -and $panel.Bottom -le $bar.Bottom
@@ -201,8 +203,21 @@ try {
 
     Send-Panel 0x111 105
     Wait-For { Test-Setting 'theme=dark' } 'Dark theme was not saved.'
+    Send-Panel 0x111 118
+    Wait-For { Test-Setting 'theme=transparent' } 'Transparent theme was not saved.'
+    Send-Panel 0x7b 0 ([intptr]$coordinates)
+    Wait-For { Is-InMenu } 'The transparent panel menu did not open.'
+    $menuInfo = [MonitorSmoke.Native+ThreadInfo]::new()
+    $menuInfo.Size = [Runtime.InteropServices.Marshal]::SizeOf($menuInfo)
+    Assert-True ([MonitorSmoke.Native]::GetGUIThreadInfo($guiThread, [ref]$menuInfo)) 'Could not inspect the transparent panel menu.'
+    Assert-True ($menuInfo.MenuOwner -ne [intptr]::Zero -and $menuInfo.MenuOwner -ne $window) 'The painted panel owns the transparent menu.'
+    Assert-True ([MonitorSmoke.Native]::GetForegroundWindow() -ne $window) 'Opening the transparent menu activated the painted panel.'
+    Assert-True ([MonitorSmoke.Native]::PostMessageW($menuInfo.MenuOwner, 0x1f, [uintptr]0, [intptr]::Zero)) 'Could not dismiss the transparent menu.'
+    Wait-For { -not (Is-InMenu) } 'The transparent panel menu did not close.'
     Send-Panel 0x111 104
     Wait-For { Test-Setting 'theme=light' } 'Light theme was not saved.'
+    Send-Panel 0x111 119
+    Wait-For { Test-Setting 'label_bold=false' } 'Label bold must be enabled by default and can be turned off.'
     Send-Panel 0x111 102
     Wait-For { ([MonitorSmoke.Native]::GetWindowLongPtr($window, -20).ToInt64() -band 8) -eq 0 } 'Topmost did not turn off.'
     Send-Panel 0x111 102
@@ -288,6 +303,8 @@ try {
         Wait-For { Test-Setting 'taskbar=false' } 'Taskbar mode did not turn off.'
     }
     Wait-For { Test-PanelSize 326 68 } 'Tight floating dimensions were not restored after restart.'
+    Send-Panel 0x111 119
+    Wait-For { Test-Setting 'label_bold=true' } 'The label weight preference was not restored after restart.'
     Send-Panel 0x111 107
     Assert-True ($app.WaitForExit(5000) -and $app.ExitCode -eq 0) 'The relaunched instance failed to close.'
 

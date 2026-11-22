@@ -104,8 +104,8 @@ impl Layout {
         let (floating, taskbar) = match metric {
             Metric::Upload | Metric::Download => (77, 71),
             Metric::Cpu | Metric::Memory | Metric::Disk | Metric::Battery => (94, 76),
-            Metric::Traffic => (120, 114),
-            Metric::AvailableMemory | Metric::UsedMemory => (135, 131),
+            Metric::Traffic => (120, 116),
+            Metric::AvailableMemory | Metric::UsedMemory => (139, 135),
             Metric::AvailableMemoryPercent => (112, 106),
             Metric::CpuFrequency => (126, 120),
             Metric::Uptime => (142, 136),
@@ -245,6 +245,7 @@ const TRANSPARENT_LIGHT: Colors = Colors {
     surface: 0xf3f3f3,
     number: 0x000000,
     label: 0x000000,
+    divider: 0x000000,
     upload: 0x000000,
     download: 0x000000,
     ..LIGHT
@@ -253,6 +254,7 @@ const TRANSPARENT_DARK: Colors = Colors {
     surface: 0x202020,
     number: 0xffffff,
     label: 0xffffff,
+    divider: 0xffffff,
     upload: 0xffffff,
     download: 0xffffff,
     ..DARK
@@ -387,6 +389,7 @@ pub struct Panel {
     tabular: IDWriteTypography,
     mode: Layout,
     display: DisplayOptions,
+    label_bold: bool,
     labels: [Option<IDWriteTextLayout>; Metric::ALL.len()],
     empty_label: IDWriteTextLayout,
     values: [Option<TextReading>; Metric::ALL.len()],
@@ -397,7 +400,7 @@ impl Panel {
     pub fn new() -> Result<Self> {
         let factory = unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
         let fonts = unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED)? };
-        let label_format = text_format(&fonts, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?;
+        let labels = metric_labels(&fonts, true)?;
         let number_format = text_format(
             &fonts,
             TextSize::DEFAULT as f32,
@@ -414,24 +417,8 @@ impl Panel {
             })?;
             typography
         };
-        let mut labels = [const { None }; Metric::ALL.len()];
-        for metric in Metric::ALL
-            .into_iter()
-            .filter(|&metric| !is_network_rate(metric))
-        {
-            let label = match metric {
-                Metric::Cpu => "CPU",
-                Metric::Memory => "内存",
-                Metric::AvailableMemory | Metric::AvailableMemoryPercent => "可用内存",
-                Metric::UsedMemory => "已用内存",
-                Metric::Disk => "磁盘",
-                Metric::CpuFrequency => "CPU 频率",
-                Metric::Battery => "电量",
-                _ => super::metric_name(metric),
-            };
-            labels[metric.index()] = Some(layout(&fonts, &label_format, label, 80.0)?);
-        }
-        let empty_label = layout(&fonts, &label_format, "未选择监控项", 112.0)?;
+        let empty_format = text_format(&fonts, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?;
+        let empty_label = layout(&fonts, &empty_format, "未选择监控项", 112.0)?;
         unsafe { empty_label.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)? };
         Ok(Self {
             factory,
@@ -443,11 +430,20 @@ impl Panel {
             tabular,
             mode: Layout::Floating,
             display: DisplayOptions::default(),
+            label_bold: true,
             labels,
             empty_label,
             values: [const { None }; Metric::ALL.len()],
             target: None,
         })
+    }
+
+    pub fn set_label_bold(&mut self, bold: bool) -> Result<()> {
+        if self.label_bold != bold {
+            self.labels = metric_labels(&self.fonts, bold)?;
+            self.label_bold = bold;
+        }
+        Ok(())
     }
 
     pub fn set_layout(&mut self, mode: Layout, display: DisplayOptions) {
@@ -513,7 +509,11 @@ impl Panel {
         } else {
             color(colors.surface)
         };
-        let chrome = matches!(appearance, Appearance::Solid { .. });
+        let solid = matches!(appearance, Appearance::Solid { .. });
+        let mut divider = color(colors.divider);
+        if !solid {
+            divider.a = 0.24;
+        }
         let (width, height) = self.mode.base_size(self.display);
         let factor = self.display.text_size.factor();
         let result = unsafe {
@@ -522,7 +522,7 @@ impl Panel {
             window.BeginDraw();
             window.Clear(Some(&background));
             window.SetTransform(&Matrix3x2::scale(factor, factor));
-            if chrome && self.mode == Layout::Floating {
+            if solid && self.mode == Layout::Floating {
                 let radius = self.mode.base_radius() as f32 - 0.5;
                 brush.SetColor(&color(colors.border));
                 window.DrawRoundedRectangle(
@@ -541,11 +541,9 @@ impl Panel {
                     None,
                 );
             }
-            if chrome {
-                brush.SetColor(&color(colors.divider));
-                for (start, end) in self.mode.dividers(self.display) {
-                    window.DrawLine(start, end, brush, 1.0, None);
-                }
+            brush.SetColor(&divider);
+            for (start, end) in self.mode.dividers(self.display) {
+                window.DrawLine(start, end, brush, 1.0, None);
             }
             if self.display.metrics.iter().next().is_none() {
                 brush.SetColor(&color(colors.label));
@@ -790,6 +788,36 @@ fn text_format(
     }
 }
 
+fn metric_labels(
+    fonts: &IDWriteFactory,
+    bold: bool,
+) -> Result<[Option<IDWriteTextLayout>; Metric::ALL.len()]> {
+    let weight = if bold {
+        DWRITE_FONT_WEIGHT_SEMI_BOLD
+    } else {
+        DWRITE_FONT_WEIGHT_NORMAL
+    };
+    let format = text_format(fonts, 14.0, weight)?;
+    let mut labels = [const { None }; Metric::ALL.len()];
+    for metric in Metric::ALL
+        .into_iter()
+        .filter(|&metric| !is_network_rate(metric))
+    {
+        let label = match metric {
+            Metric::Cpu => "CPU",
+            Metric::Memory => "内存",
+            Metric::AvailableMemory | Metric::AvailableMemoryPercent => "可用内存",
+            Metric::UsedMemory => "已用内存",
+            Metric::Disk => "磁盘",
+            Metric::CpuFrequency => "CPU 频率",
+            Metric::Battery => "电量",
+            _ => super::metric_name(metric),
+        };
+        labels[metric.index()] = Some(layout(fonts, &format, label, 80.0)?);
+    }
+    Ok(labels)
+}
+
 fn layout(
     fonts: &IDWriteFactory,
     format: &IDWriteTextFormat,
@@ -844,6 +872,28 @@ mod tests {
     use crate::model::{Metrics, PhysicalMemory, Sample, readings};
 
     #[test]
+    fn label_weight_can_change_without_resizing_text() {
+        let mut panel = Panel::new().unwrap();
+        let verify = |panel: &Panel, expected| {
+            for label in panel.labels.iter().flatten() {
+                let mut weight = DWRITE_FONT_WEIGHT::default();
+                let mut size = 0.0;
+                unsafe {
+                    label.GetFontWeight(0, &mut weight, None).unwrap();
+                    label.GetFontSize(0, &mut size, None).unwrap();
+                }
+                assert_eq!(weight, expected);
+                assert_eq!(size, 14.0);
+            }
+        };
+        verify(&panel, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        panel.set_label_bold(false).unwrap();
+        verify(&panel, DWRITE_FONT_WEIGHT_NORMAL);
+        panel.set_label_bold(true).unwrap();
+        verify(&panel, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    }
+
+    #[test]
     fn text_fits_in_both_layouts() {
         let mut panel = Panel::new().unwrap();
         let sample = Sample {
@@ -861,20 +911,20 @@ mod tests {
             ..Default::default()
         };
         let selections = [
-            (Metrics::default(), [381, 326]),
+            (Metrics::default(), [381, 328]),
             (
                 Metrics::parse(
                     "uptime,upload,available_memory,cpu_frequency,battery,download,traffic",
                 ),
-                [635, 561],
+                [639, 567],
             ),
             (
                 Metrics::parse("traffic,disk,upload,download,cpu_frequency,available_memory"),
-                [440, 394],
+                [444, 400],
             ),
             (
                 Metrics::parse("available_memory_percent,used_memory,available_memory"),
-                [342, 314],
+                [350, 322],
             ),
             (Metrics::parse(""), [132, 112]),
         ];
@@ -888,9 +938,7 @@ mod tests {
                     ..Default::default()
                 };
                 panel.set_layout(mode, display);
-                panel
-                    .update_text(&readings(sample, 999_990_000_000))
-                    .unwrap();
+                panel.update_text(&readings(sample, 999_000_000)).unwrap();
                 assert_eq!(mode.size(display).0, expected_width);
                 assert!(
                     mode.slots(display)
@@ -913,9 +961,10 @@ mod tests {
                         assert!((text.number_x + number_width + gap - text.unit_x).abs() < 0.01);
                     }
                     if let Some(label) = &panel.labels[metric.index()] {
+                        let label_gap = text.number_x - slot.label_x - text_width(label).unwrap();
                         assert!(
-                            slot.label_x + text_width(label).unwrap() + 3.0 <= text.number_x,
-                            "{mode:?} overlapping {metric:?}"
+                            label_gap >= 3.0,
+                            "{mode:?} {metric:?} label gap: {label_gap}"
                         );
                     } else {
                         let arrow_x = text.arrow_x(slot.label_x);
@@ -941,7 +990,7 @@ mod tests {
         let values = readings(Sample::default(), 16_000_000);
         for (mode, widths) in [
             (Layout::Floating, [381, 351, 326]),
-            (Layout::Taskbar, [326, 301, 281]),
+            (Layout::Taskbar, [328, 303, 283]),
         ] {
             let height = mode.size(DisplayOptions::default()).1;
             for (density, width) in [Density::Standard, Density::Compact, Density::Tight]
@@ -1110,7 +1159,16 @@ mod tests {
                     )
                 };
                 assert_eq!(pixels[0], 0);
+                assert_eq!(pixels[bitmap.size.cx as usize - 1], 0);
+                assert_eq!(pixels[pixels.len() - bitmap.size.cx as usize], 0);
+                assert_eq!(pixels[pixels.len() - 1], 0);
                 assert!(pixels.contains(&if dark { 0xffffffff } else { 0xff000000 }));
+                let (start, end) = mode.dividers(display).next().unwrap();
+                let pixel_scale = dpi as f32 / 96.0 * display.text_size.factor();
+                let x = (start.X * pixel_scale) as usize;
+                let y = ((start.Y + end.Y) * 0.5 * pixel_scale) as usize;
+                let divider_alpha = pixels[y * bitmap.size.cx as usize + x] >> 24;
+                assert!((2..=127).contains(&divider_alpha));
             }
         }
     }

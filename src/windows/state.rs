@@ -117,6 +117,7 @@ impl TaskbarSide {
 pub struct Settings {
     pub traffic: u64,
     pub theme: Theme,
+    pub label_bold: bool,
     pub topmost: bool,
     pub taskbar: bool,
     pub taskbar_side: TaskbarSide,
@@ -130,6 +131,7 @@ impl Default for Settings {
         Self {
             traffic: 0,
             theme: Theme::System,
+            label_bold: true,
             topmost: true,
             taskbar: false,
             taskbar_side: TaskbarSide::default(),
@@ -152,6 +154,7 @@ impl Settings {
                     match key {
                         "traffic" => settings.traffic = value.parse().unwrap_or_default(),
                         "theme" => settings.theme = Theme::parse(value),
+                        "label_bold" => settings.label_bold = value.parse().unwrap_or(true),
                         "topmost" => settings.topmost = value.parse().unwrap_or(true),
                         "taskbar" => settings.taskbar = value.parse().unwrap_or(false),
                         "taskbar_side" => settings.taskbar_side = TaskbarSide::parse(value),
@@ -198,8 +201,9 @@ impl Settings {
         fs::write(
             &temp,
             format!(
-                "traffic={}\ntheme={theme}\ntopmost={}\ntaskbar={}\ntaskbar_side={}\nrefresh={}\nposition={position}\nmetrics={metrics}\ntext_size={text_size}\ndensity={density}\n",
+                "traffic={}\ntheme={theme}\nlabel_bold={}\ntopmost={}\ntaskbar={}\ntaskbar_side={}\nrefresh={}\nposition={position}\nmetrics={metrics}\ntext_size={text_size}\ndensity={density}\n",
                 self.traffic,
+                self.label_bold,
                 self.topmost,
                 self.taskbar,
                 self.taskbar_side.as_str(),

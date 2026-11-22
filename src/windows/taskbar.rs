@@ -278,13 +278,15 @@ pub fn covered_by_taskbar(window: HWND, rect: RECT) -> bool {
         x: rect.left + (rect.right - rect.left) / 2,
         y: rect.top + (rect.bottom - rect.top) / 2,
     };
-    if unsafe { GetAncestor(WindowFromPoint(center), GA_ROOT) } != bar {
+    let hit = unsafe { GetAncestor(WindowFromPoint(center), GA_ROOT) };
+    let layered = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) } & WS_EX_LAYERED.0 as isize != 0;
+    if !layered {
+        return hit == bar;
+    }
+    if hit != bar && unsafe { GetAncestor(hit, GA_ROOTOWNER) } != window {
         return false;
     }
-    if unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) } & WS_EX_LAYERED.0 as isize == 0 {
-        return true;
-    }
-    // Hit testing skips pixels with zero alpha even if the panel is above the taskbar.
+    // The owned input window can receive clicks even if the visual is below the taskbar.
     let mut visited = HashSet::new();
     let mut current = window;
     while let Ok(above) = unsafe { GetWindow(current, GW_HWNDPREV) } {
