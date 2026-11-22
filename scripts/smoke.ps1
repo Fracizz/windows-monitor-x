@@ -154,11 +154,11 @@ function Get-Bounds([intptr]$Handle) {
     $rect
 }
 
-function Test-PanelSize([int]$Width, [int]$Height) {
+function Test-PanelSize([int]$ScalableWidth, [int]$GapPixels, [int]$Height) {
     $panel = Get-Bounds $window
     $dpi = [MonitorSmoke.Native]::GetDpiForWindow($window)
     return (
-        ($panel.Right - $panel.Left) -eq [math]::Floor(($Width * $dpi + 48) / 96) -and
+        ($panel.Right - $panel.Left) -eq ([math]::Ceiling($ScalableWidth * $dpi / 96) + $GapPixels) -and
         ($panel.Bottom - $panel.Top) -eq [math]::Floor(($Height * $dpi + 48) / 96)
     )
 }
@@ -171,7 +171,7 @@ function Test-TaskbarPlacement {
     $taskbarDpi = [MonitorSmoke.Native]::GetDpiForWindow($taskbar)
     return (
         [MonitorSmoke.Native]::IsWindowVisible($window) -and
-        ($panel.Right - $panel.Left) -eq [math]::Floor((258 * $taskbarDpi + 48) / 96) -and
+        ($panel.Right - $panel.Left) -eq ([math]::Ceiling(246 * $taskbarDpi / 96) + 12) -and
         ($panel.Bottom - $panel.Top) -eq [math]::Floor((36 * $taskbarDpi + 48) / 96) -and
         $panel.Left -ge $bar.Left -and $panel.Right -le $bar.Right -and
         $panel.Top -ge $bar.Top -and $panel.Bottom -le $bar.Bottom
@@ -211,7 +211,7 @@ try {
     $guiThread = [MonitorSmoke.Native]::GetWindowThreadProcessId($window, [ref]$owner)
     Assert-True ($owner -eq $app.Id) 'The launched instance must own the window.'
     Wait-For { [MonitorSmoke.Native]::IsWindowVisible($window) } 'Panel was not visible.'
-    Wait-For { Test-PanelSize 344 68 } 'Incorrect DPI-scaled English panel dimensions after startup.'
+    Wait-For { Test-PanelSize 320 24 68 } 'Incorrect DPI-scaled English panel dimensions after startup.'
     Wait-For { Test-ManagerVisible } 'Starting manually did not open the manager.'
     $manager = Get-ManagerWindow
     Assert-True ((Get-WindowTitle $manager).StartsWith('Manager')) 'Manager language was not restored.'
@@ -301,20 +301,20 @@ try {
         (Test-Setting 'language=zh-CN') -and (Get-WindowTitle $editor) -cne 'Edit Metrics' -and
             -not (Get-WindowTitle $manager).StartsWith('Manager')
     } 'Chinese did not apply to the open manager and editor.'
-    Wait-For { Test-PanelSize 357 68 } 'The panel did not resize for the Chinese labels.'
+    Wait-For { Test-PanelSize 333 24 68 } 'The panel did not resize for the Chinese labels.'
     Send-Panel 0x111 123
     Wait-For {
         (Test-Setting 'language=en-US') -and (Get-WindowTitle $editor) -ceq 'Edit Metrics' -and
             (Get-WindowTitle $manager).StartsWith('Manager')
     } 'English did not apply to the open manager and editor.'
-    Wait-For { Test-PanelSize 344 68 } 'The panel did not resize for the English labels.'
+    Wait-For { Test-PanelSize 320 24 68 } 'The panel did not resize for the English labels.'
     $density = [MonitorSmoke.Native]::GetDlgItem($editor, 15)
     Assert-True ($density -ne [intptr]::Zero) 'The density dropdown was missing.'
     $selected = [MonitorSmoke.Native]::SendMessageW($density, 0x14e, [uintptr]2, [intptr]::Zero)
     Assert-True ($selected.ToInt64() -eq 2) 'The tight density could not be selected.'
     Assert-True ([MonitorSmoke.Native]::PostMessageW($editor, 0x111, [uintptr]0x1000f, $density)) 'Changing density failed.'
     Assert-True ([MonitorSmoke.Native]::PostMessageW($editor, 0x111, [uintptr]1, [intptr]::Zero)) 'Applying density failed.'
-    Wait-For { (Test-Setting 'density=tight') -and (Test-PanelSize 277 68) } 'Tight density was not saved and applied.'
+    Wait-For { (Test-Setting 'density=tight') -and (Test-PanelSize 265 12 68) } 'Tight density was not saved and applied.'
     $rect = Get-Bounds $window
     $width = $rect.Right - $rect.Left
     $height = $rect.Bottom - $rect.Top
@@ -377,7 +377,7 @@ try {
         Send-Panel 0x111 108
         Wait-For { Test-Setting 'taskbar=false' } 'Taskbar mode did not turn off.'
     }
-    Wait-For { Test-PanelSize 277 68 } 'Tight floating dimensions were not restored after restart.'
+    Wait-For { Test-PanelSize 265 12 68 } 'Tight floating dimensions were not restored after restart.'
     Assert-True ((Get-ManagerWindow) -eq [intptr]::Zero) 'A background startup opened the manager.'
     Send-Panel 0x111 125
     Wait-For { Test-ManagerVisible } 'The Open Manager command did not open the manager.'
