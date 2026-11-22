@@ -5,7 +5,7 @@ use std::{
 
 use ::windows::{
     Win32::{
-        Foundation::{HWND, POINT, RECT},
+        Foundation::{HWND, RECT},
         Graphics::{
             Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
             Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromWindow},
@@ -18,11 +18,10 @@ use ::windows::{
             Accessibility::*,
             Shell::{ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage},
             WindowsAndMessaging::{
-                FindWindowExW, FindWindowW, GA_ROOT, GA_ROOTOWNER, GUI_INMENUMODE,
-                GUI_POPUPMENUMODE, GUITHREADINFO, GW_HWNDPREV, GWL_EXSTYLE, GetAncestor,
-                GetDesktopWindow, GetForegroundWindow, GetGUIThreadInfo, GetShellWindow, GetWindow,
-                GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
-                WS_EX_LAYERED, WindowFromPoint,
+                FindWindowExW, FindWindowW, GA_ROOTOWNER, GUI_INMENUMODE, GUI_POPUPMENUMODE,
+                GUITHREADINFO, GW_HWNDPREV, GetAncestor, GetClassNameW, GetDesktopWindow,
+                GetForegroundWindow, GetGUIThreadInfo, GetShellWindow, GetWindow, GetWindowRect,
+                GetWindowThreadProcessId, IsWindowVisible,
             },
         },
     },
@@ -252,8 +251,33 @@ pub fn primary_taskbar() -> Option<HWND> {
 }
 
 pub fn taskbar_has_focus(bar: HWND) -> bool {
-    let foreground = unsafe { GetForegroundWindow() };
-    foreground == bar || unsafe { GetAncestor(foreground, GA_ROOTOWNER) == bar }
+    is_taskbar_window(bar, unsafe { GetForegroundWindow() })
+}
+
+pub fn is_taskbar_window(bar: HWND, window: HWND) -> bool {
+    window == bar
+        || unsafe { GetAncestor(window, GA_ROOTOWNER) == bar }
+        || is_tray_overflow(bar, window)
+}
+
+pub fn is_tray_overflow(bar: HWND, window: HWND) -> bool {
+    let mut class = [0; 64];
+    let len = unsafe { GetClassNameW(window, &mut class) } as usize;
+    if ![
+        w!("TopLevelWindowForOverflowXamlIsland"),
+        w!("NotifyIconOverflowWindow"),
+    ]
+    .iter()
+    .any(|name| unsafe { name.as_wide() } == &class[..len])
+    {
+        return false;
+    }
+    let (mut shell_pid, mut window_pid) = (0, 0);
+    unsafe {
+        GetWindowThreadProcessId(bar, Some(&mut shell_pid));
+        GetWindowThreadProcessId(window, Some(&mut window_pid));
+    }
+    shell_pid != 0 && shell_pid == window_pid
 }
 
 pub fn taskbar_menu_open(bar: HWND) -> bool {
@@ -267,26 +291,16 @@ pub fn taskbar_menu_open(bar: HWND) -> bool {
         && (info.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)).0 != 0
 }
 
-pub fn covered_by_taskbar(window: HWND, rect: RECT) -> bool {
+pub fn covered_by_taskbar(bar: HWND, window: HWND, rect: RECT) -> bool {
     if !unsafe { IsWindowVisible(window).as_bool() } || window_rect(window) != Some(rect) {
         return false;
     }
-    let Some(bar) = primary_taskbar() else {
-        return false;
-    };
-    let center = POINT {
-        x: rect.left + (rect.right - rect.left) / 2,
-        y: rect.top + (rect.bottom - rect.top) / 2,
-    };
-    let hit = unsafe { GetAncestor(WindowFromPoint(center), GA_ROOT) };
-    let layered = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) } & WS_EX_LAYERED.0 as isize != 0;
-    if !layered {
-        return hit == bar;
-    }
-    if hit != bar && unsafe { GetAncestor(hit, GA_ROOTOWNER) } != window {
+    if !unsafe { IsWindowVisible(bar).as_bool() }
+        || !window_rect(bar).is_some_and(|bounds| valid_on_bar(rect, bounds))
+    {
         return false;
     }
-    // The owned input window can receive clicks even if the visual is below the taskbar.
+    // The transparent panel's input window can be above the taskbar while its visual is below.
     let mut visited = HashSet::new();
     let mut current = window;
     while let Ok(above) = unsafe { GetWindow(current, GW_HWNDPREV) } {
@@ -343,11 +357,10 @@ fn is_button(kind: UIA_CONTROLTYPE_ID) -> bool {
 fn fullscreen_on_bar(bar: HWND, own_window: HWND) -> bool {
     let foreground = unsafe { GetForegroundWindow() };
     if foreground.is_invalid()
-        || foreground == bar
         || foreground == own_window
         || foreground == unsafe { GetShellWindow() }
         || foreground == unsafe { GetDesktopWindow() }
-        || unsafe { GetAncestor(foreground, GA_ROOTOWNER) == bar }
+        || is_taskbar_window(bar, foreground)
     {
         return false;
     }

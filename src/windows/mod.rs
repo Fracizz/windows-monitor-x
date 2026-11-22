@@ -31,7 +31,15 @@ use ::windows::{
                 MonitorFromWindow, PAINTSTRUCT, SetWindowRgn, UpdateWindow,
             },
         },
-        System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            Threading::{
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CloseThreadpoolWait, CreateMutexW,
+                CreateThreadpoolWait, CreateWaitableTimerExW, PTP_CALLBACK_INSTANCE, PTP_WAIT,
+                SetThreadpoolWait, SetWaitableTimer, TIMER_ALL_ACCESS,
+                WaitForThreadpoolWaitCallbacks,
+            },
+        },
         UI::{
             Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             HiDpi::GetDpiForWindow,
@@ -51,8 +59,8 @@ use panel_input::PanelInput;
 use sampler::Sampler;
 use state::{DisplayOptions, Refresh, Settings, TaskbarSide, TextSize, Theme};
 use taskbar::{
-    DockPlacement, Observation, Placement, Taskbar, covered_by_taskbar, primary_taskbar,
-    taskbar_has_focus, taskbar_menu_open,
+    DockPlacement, Observation, Placement, Taskbar, covered_by_taskbar, is_taskbar_window,
+    is_tray_overflow, primary_taskbar, taskbar_has_focus, taskbar_menu_open,
 };
 
 const CLASS: PCWSTR = w!("WindowsMonitor.Panel");
@@ -62,11 +70,13 @@ const TRAY_EVENT: u32 = WM_APP + 2;
 const REVEAL_WINDOW: u32 = WM_APP + 3;
 const DOCK_READY: u32 = WM_APP + 4;
 const UPDATE_READY: u32 = WM_APP + 5;
-const TASKBAR_INTERACTION: u32 = WM_APP + 6;
+const DOCK_Z_ORDER_CHECK: u32 = WM_APP + 6;
 const TRAY_ID: u32 = 1;
 const ICON_ID: PCWSTR = PCWSTR(101usize as *const u16);
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const DOCK_INTERVAL: Duration = Duration::from_secs(1);
+const DOCK_Z_ORDER_TIMER: usize = 1;
+const DOCK_Z_ORDER_SETTLE: Duration = Duration::from_millis(120);
 const SAVE_INTERVAL: Duration = Duration::from_secs(60);
 
 const TOGGLE: usize = 101;
@@ -125,6 +135,8 @@ struct App {
     shown: bool,
     dock_generation: u64,
     placement: Option<Placement>,
+    dock_z_order_until: Option<Instant>,
+    dock_timer: Option<DockTimer>,
     sample: Sample,
     waiting_sample: bool,
     displayed: [Reading; Metric::ALL.len()],
@@ -173,6 +185,8 @@ impl App {
             shown: true,
             dock_generation: 0,
             placement: (!settings.taskbar).then_some(Placement::Floating),
+            dock_z_order_until: None,
+            dock_timer: None,
             sample,
             waiting_sample: true,
             displayed: readings(sample, settings.traffic),
@@ -202,6 +216,32 @@ impl App {
 
     fn panel_topmost(&self) -> bool {
         self.settings.topmost || self.placement != Some(Placement::Floating)
+    }
+
+    fn visible_dock_rect(&self) -> Option<RECT> {
+        match self.placement {
+            Some(Placement::Docked(rect)) if self.shown => Some(rect),
+            _ => None,
+        }
+    }
+
+    fn schedule_dock_z_order_check(&mut self, hwnd: HWND) {
+        if self.dock_timer.as_ref().is_some_and(DockTimer::arm) {
+            return;
+        }
+        self.dock_timer = None;
+        if unsafe {
+            SetCoalescableTimer(
+                Some(hwnd),
+                DOCK_Z_ORDER_TIMER,
+                USER_TIMER_MINIMUM,
+                None,
+                TIMERV_NO_COALESCING,
+            )
+        } == 0
+        {
+            self.dock_z_order_until = None;
+        }
     }
 
     fn request_dock(&mut self) {
@@ -372,7 +412,8 @@ impl SamplerWorker {
                         };
                         if let Some(placement) = placement
                             && (last_placement != Some(placement)
-                                || matches!(placement, Placement::Docked(rect) if covered_by_taskbar(hwnd, rect)))
+                                || matches!(placement, Placement::Docked(rect)
+                                    if bar.is_some_and(|bar| covered_by_taskbar(bar, hwnd, rect))))
                         {
                             last_placement = Some(placement);
                             let pending = feed
@@ -454,28 +495,84 @@ impl Drop for Window {
     }
 }
 
-struct TaskbarEvents(HWINEVENTHOOK);
+struct DockTimer {
+    timer: Instance,
+    wait: PTP_WAIT,
+}
+
+impl DockTimer {
+    fn new(hwnd: HWND) -> Result<Self> {
+        unsafe {
+            let timer = Instance(CreateWaitableTimerExW(
+                None,
+                PCWSTR::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS.0,
+            )?);
+            let wait = CreateThreadpoolWait(Some(dock_timer_fired), Some(hwnd.0), None)?;
+            Ok(Self { timer, wait })
+        }
+    }
+
+    fn arm(&self) -> bool {
+        // Check again in 2 ms. Relative due times use negative 100 ns units.
+        let due = -20_000;
+        unsafe {
+            SetThreadpoolWait(self.wait, Some(self.timer.0), None);
+            SetWaitableTimer(self.timer.0, &due, 0, None, None, false).is_ok()
+        }
+    }
+}
+
+impl Drop for DockTimer {
+    fn drop(&mut self) {
+        unsafe {
+            SetThreadpoolWait(self.wait, None, None);
+            WaitForThreadpoolWaitCallbacks(self.wait, true);
+            CloseThreadpoolWait(self.wait);
+        }
+    }
+}
+
+unsafe extern "system" fn dock_timer_fired(
+    _: PTP_CALLBACK_INSTANCE,
+    hwnd: *mut std::ffi::c_void,
+    _: PTP_WAIT,
+    _: u32,
+) {
+    let _ = notify(HWND(hwnd), DOCK_Z_ORDER_CHECK);
+}
+
+struct TaskbarEvents([HWINEVENTHOOK; 2]);
 
 impl TaskbarEvents {
     fn watch() -> Self {
-        Self(unsafe {
-            SetWinEventHook(
-                EVENT_SYSTEM_FOREGROUND,
-                EVENT_SYSTEM_MENUPOPUPEND,
-                None,
-                Some(taskbar_event),
-                0,
-                0,
-                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-            )
-        })
+        Self(
+            [
+                (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUPOPUPEND),
+                (EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE),
+            ]
+            .map(|(first, last)| unsafe {
+                SetWinEventHook(
+                    first,
+                    last,
+                    None,
+                    Some(taskbar_event),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                )
+            }),
+        )
     }
 }
 
 impl Drop for TaskbarEvents {
     fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            let _ = unsafe { UnhookWinEvent(self.0) };
+        for hook in self.0 {
+            if !hook.is_invalid() {
+                let _ = unsafe { UnhookWinEvent(hook) };
+            }
         }
     }
 }
@@ -484,23 +581,83 @@ unsafe extern "system" fn taskbar_event(
     _: HWINEVENTHOOK,
     event: u32,
     window: HWND,
-    _: i32,
-    _: i32,
+    object: i32,
+    child: i32,
     thread: u32,
     _: u32,
 ) {
-    let Some(panel) = with_app(|app| app.settings.taskbar.then_some(app.tray.hWnd)).flatten()
-    else {
+    let visibility_event = matches!(event, EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE);
+    if visibility_event && (object != OBJID_WINDOW.0 || child != CHILDID_SELF as i32) {
         return;
-    };
+    }
     let Some(bar) = primary_taskbar() else {
         return;
     };
-    let menu_event = event != EVENT_SYSTEM_FOREGROUND
-        && thread != 0
-        && thread == unsafe { GetWindowThreadProcessId(bar, None) };
-    if window == bar || menu_event || unsafe { GetAncestor(window, GA_ROOTOWNER) == bar } {
-        let _ = notify(panel, TASKBAR_INTERACTION);
+    let is_interaction = if visibility_event {
+        is_tray_overflow(bar, window)
+    } else {
+        is_taskbar_window(bar, window)
+            || (event != EVENT_SYSTEM_FOREGROUND
+                && thread != 0
+                && thread == unsafe { GetWindowThreadProcessId(bar, None) })
+    };
+    if !is_interaction {
+        return;
+    }
+    let Some((panel, rect)) = with_app(|app| {
+        if !app.settings.taskbar {
+            return None;
+        }
+        let _ = app.worker.send(WorkerCommand::TaskbarInteraction);
+        let rect = app.visible_dock_rect()?;
+        let panel = app.tray.hWnd;
+        // Explorer can raise the taskbar just after sending the foreground event.
+        if app
+            .dock_z_order_until
+            .replace(Instant::now() + DOCK_Z_ORDER_SETTLE)
+            .is_none()
+        {
+            app.schedule_dock_z_order_check(panel);
+        }
+        Some((panel, rect))
+    })
+    .flatten() else {
+        return;
+    };
+    keep_dock_above_taskbar(bar, panel, rect);
+}
+
+fn check_dock_z_order(hwnd: HWND) {
+    let Some(rect) = with_app(|app| {
+        let rect = app.visible_dock_rect();
+        let settling = rect.is_some()
+            && app
+                .dock_z_order_until
+                .is_some_and(|until| Instant::now() < until);
+        if settling {
+            if app.dock_timer.is_some() {
+                app.schedule_dock_z_order_check(hwnd);
+            }
+        } else {
+            app.dock_z_order_until = None;
+            if app.dock_timer.is_none() {
+                let _ = unsafe { KillTimer(Some(hwnd), DOCK_Z_ORDER_TIMER) };
+            }
+        }
+        rect
+    }) else {
+        return;
+    };
+    if let Some(rect) = rect
+        && let Some(bar) = primary_taskbar()
+    {
+        keep_dock_above_taskbar(bar, hwnd, rect);
+    }
+}
+
+fn keep_dock_above_taskbar(bar: HWND, hwnd: HWND, rect: RECT) {
+    if covered_by_taskbar(bar, hwnd, rect) {
+        set_topmost(hwnd, true);
     }
 }
 
@@ -538,7 +695,10 @@ pub fn run() -> Result<()> {
     let _ = show_starting_panel(hwnd);
 
     let _sampler = SamplerWorker::start(hwnd, feed, settings, worker).map_err(Error::from)?;
-    with_app(|app| app.add_tray(hwnd));
+    with_app(|app| {
+        app.add_tray(hwnd);
+        app.dock_timer = DockTimer::new(hwnd).ok();
+    });
     let _taskbar_events = TaskbarEvents::watch();
     let mut message = MSG::default();
     loop {
@@ -714,6 +874,8 @@ unsafe extern "system" fn window_proc(
             }
         }
         WM_CONTEXTMENU | WM_NCRBUTTONUP => open_menu(hwnd, message_point(lparam)),
+        DOCK_Z_ORDER_CHECK => check_dock_z_order(hwnd),
+        WM_TIMER if wparam.0 == DOCK_Z_ORDER_TIMER => check_dock_z_order(hwnd),
         TRAY_EVENT => match (lparam.0 as u32) & 0xffff {
             WM_CONTEXTMENU => open_menu(hwnd, message_point(LPARAM(wparam.0 as isize))),
             NIN_SELECT | NIN_KEYSELECT => command(hwnd, TOGGLE),
@@ -757,18 +919,6 @@ unsafe extern "system" fn window_proc(
                 apply_placement(hwnd);
             }
         }
-        TASKBAR_INTERACTION => {
-            let slot = with_app(|app| {
-                let _ = app.worker.send(WorkerCommand::TaskbarInteraction);
-                app.placement.filter(|_| app.shown)
-            })
-            .flatten();
-            if let Some(Placement::Docked(rect)) = slot
-                && covered_by_taskbar(hwnd, rect)
-            {
-                set_topmost(hwnd, true);
-            }
-        }
         UPDATE_READY => finish_update(hwnd),
         REVEAL_WINDOW => {
             with_app(|app| app.shown = true);
@@ -786,6 +936,7 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY => {
             with_app(|app| {
+                app.dock_timer = None;
                 app.take_sample();
                 app.save();
                 if app.tray_ready {
