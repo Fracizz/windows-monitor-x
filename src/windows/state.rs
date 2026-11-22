@@ -162,6 +162,7 @@ pub struct Settings {
     pub taskbar: bool,
     pub taskbar_side: TaskbarSide,
     pub refresh: Refresh,
+    pub record_history: bool,
     pub display: DisplayOptions,
     pub position: Option<POINT>,
 }
@@ -177,6 +178,7 @@ impl Default for Settings {
             taskbar: false,
             taskbar_side: TaskbarSide::default(),
             refresh: Refresh::default(),
+            record_history: false,
             display: DisplayOptions {
                 language: LanguagePreference::System.resolve(),
                 ..Default::default()
@@ -204,6 +206,9 @@ impl Settings {
                         "taskbar" => settings.taskbar = value.parse().unwrap_or(false),
                         "taskbar_side" => settings.taskbar_side = TaskbarSide::parse(value),
                         "refresh" => settings.refresh = Refresh::parse(value),
+                        "record_history" => {
+                            settings.record_history = value.parse().unwrap_or(false)
+                        }
                         "metrics" => settings.display.metrics = Metrics::parse(value),
                         "density" => settings.display.density = Density::parse(value),
                         "text_size" => {
@@ -247,14 +252,15 @@ impl Settings {
         fs::write(
             &temp,
             format!(
-                "traffic={}\ntheme={theme}\nlanguage={}\nlabel_bold={}\ntopmost={}\ntaskbar={}\ntaskbar_side={}\nrefresh={}\nposition={position}\nmetrics={metrics}\ntext_size={text_size}\ndensity={density}\n",
+                "traffic={}\ntheme={theme}\nlanguage={}\nlabel_bold={}\ntopmost={}\ntaskbar={}\ntaskbar_side={}\nrefresh={}\nrecord_history={}\nposition={position}\nmetrics={metrics}\ntext_size={text_size}\ndensity={density}\n",
                 self.traffic,
                 self.language.key(),
                 self.label_bold,
                 self.topmost,
                 self.taskbar,
                 self.taskbar_side.as_str(),
-                self.refresh.seconds()
+                self.refresh.seconds(),
+                self.record_history,
             ),
         )?;
         fs::rename(temp, file)
@@ -337,9 +343,9 @@ fn parse_point(value: &str) -> Option<POINT> {
 }
 
 fn state_file() -> Option<PathBuf> {
-    Some(
-        PathBuf::from(env::var_os("LOCALAPPDATA")?)
-            .join("WindowsMonitor")
-            .join("state.ini"),
-    )
+    Some(data_directory()?.join("state.ini"))
+}
+
+pub fn data_directory() -> Option<PathBuf> {
+    Some(PathBuf::from(env::var_os("LOCALAPPDATA")?).join("WindowsMonitor"))
 }

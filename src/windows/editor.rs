@@ -2,9 +2,7 @@ use std::cell::RefCell;
 
 use ::windows::{
     Win32::{
-        Foundation::{
-            ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
-        },
+        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::{
             BeginPaint, COLOR_BTNFACE, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, DEFAULT_GUI_FONT, EndPaint,
             FillRect, GetMonitorInfoW, GetStockObject, GetSysColorBrush, MONITOR_DEFAULTTONEAREST,
@@ -20,12 +18,15 @@ use ::windows::{
             WindowsAndMessaging::*,
         },
     },
-    core::{Error, PCWSTR, PWSTR, Result, w},
+    core::{PCWSTR, PWSTR, Result, w},
 };
 
 use super::panel::{Appearance, Layout, Panel};
 use super::state::{Density, DisplayOptions, TextSize, Theme};
-use super::{Window, invalidate, metric_name, scale, set_display, window_dpi, with_app};
+use super::{
+    Window, control, invalidate, metric_name, position, register_class, scale, send, set_display,
+    window_dpi, with_app,
+};
 use crate::{
     language::Language,
     model::{Metric, readings},
@@ -83,7 +84,7 @@ impl Drag {
     }
 }
 
-pub fn open(owner: HWND) -> Result<()> {
+pub fn open(owner: HWND, anchor: HWND) -> Result<()> {
     if let Some(hwnd) = with_editor(|editor| editor.hwnd) {
         unsafe {
             let _ = SetForegroundWindow(hwnd);
@@ -117,14 +118,14 @@ pub fn open(owner: HWND) -> Result<()> {
         0,
     )?;
 
-    let dpi = window_dpi(owner);
+    let dpi = window_dpi(anchor);
     let mut area = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
     unsafe {
         GetMonitorInfoW(
-            MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST),
+            MonitorFromWindow(anchor, MONITOR_DEFAULTTONEAREST),
             &mut area,
         )
         .ok()?;
@@ -171,33 +172,6 @@ pub fn open(owner: HWND) -> Result<()> {
 }
 
 const HBRUSH_BUTTON_FACE: isize = COLOR_BTNFACE.0 as isize + 1;
-
-fn register_class(
-    class: PCWSTR,
-    instance: HINSTANCE,
-    proc: WNDPROC,
-    icon: HICON,
-    background: isize,
-) -> Result<()> {
-    unsafe {
-        let definition = WNDCLASSW {
-            lpfnWndProc: proc,
-            hInstance: instance,
-            hIcon: icon,
-            hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hbrBackground: ::windows::Win32::Graphics::Gdi::HBRUSH(background as *mut _),
-            lpszClassName: class,
-            ..Default::default()
-        };
-        if RegisterClassW(&definition) == 0 {
-            let error = Error::from_thread();
-            if error.code() != ERROR_CLASS_ALREADY_EXISTS.to_hresult() {
-                return Err(error);
-            }
-        }
-    }
-    Ok(())
-}
 
 impl Editor {
     fn new(hwnd: HWND, owner: HWND, display: DisplayOptions, layout: Layout) -> Result<Self> {
@@ -502,12 +476,10 @@ impl Editor {
         let left = scale(214, dpi).min(bounds.right / 2) + 2 * margin;
         let available = (bounds.right - left - margin).max(1);
         let display = self.preview_display();
-        let (width, height) = self.layout.size(display);
-        self.preview_dpi = dpi.min(((i64::from(available) * 96) / i64::from(width)).max(1) as u32);
-        let (width, height) = (
-            scale(width, self.preview_dpi).max(1),
-            scale(height, self.preview_dpi).max(1),
-        );
+        let size = self.layout.size(display);
+        self.preview_dpi = size.fitting_dpi(dpi, available);
+        let (width, height) = size.pixels(self.preview_dpi);
+        let (width, height) = (width.max(1), height.max(1));
         position(
             self.preview,
             left + (available - width) / 2,
@@ -802,43 +774,6 @@ fn row_bounds(list: HWND, index: usize) -> Option<RECT> {
     (send(list, LVM_GETITEMRECT, index, &mut row as *mut _ as isize) != 0).then_some(row)
 }
 
-fn control(parent: HWND, class: PCWSTR, label: PCWSTR, style: u32, id: usize) -> Result<HWND> {
-    unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            class,
-            label,
-            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(style),
-            0,
-            0,
-            0,
-            0,
-            Some(parent),
-            Some(HMENU(id as *mut _)),
-            None,
-            None,
-        )
-    }
-}
-
-fn position(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
-    unsafe {
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            x,
-            y,
-            width,
-            height,
-            SWP_NOACTIVATE | SWP_NOZORDER,
-        );
-    }
-}
-
-fn send(hwnd: HWND, message: u32, wparam: usize, lparam: isize) -> isize {
-    unsafe { SendMessageW(hwnd, message, Some(WPARAM(wparam)), Some(LPARAM(lparam))).0 }
-}
-
 fn with_editor<T>(run: impl FnOnce(&mut Editor) -> T) -> Option<T> {
     EDITOR.with(|editor| editor.try_borrow_mut().ok()?.as_mut().map(run))
 }
@@ -1078,7 +1013,7 @@ mod tests {
                 sender,
             ));
         });
-        open(owner.0).unwrap();
+        open(owner.0, owner.0).unwrap();
         let (hwnd, list, preview, size) =
             with_editor(|editor| (editor.hwnd, editor.list, editor.preview, editor.size)).unwrap();
         let initial_width = client_width(preview);

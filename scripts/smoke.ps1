@@ -85,15 +85,37 @@ function Send-Panel([uint32]$Message, [uint32]$Command = 0, [intptr]$Data = [int
     Assert-True ([MonitorSmoke.Native]::PostMessageW($window, $Message, [uintptr]$Command, $Data)) 'Posting to the panel failed.'
 }
 
-function Start-Monitor {
+function Start-Monitor([switch]$Background) {
     $info = [Diagnostics.ProcessStartInfo]::new($Exe)
     $info.UseShellExecute = $false
     $info.EnvironmentVariables['LOCALAPPDATA'] = $testData
+    if ($Background) { $info.Arguments = '--background' }
     [Diagnostics.Process]::Start($info)
 }
 
 function Get-PanelWindow {
     [MonitorSmoke.Native]::FindWindow('WindowsMonitor.Panel', [intptr]::Zero)
+}
+
+function Get-ManagerWindow {
+    [MonitorSmoke.Native]::FindWindow('WindowsMonitor.Manager', [intptr]::Zero)
+}
+
+function Test-ManagerVisible {
+    $handle = Get-ManagerWindow
+    $handle -ne [intptr]::Zero -and [MonitorSmoke.Native]::IsWindowVisible($handle)
+}
+
+function Send-ManagerControl([uint32]$Id, [int]$Selection = -1) {
+    $control = [MonitorSmoke.Native]::GetDlgItem($manager, $Id)
+    Assert-True ($control -ne [intptr]::Zero) "Manager control $Id is missing."
+    $command = $Id
+    if ($Selection -ge 0) {
+        $selected = [MonitorSmoke.Native]::SendMessageW($control, 0x14e, [uintptr]$Selection, [intptr]::Zero)
+        Assert-True ($selected.ToInt64() -eq $Selection) "Could not select option $Selection for control $Id."
+        $command = $command -bor 0x10000
+    }
+    Assert-True ([MonitorSmoke.Native]::PostMessageW($manager, 0x111, [uintptr]$command, $control)) "Could not use manager control $Id."
 }
 
 function Get-WindowTitle([intptr]$Handle) {
@@ -149,7 +171,7 @@ function Test-TaskbarPlacement {
     $taskbarDpi = [MonitorSmoke.Native]::GetDpiForWindow($taskbar)
     return (
         [MonitorSmoke.Native]::IsWindowVisible($window) -and
-        ($panel.Right - $panel.Left) -eq [math]::Floor((283 * $taskbarDpi + 48) / 96) -and
+        ($panel.Right - $panel.Left) -eq [math]::Floor((258 * $taskbarDpi + 48) / 96) -and
         ($panel.Bottom - $panel.Top) -eq [math]::Floor((36 * $taskbarDpi + 48) / 96) -and
         $panel.Left -ge $bar.Left -and $panel.Right -le $bar.Right -and
         $panel.Top -ge $bar.Top -and $panel.Bottom -le $bar.Bottom
@@ -179,7 +201,7 @@ Assert-True ((Get-PanelWindow) -eq [intptr]::Zero) 'Close the existing Windows M
 $testData = Join-Path ([IO.Path]::GetTempPath()) ('windows-monitor-smoke-' + [guid]::NewGuid())
 $stateFile = Join-Path $testData 'WindowsMonitor\state.ini'
 [void][IO.Directory]::CreateDirectory((Split-Path -Parent $stateFile))
-[IO.File]::WriteAllLines($stateFile, @('traffic=16360000000', 'theme=light', 'topmost=true'))
+[IO.File]::WriteAllLines($stateFile, @('traffic=16360000000', 'theme=light', 'language=en-US', 'topmost=true'))
 $app = $second = $null
 try {
     $app = Start-Monitor
@@ -189,7 +211,17 @@ try {
     $guiThread = [MonitorSmoke.Native]::GetWindowThreadProcessId($window, [ref]$owner)
     Assert-True ($owner -eq $app.Id) 'The launched instance must own the window.'
     Wait-For { [MonitorSmoke.Native]::IsWindowVisible($window) } 'Panel was not visible.'
-    Wait-For { Test-PanelSize 381 68 } 'Incorrect DPI-scaled panel dimensions after startup.'
+    Wait-For { Test-PanelSize 344 68 } 'Incorrect DPI-scaled English panel dimensions after startup.'
+    Wait-For { Test-ManagerVisible } 'Starting manually did not open the manager.'
+    $manager = Get-ManagerWindow
+    Assert-True ((Get-WindowTitle $manager).StartsWith('Manager')) 'Manager language was not restored.'
+    $liveList = [MonitorSmoke.Native]::GetDlgItem($manager, 205)
+    Assert-True ($liveList -ne [intptr]::Zero) 'Live readings were missing from the manager.'
+    $rows = [MonitorSmoke.Native]::SendMessageW($liveList, 0x1004, [uintptr]0, [intptr]::Zero)
+    Assert-True ($rows.ToInt64() -eq 16) 'The manager did not show all live metrics.'
+    Assert-True ([MonitorSmoke.Native]::PostMessageW($manager, 0x10, [uintptr]0, [intptr]::Zero)) 'Closing the manager failed.'
+    Wait-For { (Get-ManagerWindow) -eq [intptr]::Zero } 'The manager did not close.'
+    Assert-True ((Get-PanelWindow) -eq $window -and [MonitorSmoke.Native]::IsWindowVisible($window)) 'Closing the manager interrupted the panel.'
 
     $rect = Get-Bounds $window
     $dpi = [MonitorSmoke.Native]::GetDpiForWindow($window)
@@ -205,12 +237,30 @@ try {
 
     Send-Panel 0x8002 0 ([intptr]0x10400)
     Wait-For { -not [MonitorSmoke.Native]::IsWindowVisible($window) } 'The tray callback did not hide the panel.'
+    $second = Start-Monitor -Background
+    Assert-True ($second.WaitForExit(5000) -and $second.ExitCode -eq 0) 'The background launch did not yield to the first instance.'
+    Assert-True ((Get-ManagerWindow) -eq [intptr]::Zero -and -not [MonitorSmoke.Native]::IsWindowVisible($window)) 'The background launch changed the visible windows.'
+    $second.Dispose()
     $second = Start-Monitor
     Assert-True ($second.WaitForExit(5000) -and $second.ExitCode -eq 0) 'The second process did not yield to the first.'
     Wait-For { [MonitorSmoke.Native]::IsWindowVisible($window) } 'A second launch did not reveal the original panel.'
     Assert-True ((Get-PanelWindow) -eq $window) 'A second launch replaced the original window.'
+    Wait-For { Test-ManagerVisible } 'A second launch did not reopen the manager.'
+    $manager = Get-ManagerWindow
+    Send-ManagerControl 101
+    Wait-For { -not [MonitorSmoke.Native]::IsWindowVisible($window) } 'The manager did not hide the panel.'
 
-    Send-Panel 0x111 105
+    Send-ManagerControl 124
+    Wait-For {
+        $script:historyWindow = [MonitorSmoke.Native]::FindWindow('WindowsMonitor.History', [intptr]::Zero)
+        $historyWindow -ne [intptr]::Zero -and [MonitorSmoke.Native]::IsWindowVisible($historyWindow)
+    } 'History did not open from the manager.'
+    Assert-True ([MonitorSmoke.Native]::PostMessageW($historyWindow, 0x10, [uintptr]0, [intptr]::Zero)) 'Closing History failed.'
+    Wait-For { [MonitorSmoke.Native]::FindWindow('WindowsMonitor.History', [intptr]::Zero) -eq [intptr]::Zero } 'History did not close.'
+    Send-ManagerControl 101
+    Wait-For { [MonitorSmoke.Native]::IsWindowVisible($window) } 'The manager did not show the panel again.'
+
+    Send-ManagerControl 202 2
     Wait-For { Test-Setting 'theme=dark' } 'Dark theme was not saved.'
     Send-Panel 0x111 118
     Wait-For { Test-Setting 'theme=transparent' } 'Transparent theme was not saved.'
@@ -239,32 +289,44 @@ try {
         Wait-For { Test-Setting "refresh=$($option[1])" } 'Refresh interval was not saved.'
     }
 
-    Send-Panel 0x111 116
+    Send-ManagerControl 116
     $editorClass = 'WindowsMonitor.MetricsEditor'
     Wait-For {
         $handle = [MonitorSmoke.Native]::FindWindow($editorClass, [intptr]::Zero)
         $handle -ne [intptr]::Zero -and [MonitorSmoke.Native]::IsWindowVisible($handle)
     } 'The metric editor did not open.'
     $editor = [MonitorSmoke.Native]::FindWindow($editorClass, [intptr]::Zero)
-    Send-Panel 0x111 122
-    Wait-For { (Test-Setting 'language=zh-CN') -and (Get-WindowTitle $editor) -cne 'Edit Metrics' } 'Chinese did not apply to the open editor.'
+    Send-ManagerControl 204 1
+    Wait-For {
+        (Test-Setting 'language=zh-CN') -and (Get-WindowTitle $editor) -cne 'Edit Metrics' -and
+            -not (Get-WindowTitle $manager).StartsWith('Manager')
+    } 'Chinese did not apply to the open manager and editor.'
+    Wait-For { Test-PanelSize 357 68 } 'The panel did not resize for the Chinese labels.'
     Send-Panel 0x111 123
-    Wait-For { (Test-Setting 'language=en-US') -and (Get-WindowTitle $editor) -ceq 'Edit Metrics' } 'English did not apply to the open editor.'
+    Wait-For {
+        (Test-Setting 'language=en-US') -and (Get-WindowTitle $editor) -ceq 'Edit Metrics' -and
+            (Get-WindowTitle $manager).StartsWith('Manager')
+    } 'English did not apply to the open manager and editor.'
+    Wait-For { Test-PanelSize 344 68 } 'The panel did not resize for the English labels.'
     $density = [MonitorSmoke.Native]::GetDlgItem($editor, 15)
     Assert-True ($density -ne [intptr]::Zero) 'The density dropdown was missing.'
     $selected = [MonitorSmoke.Native]::SendMessageW($density, 0x14e, [uintptr]2, [intptr]::Zero)
     Assert-True ($selected.ToInt64() -eq 2) 'The tight density could not be selected.'
     Assert-True ([MonitorSmoke.Native]::PostMessageW($editor, 0x111, [uintptr]0x1000f, $density)) 'Changing density failed.'
     Assert-True ([MonitorSmoke.Native]::PostMessageW($editor, 0x111, [uintptr]1, [intptr]::Zero)) 'Applying density failed.'
-    Wait-For { (Test-Setting 'density=tight') -and (Test-PanelSize 326 68) } 'Tight density was not saved and applied.'
+    Wait-For { (Test-Setting 'density=tight') -and (Test-PanelSize 277 68) } 'Tight density was not saved and applied.'
     $rect = Get-Bounds $window
     $width = $rect.Right - $rect.Left
     $height = $rect.Bottom - $rect.Top
 
     $dockedPixels = $null
     if ($RequireTaskbar -or $ExpectDockHidden) {
-        Send-Panel 0x111 108
+        Send-ManagerControl 108
         Wait-For { Test-Setting 'taskbar=true' } 'Dock preference was not saved.'
+    }
+    Assert-True ([MonitorSmoke.Native]::PostMessageW($manager, 0x10, [uintptr]0, [intptr]::Zero)) 'Closing the manager after configuration failed.'
+    Wait-For { (Get-ManagerWindow) -eq [intptr]::Zero } 'The manager was still open before measuring background monitoring.'
+    if ($RequireTaskbar -or $ExpectDockHidden) {
         if ($RequireTaskbar) {
             Wait-For { Test-TaskbarPlacement } 'The panel did not enter an available taskbar slot.'
             Wait-For { Test-PanelOnTopAtCenter } 'The taskbar panel is not visible above Explorer.'
@@ -301,7 +363,7 @@ try {
     Assert-True (Test-Setting 'theme=light') 'Settings were not preserved at exit.'
 
     $app.Dispose()
-    $app = Start-Monitor
+    $app = Start-Monitor -Background
     Wait-For { (Get-PanelWindow) -ne [intptr]::Zero } 'Panel did not reopen.'
     $window = Get-PanelWindow
     if ($RequireTaskbar -or $ExpectDockHidden) {
@@ -315,7 +377,11 @@ try {
         Send-Panel 0x111 108
         Wait-For { Test-Setting 'taskbar=false' } 'Taskbar mode did not turn off.'
     }
-    Wait-For { Test-PanelSize 326 68 } 'Tight floating dimensions were not restored after restart.'
+    Wait-For { Test-PanelSize 277 68 } 'Tight floating dimensions were not restored after restart.'
+    Assert-True ((Get-ManagerWindow) -eq [intptr]::Zero) 'A background startup opened the manager.'
+    Send-Panel 0x111 125
+    Wait-For { Test-ManagerVisible } 'The Open Manager command did not open the manager.'
+    $manager = Get-ManagerWindow
     Send-Panel 0x111 116
     Wait-For {
         $script:editor = [MonitorSmoke.Native]::FindWindow($editorClass, [intptr]::Zero)
@@ -324,7 +390,7 @@ try {
     Assert-True ([MonitorSmoke.Native]::PostMessageW($editor, 0x111, [uintptr]2, [intptr]::Zero)) 'Closing the metrics editor failed.'
     Send-Panel 0x111 119
     Wait-For { Test-Setting 'label_bold=true' } 'The label weight preference was not restored after restart.'
-    Send-Panel 0x111 107
+    Send-ManagerControl 107
     Assert-True ($app.WaitForExit(5000) -and $app.ExitCode -eq 0) 'The relaunched instance failed to close.'
 
     [pscustomobject]@{

@@ -28,7 +28,7 @@ use ::windows::{
     core::{Interface, PCWSTR, Result, w},
 };
 
-use super::{scale, state::TaskbarSide, window_dpi};
+use super::{panel::LayoutSize, scale, state::TaskbarSide, window_dpi};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Placement {
@@ -150,7 +150,7 @@ impl Taskbar {
         bar: HWND,
         own_window: HWND,
         side: TaskbarSide,
-        (width, height): (i32, i32),
+        size: LayoutSize,
         preferred_x: Option<i32>,
     ) -> Option<Observation> {
         let mut info = APPBARDATA {
@@ -168,7 +168,7 @@ impl Taskbar {
             return Some(Observation::Placement(Placement::Hidden));
         }
         let dpi = window_dpi(bar);
-        let (width, height) = (scale(width, dpi), scale(height, dpi));
+        let (width, height) = size.pixels(dpi);
         let padding = scale(3, dpi);
         if height + scale(4, dpi) > bounds.bottom - bounds.top {
             return Some(Observation::Placement(Placement::Floating));

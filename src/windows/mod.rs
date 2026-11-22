@@ -1,5 +1,7 @@
 mod about;
 mod editor;
+mod history_window;
+mod manager;
 mod panel;
 mod panel_input;
 mod sampler;
@@ -10,6 +12,8 @@ mod updater;
 
 use std::{
     cell::RefCell,
+    io,
+    path::PathBuf,
     sync::{Arc, Mutex, OnceLock, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -18,8 +22,8 @@ use std::{
 use ::windows::{
     Win32::{
         Foundation::{
-            CloseHandle, D2DERR_RECREATE_TARGET, ERROR_ALREADY_EXISTS, GetLastError, HANDLE,
-            HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+            CloseHandle, D2DERR_RECREATE_TARGET, ERROR_ALREADY_EXISTS, ERROR_CLASS_ALREADY_EXISTS,
+            GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
         },
         Globalization::SetThreadUILanguage,
         Graphics::{
@@ -28,9 +32,9 @@ use ::windows::{
                 DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY, DwmSetWindowAttribute,
             },
             Gdi::{
-                BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, GetMonitorInfoW, HDC,
-                HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
-                MonitorFromWindow, PAINTSTRUCT, SetWindowRgn, UpdateWindow,
+                BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, GetMonitorInfoW, HBRUSH,
+                HDC, HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+                MonitorFromPoint, MonitorFromWindow, PAINTSTRUCT, SetWindowRgn, UpdateWindow,
             },
         },
         System::{
@@ -56,10 +60,11 @@ use ::windows::{
 };
 
 use crate::{
+    history,
     language::Language,
     model::{Metric, Reading, Sample, readings},
 };
-use panel::{Appearance, Layout, Panel};
+use panel::{Appearance, Layout, LayoutSize, Panel};
 use panel_input::PanelInput;
 use sampler::Sampler;
 use state::{DisplayOptions, LanguagePreference, Refresh, Settings, TaskbarSide, TextSize, Theme};
@@ -77,6 +82,7 @@ const REVEAL_WINDOW: u32 = WM_APP + 3;
 const DOCK_READY: u32 = WM_APP + 4;
 const UPDATE_READY: u32 = WM_APP + 5;
 const DOCK_Z_ORDER_CHECK: u32 = WM_APP + 6;
+const HISTORY_STATUS: u32 = WM_APP + 7;
 const TRAY_ID: u32 = 1;
 const ICON_ID: PCWSTR = PCWSTR(101usize as *const u16);
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
@@ -104,6 +110,8 @@ const ABOUT: usize = 120;
 const LANGUAGE_SYSTEM: usize = 121;
 const LANGUAGE_CHINESE: usize = 122;
 const LANGUAGE_ENGLISH: usize = 123;
+const OPEN_HISTORY: usize = 124;
+const OPEN_MANAGER: usize = 125;
 const REFRESH_OPTIONS: [(usize, Refresh); 4] = [
     (109, Refresh::One),
     (110, Refresh::Two),
@@ -119,13 +127,16 @@ thread_local! {
 struct Mailbox {
     sample: Option<Sample>,
     dock: Option<(u64, Placement)>,
+    history_error: Option<String>,
 }
 
 type Feed = Arc<Mutex<Mailbox>>;
 
 enum WorkerCommand {
     Interval(Refresh),
-    Dock(Option<u64>, TaskbarSide, (i32, i32)),
+    RecordHistory(bool),
+    ResetHistoryTraffic(u64),
+    Dock(Option<u64>, TaskbarSide, LayoutSize),
     RecheckDock,
     TaskbarInteraction,
     Stop,
@@ -376,6 +387,7 @@ impl SamplerWorker {
                 let mut last_sample = Instant::now();
                 let mut next_sample = last_sample;
                 let mut interval = settings.refresh.interval();
+                let mut capture = HistoryCapture::new(settings);
                 let mut dock = settings.taskbar.then_some((0, next_sample));
                 let mut taskbar_side = settings.taskbar_side;
                 let mut dock_size = Layout::Taskbar.size(settings.display);
@@ -392,6 +404,7 @@ impl SamplerWorker {
                         if !pending && !notify(hwnd, SAMPLE_READY) {
                             break;
                         }
+                        capture.poll(hwnd, &feed, now, interval, sample);
                     }
                     if let Some((generation, deadline)) = dock
                         && now >= deadline
@@ -448,6 +461,13 @@ impl SamplerWorker {
                             interval = refresh.interval();
                             next_sample = last_sample + interval;
                         }
+                        Ok(WorkerCommand::RecordHistory(enabled)) => {
+                            capture.set_enabled(hwnd, &feed, enabled);
+                        }
+                        Ok(WorkerCommand::ResetHistoryTraffic(traffic)) => {
+                            capture.starting_traffic = 0;
+                            capture.traffic_at_reset = traffic;
+                        }
                         Ok(WorkerCommand::Dock(generation, side, size)) => {
                             taskbar_side = side;
                             dock_size = size;
@@ -477,6 +497,105 @@ impl SamplerWorker {
             control,
             thread: Some(thread),
         })
+    }
+}
+
+fn history_directory() -> Option<PathBuf> {
+    Some(state::data_directory()?.join("history-v1"))
+}
+
+struct HistoryCapture {
+    directory: Option<PathBuf>,
+    writer: Option<history::Writer>,
+    enabled: bool,
+    first_sample: bool,
+    prune_at: Instant,
+    retry_at: Instant,
+    starting_traffic: u64,
+    traffic_at_reset: u64,
+}
+
+impl HistoryCapture {
+    fn new(settings: Settings) -> Self {
+        let now = Instant::now();
+        Self {
+            directory: history_directory(),
+            writer: None,
+            enabled: settings.record_history,
+            first_sample: true,
+            prune_at: now,
+            retry_at: now,
+            starting_traffic: settings.traffic,
+            traffic_at_reset: 0,
+        }
+    }
+
+    fn set_enabled(&mut self, hwnd: HWND, feed: &Feed, enabled: bool) {
+        self.enabled = enabled;
+        self.first_sample = true;
+        self.retry_at = Instant::now();
+        if !enabled {
+            self.writer = None;
+            Self::report(hwnd, feed, None);
+        }
+    }
+
+    fn poll(&mut self, hwnd: HWND, feed: &Feed, now: Instant, interval: Duration, sample: Sample) {
+        if now >= self.prune_at {
+            // Previously recorded history expires even when recording is paused.
+            let result = self.directory.as_ref().map_or(Ok(()), |directory| {
+                history::prune(directory, history::now_ms())
+            });
+            self.prune_at = now
+                + if result.is_ok() {
+                    Duration::from_secs(3600)
+                } else {
+                    SAVE_INTERVAL
+                };
+        }
+        if !self.enabled || now < self.retry_at {
+            return;
+        }
+        let opening = self.writer.is_none();
+        let result = self.record(interval, sample);
+        if let Err(error) = result {
+            self.writer = None;
+            self.first_sample = true;
+            self.retry_at = now + SAVE_INTERVAL;
+            Self::report(hwnd, feed, Some(error.to_string()));
+        } else if opening {
+            Self::report(hwnd, feed, None);
+        }
+    }
+
+    fn record(&mut self, interval: Duration, sample: Sample) -> io::Result<()> {
+        let directory = self
+            .directory
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA"))?;
+        let writer = self
+            .writer
+            .get_or_insert_with(|| history::Writer::new(directory.clone()));
+        let cadence = if self.first_sample {
+            0
+        } else {
+            interval.as_millis() as u64
+        };
+        let traffic = self
+            .starting_traffic
+            .saturating_add(sample.traffic.saturating_sub(self.traffic_at_reset));
+        writer.record(history::now_ms(), cadence, sample, traffic)?;
+        self.first_sample = false;
+        Ok(())
+    }
+
+    fn report(hwnd: HWND, feed: &Feed, error: Option<String>) {
+        let mut mailbox = feed.lock().unwrap();
+        if mailbox.history_error != error {
+            mailbox.history_error = error;
+            drop(mailbox);
+            notify(hwnd, HISTORY_STATUS);
+        }
     }
 }
 
@@ -684,6 +803,9 @@ pub fn run() -> Result<()> {
         }
         return Ok(());
     }
+    let background = std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == startup::BACKGROUND_ARG);
     let _instance = unsafe {
         let instance = Instance(CreateMutexW(
             None,
@@ -691,7 +813,12 @@ pub fn run() -> Result<()> {
             w!(r"Local\WindowsMonitor.Panel.v1"),
         )?);
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            if let Ok(hwnd) = FindWindowW(CLASS, PCWSTR::null()) {
+            if !background && let Ok(hwnd) = FindWindowW(CLASS, PCWSTR::null()) {
+                let mut process = 0;
+                GetWindowThreadProcessId(hwnd, Some(&mut process));
+                if process != 0 {
+                    let _ = AllowSetForegroundWindow(process);
+                }
                 let _ = PostMessageW(Some(hwnd), REVEAL_WINDOW, WPARAM(0), LPARAM(0));
             }
             return Ok(());
@@ -715,13 +842,20 @@ pub fn run() -> Result<()> {
         app.dock_timer = DockTimer::new(hwnd).ok();
     });
     let _taskbar_events = TaskbarEvents::watch();
+    let _ = startup::migrate();
+    if !background {
+        command(hwnd, OPEN_MANAGER);
+    }
     let mut message = MSG::default();
     loop {
         match unsafe { GetMessageW(&mut message, None, 0, 0) }.0 {
             -1 => return Err(Error::from_thread()),
             0 => return Ok(()),
             _ => {
-                if editor::handle_dialog_message(&message) {
+                if editor::handle_dialog_message(&message)
+                    || history_window::handle_dialog_message(&message)
+                    || manager::handle_dialog_message(&message)
+                {
                     continue;
                 }
                 unsafe {
@@ -785,7 +919,7 @@ fn create_window(
         if RegisterClassExW(&class) == 0 {
             return Err(Error::from_thread());
         }
-        let (width, height) = Layout::Floating.size(settings.display);
+        let (width, height) = Layout::Floating.size(settings.display).pixels(96);
         // Windows can ignore a background process's request to promote an existing window.
         let mut ex_style = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
         if settings.taskbar || settings.topmost {
@@ -806,6 +940,70 @@ fn create_window(
             None,
         )
     }
+}
+
+fn register_class(
+    class: PCWSTR,
+    instance: HINSTANCE,
+    proc: WNDPROC,
+    icon: HICON,
+    background: isize,
+) -> Result<()> {
+    unsafe {
+        let definition = WNDCLASSW {
+            lpfnWndProc: proc,
+            hInstance: instance,
+            hIcon: icon,
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hbrBackground: HBRUSH(background as *mut _),
+            lpszClassName: class,
+            ..Default::default()
+        };
+        if RegisterClassW(&definition) == 0 {
+            let error = Error::from_thread();
+            if error.code() != ERROR_CLASS_ALREADY_EXISTS.to_hresult() {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn control(parent: HWND, class: PCWSTR, label: PCWSTR, style: u32, id: usize) -> Result<HWND> {
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            class,
+            label,
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(style),
+            0,
+            0,
+            0,
+            0,
+            Some(parent),
+            Some(HMENU(id as *mut _)),
+            None,
+            None,
+        )
+    }
+}
+
+fn position(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        );
+    }
+}
+
+fn send(hwnd: HWND, message: u32, wparam: usize, lparam: isize) -> isize {
+    unsafe { SendMessageW(hwnd, message, Some(WPARAM(wparam)), Some(LPARAM(lparam))).0 }
 }
 
 fn with_app<T>(run: impl FnOnce(&mut App) -> T) -> Option<T> {
@@ -856,15 +1054,15 @@ unsafe extern "system" fn window_proc(
                 center_starting_panel(hwnd, dpi, display.text_size);
                 return LRESULT(0);
             }
-            let (width, height) = layout.size(display);
+            let (width, height) = layout.size(display).pixels(dpi);
             let _ = unsafe {
                 SetWindowPos(
                     hwnd,
                     None,
                     suggested.left,
                     suggested.top,
-                    scale(width, dpi),
-                    scale(height, dpi),
+                    width,
+                    height,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 )
             };
@@ -927,6 +1125,7 @@ unsafe extern "system" fn window_proc(
                 invalidate(hwnd);
             }
             editor::refresh_preview();
+            manager::refresh_readings();
         }
         DOCK_READY => {
             let applied = with_app(|app| {
@@ -945,9 +1144,11 @@ unsafe extern "system" fn window_proc(
             }
         }
         UPDATE_READY => finish_update(hwnd),
+        HISTORY_STATUS => history_window::refresh_capture_status(),
         REVEAL_WINDOW => {
             with_app(|app| app.shown = true);
             apply_visibility(hwnd);
+            command(hwnd, OPEN_MANAGER);
         }
         WM_CLOSE => {
             let _ = unsafe { DestroyWindow(hwnd) };
@@ -960,6 +1161,7 @@ unsafe extern "system" fn window_proc(
             });
         }
         WM_DESTROY => {
+            manager::close();
             with_app(|app| {
                 app.dock_timer = None;
                 app.take_sample();
@@ -984,6 +1186,7 @@ unsafe extern "system" fn window_proc(
                 if ready.is_some() {
                     recheck_placement(hwnd);
                     apply_visibility(hwnd);
+                    manager::refresh_settings();
                 }
             } else {
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
@@ -1099,6 +1302,7 @@ fn apply_visibility(hwnd: HWND) {
     if shown {
         invalidate(hwnd);
     }
+    manager::refresh_status();
 }
 
 fn sync_panel_input(hwnd: HWND) {
@@ -1169,8 +1373,7 @@ fn place(
     display: DisplayOptions,
     snap: bool,
 ) -> Option<POINT> {
-    let (width, height) = Layout::Floating.size(display);
-    let (width, height) = (scale(width, dpi), scale(height, dpi));
+    let (width, height) = Layout::Floating.size(display).pixels(dpi);
     let reference = requested
         .map(|position| POINT {
             x: position.x.saturating_add(width / 2),
@@ -1361,7 +1564,9 @@ fn open_menu(hwnd: HWND, at: POINT) {
             let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
             result.0 as usize
         };
-        command(hwnd, selection);
+        if selection != 0 {
+            command(hwnd, selection);
+        }
     }
 }
 
@@ -1399,6 +1604,11 @@ fn make_menu(
 ) -> Result<Menu> {
     let language = settings.display.language;
     let menu = Menu::new()?;
+    menu.item(
+        OPEN_MANAGER,
+        language.choose(w!("打开管理窗口…"), w!("Open Manager…")),
+        MF_ENABLED,
+    )?;
     let visibility = if shown {
         language.choose(w!("隐藏监控"), w!("Hide Monitor"))
     } else {
@@ -1411,6 +1621,11 @@ fn make_menu(
         make_settings_menu(settings, placement, startup, update_busy)?,
     )?;
     menu.separator()?;
+    menu.item(
+        OPEN_HISTORY,
+        language.choose(w!("历史记录…"), w!("History…")),
+        MF_ENABLED,
+    )?;
     menu.item(
         RESET_TRAFFIC,
         language.choose(w!("清零总流量"), w!("Reset Total Traffic")),
@@ -1574,6 +1789,10 @@ fn metric_name(metric: Metric, language: Language) -> &'static str {
         Metric::AvailableMemory => language.choose("可用内存（GB）", "Available Memory (GB)"),
         Metric::AvailableMemoryPercent => language.choose("可用内存百分比", "Available Memory (%)"),
         Metric::UsedMemory => language.choose("已用内存（GB）", "Used Memory (GB)"),
+        Metric::DiskRead => language.choose("磁盘读取速度", "Disk Read Speed"),
+        Metric::DiskWrite => language.choose("磁盘写入速度", "Disk Write Speed"),
+        Metric::GpuMemoryPercent => language.choose("显存使用率", "VRAM Usage (%)"),
+        Metric::UsedGpuMemory => language.choose("已用显存（GB）", "Used VRAM (GB)"),
         Metric::CpuFrequency => language.choose("CPU 当前频率", "CPU Frequency"),
         Metric::Uptime => language.choose("运行时长", "Uptime"),
         Metric::Battery => language.choose("电池电量", "Battery Level"),
@@ -1623,6 +1842,7 @@ fn set_language(hwnd: HWND, preference: LanguagePreference) {
         set_thread_language(language);
         set_display(hwnd, display);
         editor::set_language(language);
+        history_window::set_language(language);
     }
 }
 
@@ -1634,7 +1854,7 @@ fn start_update(hwnd: HWND, action: updater::Action) {
         Ok::<_, std::io::Error>(())
     });
     if let Some(Err(error)) = result {
-        show_update_error(Some(hwnd), &error);
+        show_update_error(Some(manager::dialog_owner(hwnd)), &error);
     }
 }
 
@@ -1645,6 +1865,7 @@ fn finish_update(hwnd: HWND) {
         Some(event)
     })
     .flatten();
+    let owner = manager::dialog_owner(hwnd);
     match event {
         Some(updater::Event::Checked(Ok(Some(release)))) => {
             let version = release.version.to_string();
@@ -1656,7 +1877,7 @@ fn finish_update(hwnd: HWND) {
             });
             let answer = unsafe {
                 MessageBoxW(
-                    Some(hwnd),
+                    Some(owner),
                     &text,
                     app_title(),
                     MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
@@ -1675,19 +1896,20 @@ fn finish_update(hwnd: HWND) {
                     "."
                 ),
             ));
-            unsafe { MessageBoxW(Some(hwnd), &text, app_title(), MB_OK | MB_ICONINFORMATION) };
+            unsafe { MessageBoxW(Some(owner), &text, app_title(), MB_OK | MB_ICONINFORMATION) };
         }
         Some(updater::Event::Downloaded(Ok(update))) => match update.launch(ui_language()) {
             Ok(()) => {
                 let _ = unsafe { DestroyWindow(hwnd) };
             }
-            Err(error) => show_update_error(Some(hwnd), &error),
+            Err(error) => show_update_error(Some(owner), &error),
         },
         Some(updater::Event::Checked(Err(error)) | updater::Event::Downloaded(Err(error))) => {
-            show_update_error(Some(hwnd), &error);
+            show_update_error(Some(owner), &error);
         }
         None => {}
     }
+    manager::refresh_settings();
 }
 
 fn show_update_error(hwnd: Option<HWND>, error: &impl std::fmt::Display) {
@@ -1704,11 +1926,34 @@ fn show_warning(hwnd: Option<HWND>, heading: &str, error: &impl std::fmt::Displa
 }
 
 fn command(hwnd: HWND, selection: usize) {
+    let owner = manager::dialog_owner(hwnd);
     match selection {
-        ABOUT => {
-            if let Err(error) = about::open(hwnd) {
+        OPEN_MANAGER => {
+            if let Err(error) = manager::open(hwnd) {
                 show_warning(
                     Some(hwnd),
+                    ui_language().choose(
+                        "无法打开管理窗口。",
+                        "The manager window could not be opened.",
+                    ),
+                    &error,
+                );
+            }
+            return;
+        }
+        OPEN_HISTORY => {
+            if let Err(error) = history_window::open(hwnd, owner) {
+                show_warning(
+                    Some(owner),
+                    ui_language().choose("无法打开历史记录。", "History could not be opened."),
+                    &error,
+                );
+            }
+        }
+        ABOUT => {
+            if let Err(error) = about::open(owner) {
+                show_warning(
+                    Some(owner),
                     ui_language().choose(
                         "无法打开关于窗口。",
                         "The About dialog could not be opened.",
@@ -1719,9 +1964,9 @@ fn command(hwnd: HWND, selection: usize) {
         }
         CHECK_UPDATE => start_update(hwnd, updater::Action::Check),
         EDIT_METRICS => {
-            if let Err(error) = editor::open(hwnd) {
+            if let Err(error) = editor::open(hwnd, owner) {
                 show_warning(
-                    Some(hwnd),
+                    Some(owner),
                     ui_language().choose(
                         "无法打开监控项编辑器。",
                         "The metrics editor could not be opened.",
@@ -1734,7 +1979,7 @@ fn command(hwnd: HWND, selection: usize) {
             let language = ui_language();
             if let Err(error) = startup::toggle(language) {
                 show_warning(
-                    Some(hwnd),
+                    Some(owner),
                     language.choose(
                         "无法更改开机自启设置。",
                         "The run-at-sign-in setting could not be changed.",
@@ -1824,6 +2069,9 @@ fn command(hwnd: HWND, selection: usize) {
                 app.take_sample();
                 app.starting_traffic = 0;
                 app.traffic_at_reset = app.sample.traffic;
+                let _ = app
+                    .worker
+                    .send(WorkerCommand::ResetHistoryTraffic(app.traffic_at_reset));
                 app.update_display();
                 app.save();
             });
@@ -1832,6 +2080,7 @@ fn command(hwnd: HWND, selection: usize) {
         }
         EXIT => {
             let _ = unsafe { DestroyWindow(hwnd) };
+            return;
         }
         _ => {
             if let Some((_, interval)) =
@@ -1845,6 +2094,7 @@ fn command(hwnd: HWND, selection: usize) {
             }
         }
     }
+    manager::refresh_settings();
 }
 
 #[cfg(test)]
@@ -1960,11 +2210,13 @@ mod tests {
         )
         .unwrap();
         unsafe {
-            assert_eq!(GetMenuItemCount(Some(menu.0)), 6);
-            assert_eq!(GetMenuItemID(menu.0, 0), TOGGLE as u32);
-            assert_eq!(GetMenuItemID(menu.0, 4), ABOUT as u32);
-            assert_eq!(GetMenuItemID(menu.0, 5), EXIT as u32);
-            let settings = GetSubMenu(menu.0, 1);
+            assert_eq!(GetMenuItemCount(Some(menu.0)), 8);
+            assert_eq!(GetMenuItemID(menu.0, 0), OPEN_MANAGER as u32);
+            assert_eq!(GetMenuItemID(menu.0, 1), TOGGLE as u32);
+            assert_eq!(GetMenuItemID(menu.0, 4), OPEN_HISTORY as u32);
+            assert_eq!(GetMenuItemID(menu.0, 6), ABOUT as u32);
+            assert_eq!(GetMenuItemID(menu.0, 7), EXIT as u32);
+            let settings = GetSubMenu(menu.0, 2);
             assert!(!settings.is_invalid());
             let refresh = GetSubMenu(settings, 4);
             let theme = GetSubMenu(settings, 5);

@@ -13,6 +13,9 @@ pub struct Sample {
     pub cpu_mhz: Option<f64>,
     pub battery: Option<f64>,
     pub uptime: Option<Duration>,
+    pub disk_read: Option<f64>,
+    pub disk_write: Option<f64>,
+    pub gpu_memory: Option<GpuMemory>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -25,6 +28,12 @@ impl PhysicalMemory {
     fn percent(self, bytes: u64) -> f64 {
         100.0 * bytes as f64 / self.total as f64
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GpuMemory {
+    pub used: u64,
+    pub total: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,10 +50,14 @@ pub enum Metric {
     Battery,
     AvailableMemoryPercent,
     UsedMemory,
+    DiskRead,
+    DiskWrite,
+    GpuMemoryPercent,
+    UsedGpuMemory,
 }
 
 impl Metric {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 16] = [
         Self::Upload,
         Self::Download,
         Self::Cpu,
@@ -57,6 +70,10 @@ impl Metric {
         Self::Battery,
         Self::AvailableMemoryPercent,
         Self::UsedMemory,
+        Self::DiskRead,
+        Self::DiskWrite,
+        Self::GpuMemoryPercent,
+        Self::UsedGpuMemory,
     ];
 
     pub const fn index(self) -> usize {
@@ -77,6 +94,10 @@ impl Metric {
             Self::Uptime => "uptime",
             Self::AvailableMemoryPercent => "available_memory_percent",
             Self::UsedMemory => "used_memory",
+            Self::DiskRead => "disk_read",
+            Self::DiskWrite => "disk_write",
+            Self::GpuMemoryPercent => "gpu_memory_percent",
+            Self::UsedGpuMemory => "used_gpu_memory",
         }
     }
 }
@@ -351,6 +372,15 @@ pub fn readings(sample: Sample, total: u64, language: Language) -> [Reading; Met
             Reading::percent(memory.map(|memory| memory.percent(memory.available)))
         }
         Metric::UsedMemory => Reading::gigabytes(used),
+        Metric::DiskRead => Reading::rate(sample.disk_read),
+        Metric::DiskWrite => Reading::rate(sample.disk_write),
+        Metric::GpuMemoryPercent => Reading::percent(
+            sample
+                .gpu_memory
+                .filter(|memory| memory.total > 0)
+                .map(|memory| 100.0 * memory.used as f64 / memory.total as f64),
+        ),
+        Metric::UsedGpuMemory => Reading::gigabytes(sample.gpu_memory.map(|memory| memory.used)),
     })
 }
 
@@ -433,6 +463,12 @@ mod tests {
             cpu_mhz: Some(3424.0),
             battery: None,
             uptime: Some(Duration::from_secs(86_400 + 3_600)),
+            disk_read: Some(999_900.0),
+            disk_write: Some(745.0),
+            gpu_memory: Some(GpuMemory {
+                used: 3_456_000_000,
+                total: 8_000_000_000,
+            }),
         };
         let displayed = readings(sample, sample.traffic, Language::Chinese);
         let pairs = displayed
@@ -453,8 +489,31 @@ mod tests {
                 ("—", ""),
                 ("43", "%"),
                 ("11.47", "GB"),
+                ("1", "MB/s"),
+                ("745", "B/s"),
+                ("43", "%"),
+                ("3.46", "GB"),
             ]
         );
+    }
+
+    #[test]
+    fn optional_disk_and_gpu_metrics_preserve_old_settings() {
+        let saved = "cpu,disk,traffic";
+        let mut metrics = Metrics::parse(saved);
+        let values = readings(Sample::default(), 0, Language::English);
+        for metric in [
+            Metric::DiskRead,
+            Metric::DiskWrite,
+            Metric::GpuMemoryPercent,
+            Metric::UsedGpuMemory,
+        ] {
+            assert!(!Metrics::default().contains(metric));
+            assert!(!metrics.contains(metric));
+            assert_eq!(values[metric.index()], Reading::unavailable());
+            metrics.set_visible(metric, true);
+        }
+        assert_eq!(Metrics::parse(&metrics.to_config()), metrics);
     }
 
     #[test]

@@ -49,9 +49,7 @@ const ROW_BASELINE: f32 = 17.0;
 const UNIT_GAP: f32 = 4.0;
 const PERCENT_GAP: f32 = 2.5;
 const ARROW_WING: f32 = 3.7;
-const ARROW_GAP: f32 = 6.5;
-const MIN_ARROW_GAP: f32 = 3.0;
-const MIN_ARROW_INSET: f32 = 5.0;
+const ARROW_INSET: f32 = 2.5;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Layout {
@@ -60,23 +58,53 @@ pub enum Layout {
     Taskbar,
 }
 
-impl Layout {
-    pub fn size(self, display: DisplayOptions) -> (i32, i32) {
-        let (width, height) = self.base_size(display);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutSize {
+    width: i32,
+    height: i32,
+    gap_px: i32,
+    text_size: TextSize,
+}
+
+impl LayoutSize {
+    pub fn pixels(self, dpi: u32) -> (i32, i32) {
         (
-            display.text_size.scale(width),
-            display.text_size.scale(height),
+            (self.width as f32 * pixel_scale(self.text_size, dpi)).ceil() as i32 + self.gap_px,
+            super::scale(self.text_size.scale(self.height), dpi),
         )
     }
 
-    fn base_size(self, display: DisplayOptions) -> (i32, i32) {
-        let width = self
+    pub fn fitting_dpi(self, dpi: u32, available_px: i32) -> u32 {
+        let scalable_width = self.width as f32 * self.text_size.factor();
+        let fitting = ((available_px - self.gap_px) as f32 * 96.0 / scalable_width) as u32;
+        dpi.min(fitting.max(1))
+    }
+}
+
+fn pixel_scale(text_size: TextSize, dpi: u32) -> f32 {
+    text_size.factor() * dpi as f32 / 96.0
+}
+
+impl Layout {
+    pub fn size(self, display: DisplayOptions) -> LayoutSize {
+        let (empty_width, height) = match self {
+            Self::Floating => (132, 68),
+            Self::Taskbar => (112, 36),
+        };
+        let (width, gap_px) = self
             .columns(display)
             .last()
-            .map(|column| column.left + column.width);
-        match self {
-            Self::Floating => (width.unwrap_or(132), 68),
-            Self::Taskbar => (width.unwrap_or(112), 36),
+            .map_or((empty_width, 0), |column| {
+                (
+                    column.left + column.width,
+                    column.left_gap_px + column.gap_px,
+                )
+            });
+        LayoutSize {
+            width,
+            height,
+            gap_px,
+            text_size: display.text_size,
         }
     }
 
@@ -103,36 +131,63 @@ impl Layout {
         }
     }
 
-    fn content_width(self, metric: Metric, language: Language) -> i32 {
-        let (floating, taskbar) = match metric {
-            Metric::Upload | Metric::Download => (77, 71),
-            Metric::Battery if language == Language::English => (94, 90),
-            Metric::Cpu | Metric::Memory | Metric::Disk | Metric::Battery => (94, 76),
-            Metric::Traffic => (120, 116),
-            Metric::AvailableMemory | Metric::UsedMemory if language == Language::English => {
-                (154, 150)
-            }
-            Metric::AvailableMemory | Metric::UsedMemory => (139, 135),
-            Metric::AvailableMemoryPercent => (112, 106),
-            Metric::CpuFrequency => (126, 120),
-            Metric::Uptime => (142, 136),
+    fn field_widths(self, metric: Metric, language: Language) -> (i32, i32) {
+        let (chinese, english) = match metric {
+            Metric::Upload | Metric::Download => (10, 10),
+            Metric::Cpu | Metric::CpuFrequency => (28, 28),
+            Metric::Memory => (29, 33),
+            Metric::Disk => (29, 29),
+            Metric::Traffic => (57, 40),
+            Metric::AvailableMemory | Metric::AvailableMemoryPercent => (57, 63),
+            Metric::UsedMemory => (57, 68),
+            Metric::Uptime => (57, 48),
+            Metric::Battery => (29, 48),
+            Metric::DiskRead => (43, 64),
+            Metric::DiskWrite => (43, 67),
+            Metric::GpuMemoryPercent => (29, 41),
+            Metric::UsedGpuMemory => (57, 77),
         };
-        match self {
+        let (floating, taskbar) = match metric {
+            Metric::Upload | Metric::Download | Metric::DiskRead | Metric::DiskWrite => (59, 57),
+            Metric::Cpu
+            | Metric::Memory
+            | Metric::Disk
+            | Metric::Battery
+            | Metric::AvailableMemoryPercent
+            | Metric::GpuMemoryPercent => (37, 37),
+            Metric::Traffic => (51, 49),
+            Metric::AvailableMemory | Metric::UsedMemory => (87, 83),
+            Metric::CpuFrequency => (66, 64),
+            Metric::Uptime if language == Language::English => (62, 62),
+            Metric::Uptime => (73, 73),
+            Metric::UsedGpuMemory => (78, 75),
+        };
+        let value = match self {
             Self::Floating => floating,
             Self::Taskbar => taskbar,
-        }
+        };
+        (language.choose(chinese, english), value)
     }
 
     fn columns(self, display: DisplayOptions) -> impl Iterator<Item = Column> {
         let mut selected = display.metrics.iter();
         let mut left = 0;
         let padding = self.column_padding(display.density);
+        let gap_px = match display.density {
+            Density::Standard => 8,
+            Density::Compact => 6,
+            Density::Tight => 4,
+        };
+        let mut left_gap_px = 0;
         std::iter::from_fn(move || {
             let first = selected.next()?;
             let second = selected.next();
-            let content_width = self
-                .content_width(first, display.language)
-                .max(second.map_or(0, |metric| self.content_width(metric, display.language)));
+            let (first_label, first_value) = self.field_widths(first, display.language);
+            let (second_label, second_value) =
+                second.map_or((0, 0), |metric| self.field_widths(metric, display.language));
+            // Reserve both rows' widths so sample updates keep the same column positions.
+            let label_width = first_label.max(second_label);
+            let value_width = first_value.max(second_value);
             // At the outer edge, the network reading already leaves room for its arrow.
             let inset = if left == 0 && is_network_rate(first) && second.is_none_or(is_network_rate)
             {
@@ -140,21 +195,25 @@ impl Layout {
             } else {
                 padding
             };
-            let width = inset + content_width + padding;
+            let width = inset + label_width + value_width + padding;
             let column = Column {
                 left,
                 width,
                 first,
                 second,
                 inset,
-                content_width,
+                label_width,
+                left_gap_px,
+                gap_px,
+                value_width,
             };
             left += width;
+            left_gap_px += gap_px;
             Some(column)
         })
     }
 
-    fn slots(self, display: DisplayOptions) -> impl Iterator<Item = (Metric, Slot)> {
+    fn slots(self, display: DisplayOptions, scale: f32) -> impl Iterator<Item = (Metric, Slot)> {
         self.columns(display).flat_map(move |column| {
             let (top, bottom) = match self {
                 Self::Floating => (9.0, 35.0),
@@ -166,21 +225,27 @@ impl Layout {
                 (top + bottom) / 2.0
             };
             [
-                Some((column.first, column.slot(first_row))),
-                column.second.map(|metric| (metric, column.slot(bottom))),
+                Some((column.first, column.slot(first_row, scale))),
+                column
+                    .second
+                    .map(|metric| (metric, column.slot(bottom, scale))),
             ]
             .into_iter()
             .flatten()
         })
     }
 
-    fn dividers(self, display: DisplayOptions) -> impl Iterator<Item = (Vector2, Vector2)> {
+    fn dividers(
+        self,
+        display: DisplayOptions,
+        scale: f32,
+    ) -> impl Iterator<Item = (Vector2, Vector2)> {
         let (top, bottom) = match self {
             Self::Floating => (12.0, 56.0),
             Self::Taskbar => (5.0, 31.0),
         };
         self.columns(display).skip(1).map(move |column| {
-            let x = column.left as f32;
+            let x = column.left as f32 + column.left_gap_px as f32 / scale;
             (point(x, top), point(x, bottom))
         })
     }
@@ -192,17 +257,19 @@ struct Column {
     first: Metric,
     second: Option<Metric>,
     inset: i32,
-    content_width: i32,
+    label_width: i32,
+    left_gap_px: i32,
+    gap_px: i32,
+    value_width: i32,
 }
 
 impl Column {
-    fn slot(&self, row_y: f32) -> Slot {
-        let label_x = (self.left + self.inset) as f32;
-        let content_width = self.content_width as f32;
+    fn slot(&self, row_y: f32, scale: f32) -> Slot {
+        let label_x = (self.left + self.inset) as f32 + self.left_gap_px as f32 / scale;
         Slot {
             label_x,
-            content_width,
-            number_end: label_x + content_width,
+            value_x: label_x + self.label_width as f32 + self.gap_px as f32 / scale,
+            value_width: self.value_width as f32,
             row_y,
         }
     }
@@ -210,9 +277,19 @@ impl Column {
 
 struct Slot {
     label_x: f32,
-    content_width: f32,
-    number_end: f32,
+    value_x: f32,
+    value_width: f32,
     row_y: f32,
+}
+
+impl Slot {
+    fn value_right(&self) -> f32 {
+        self.value_x + self.value_width
+    }
+
+    fn arrow_x(&self) -> f32 {
+        self.label_x + ARROW_INSET + ARROW_WING
+    }
 }
 
 fn is_network_rate(metric: Metric) -> bool {
@@ -375,15 +452,14 @@ struct TextReading {
     displayed: Reading,
     number: IDWriteTextLayout,
     unit: IDWriteTextLayout,
+    value_right: f32,
     number_x: f32,
     unit_x: f32,
 }
 
-impl TextReading {
-    fn arrow_x(&self, label_x: f32) -> f32 {
-        let available_gap = self.number_x - label_x - MIN_ARROW_INSET - 2.0 * ARROW_WING;
-        self.number_x - ARROW_WING - available_gap.clamp(MIN_ARROW_GAP, ARROW_GAP)
-    }
+struct MetricLabel {
+    layout: IDWriteTextLayout,
+    ink_left: f32,
 }
 
 pub struct Panel {
@@ -398,7 +474,7 @@ pub struct Panel {
     display: DisplayOptions,
     label_language: Language,
     label_bold: bool,
-    labels: [Option<IDWriteTextLayout>; Metric::ALL.len()],
+    labels: [Option<MetricLabel>; Metric::ALL.len()],
     empty_label: IDWriteTextLayout,
     values: [Option<TextReading>; Metric::ALL.len()],
     target: Option<Target>,
@@ -500,7 +576,8 @@ impl Panel {
         appearance: Appearance,
         readings: &[Reading; Metric::ALL.len()],
     ) -> Result<()> {
-        self.update_text(readings)?;
+        let pixel_scale = pixel_scale(self.display.text_size, dpi);
+        self.update_text(readings, pixel_scale)?;
         let layered = matches!(appearance, Appearance::Transparent { .. });
         if !self
             .target
@@ -528,7 +605,8 @@ impl Panel {
         if !solid {
             divider.a = 0.24;
         }
-        let (width, height) = self.mode.base_size(self.display);
+        let size = self.mode.size(self.display);
+        let width = size.width as f32 + size.gap_px as f32 / pixel_scale;
         let factor = self.display.text_size.factor();
         let result = unsafe {
             let window = target.surface.render_target();
@@ -544,8 +622,8 @@ impl Panel {
                         rect: D2D_RECT_F {
                             left: 0.75,
                             top: 0.75,
-                            right: width as f32 - 0.75,
-                            bottom: height as f32 - 0.75,
+                            right: width - 0.75,
+                            bottom: size.height as f32 - 0.75,
                         },
                         radiusX: radius,
                         radiusY: radius,
@@ -556,13 +634,13 @@ impl Panel {
                 );
             }
             brush.SetColor(&divider);
-            for (start, end) in self.mode.dividers(self.display) {
+            for (start, end) in self.mode.dividers(self.display, pixel_scale) {
                 window.DrawLine(start, end, brush, 1.0, None);
             }
             if self.display.metrics.iter().next().is_none() {
                 brush.SetColor(&color(colors.label));
-                let x = (width as f32 - 112.0) / 2.0;
-                let y = (height as f32 - ROW_HEIGHT) / 2.0;
+                let x = (width - 112.0) / 2.0;
+                let y = (size.height as f32 - ROW_HEIGHT) / 2.0;
                 window.DrawTextLayout(
                     point(x, y),
                     &self.empty_label,
@@ -570,7 +648,7 @@ impl Panel {
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
             }
-            for (metric, slot) in self.mode.slots(self.display) {
+            for (metric, slot) in self.mode.slots(self.display, pixel_scale) {
                 let index = metric.index();
                 let text = self.values[index]
                     .as_ref()
@@ -578,8 +656,8 @@ impl Panel {
                 if let Some(label) = &self.labels[index] {
                     brush.SetColor(&color(colors.label));
                     window.DrawTextLayout(
-                        point(slot.label_x, slot.row_y),
-                        label,
+                        point(slot.label_x - label.ink_left, slot.row_y),
+                        &label.layout,
                         brush,
                         D2D1_DRAW_TEXT_OPTIONS_NONE,
                     );
@@ -590,13 +668,7 @@ impl Panel {
                     } else {
                         colors.download
                     }));
-                    draw_arrow(
-                        window,
-                        brush,
-                        text.arrow_x(slot.label_x),
-                        slot.row_y,
-                        upload,
-                    );
+                    draw_arrow(window, brush, slot.arrow_x(), slot.row_y, upload);
                 }
                 brush.SetColor(&color(colors.number));
                 window.DrawTextLayout(
@@ -625,13 +697,18 @@ impl Panel {
         result
     }
 
-    fn update_text(&mut self, readings: &[Reading; Metric::ALL.len()]) -> Result<()> {
-        for (metric, slot) in self.mode.slots(self.display) {
+    fn update_text(
+        &mut self,
+        readings: &[Reading; Metric::ALL.len()],
+        pixel_scale: f32,
+    ) -> Result<()> {
+        for (metric, slot) in self.mode.slots(self.display, pixel_scale) {
             let cached = &mut self.values[metric.index()];
             let reading = &readings[metric.index()];
+            let right = slot.value_right();
             if cached
                 .as_ref()
-                .is_some_and(|value| value.displayed == *reading)
+                .is_some_and(|value| value.displayed == *reading && value.value_right == right)
             {
                 continue;
             }
@@ -641,6 +718,7 @@ impl Panel {
                 | Metric::Disk
                 | Metric::Battery
                 | Metric::Uptime
+                | Metric::GpuMemoryPercent
                 | Metric::AvailableMemoryPercent => &self.percent_format,
                 _ if self.mode == Layout::Taskbar => &self.compact_format,
                 _ => &self.number_format,
@@ -649,7 +727,7 @@ impl Panel {
                 &self.fonts,
                 number_format,
                 &reading.number,
-                slot.content_width,
+                slot.value_width,
             )?;
             unsafe {
                 number.SetTypography(
@@ -661,20 +739,25 @@ impl Panel {
                 )?;
             }
             let unit = layout(&self.fonts, &self.unit_format, reading.unit, 43.0)?;
-            let number_width = text_width(&number)?;
-            let gap = match reading.unit {
+            let unit_gap = match reading.unit {
                 "" => 0.0,
                 "%" => PERCENT_GAP,
                 _ => UNIT_GAP,
             };
-            let unit_x = slot.number_end - text_width(&unit)?;
-            let number_x = unit_x - gap - number_width;
+            let (_, number_ink_right) = text_bounds(&number)?;
+            let (unit_ink_left, unit_ink_right) = if reading.unit.is_empty() {
+                (0.0, 0.0)
+            } else {
+                text_bounds(&unit)?
+            };
+            let reading_ink_right = number_ink_right + unit_gap + unit_ink_right - unit_ink_left;
             *cached = Some(TextReading {
                 displayed: reading.clone(),
                 number,
                 unit,
-                number_x,
-                unit_x,
+                value_right: right,
+                number_x: right - reading_ink_right,
+                unit_x: right - unit_ink_right,
             });
         }
         Ok(())
@@ -811,7 +894,7 @@ fn metric_labels(
     fonts: &IDWriteFactory,
     language: Language,
     bold: bool,
-) -> Result<[Option<IDWriteTextLayout>; Metric::ALL.len()]> {
+) -> Result<[Option<MetricLabel>; Metric::ALL.len()]> {
     let weight = if bold {
         DWRITE_FONT_WEIGHT_SEMI_BOLD
     } else {
@@ -831,11 +914,17 @@ fn metric_labels(
             }
             Metric::UsedMemory => language.choose("已用内存", "Used RAM"),
             Metric::Disk => language.choose("磁盘", "Disk"),
+            Metric::DiskRead => language.choose("磁盘读", "Disk Read"),
+            Metric::DiskWrite => language.choose("磁盘写", "Disk Write"),
+            Metric::GpuMemoryPercent => language.choose("显存", "VRAM"),
+            Metric::UsedGpuMemory => language.choose("已用显存", "Used VRAM"),
             Metric::Battery => language.choose("电量", "Battery"),
             Metric::Traffic => language.choose("累计流量", "Traffic"),
             _ => super::metric_name(metric, language),
         };
-        labels[metric.index()] = Some(layout(fonts, &format, label, 80.0)?);
+        let layout = layout(fonts, &format, label, 80.0)?;
+        let (ink_left, _) = text_bounds(&layout)?;
+        labels[metric.index()] = Some(MetricLabel { layout, ink_left });
     }
     Ok(labels)
 }
@@ -858,10 +947,17 @@ fn layout(
     unsafe { fonts.CreateTextLayout(&utf16, format, width, ROW_HEIGHT) }
 }
 
-fn text_width(text: &IDWriteTextLayout) -> Result<f32> {
-    let mut metrics = Default::default();
-    unsafe { text.GetMetrics(&mut metrics)? };
-    Ok(metrics.width)
+#[cfg(test)]
+fn text_right_edge(text: &IDWriteTextLayout) -> Result<f32> {
+    Ok(text_bounds(text)?.1)
+}
+
+fn text_bounds(text: &IDWriteTextLayout) -> Result<(f32, f32)> {
+    let overhang = unsafe { text.GetOverhangMetrics()? };
+    Ok((
+        -overhang.left,
+        unsafe { text.GetMaxWidth() } + overhang.right,
+    ))
 }
 
 fn draw_arrow(
@@ -901,6 +997,63 @@ mod tests {
     use super::*;
     use crate::model::{Metrics, PhysicalMemory, Sample, readings};
 
+    fn assert_row_alignment(panel: &Panel, metric: Metric, slot: &Slot, scale: f32) -> f32 {
+        let text = panel.values[metric.index()].as_ref().unwrap();
+        let right = if text.displayed.unit.is_empty() {
+            text.number_x + text_right_edge(&text.number).unwrap()
+        } else {
+            text.unit_x + text_right_edge(&text.unit).unwrap()
+        };
+        assert!((right - slot.value_right()).abs() < 0.01);
+        let label_end = match &panel.labels[metric.index()] {
+            Some(label) => slot.label_x - label.ink_left + text_right_edge(&label.layout).unwrap(),
+            None => slot.arrow_x() + ARROW_WING,
+        };
+        let gap = match panel.display.density {
+            Density::Standard => 8.0,
+            Density::Compact => 6.0,
+            Density::Tight => 4.0,
+        };
+        let (number_ink_left, _) = text_bounds(&text.number).unwrap();
+        assert!(
+            label_end + gap / scale <= text.number_x + number_ink_left + 0.01,
+            "{metric:?} overlaps the label gap"
+        );
+        right
+    }
+
+    #[test]
+    fn network_arrows_share_a_left_edge_for_different_rate_widths() {
+        let display = DisplayOptions {
+            metrics: Metrics::parse("upload,download"),
+            density: Density::Tight,
+            ..Default::default()
+        };
+        let sample = Sample {
+            upload: Some(20_000.0),
+            download: Some(999_000_000.0),
+            ..Default::default()
+        };
+        let values = readings(sample, 0, display.language);
+        let mut panel = Panel::new(display.language).unwrap();
+        for mode in [Layout::Floating, Layout::Taskbar] {
+            panel.set_layout(mode, display);
+            panel.update_text(&values, 1.0).unwrap();
+            let mut slots = mode.slots(display, 1.0);
+            let (upload, top) = slots.next().unwrap();
+            let (download, bottom) = slots.next().unwrap();
+            assert_eq!(top.arrow_x(), bottom.arrow_x());
+            assert_eq!(
+                assert_row_alignment(&panel, upload, &top, 1.0),
+                top.value_right()
+            );
+            assert_eq!(
+                assert_row_alignment(&panel, download, &bottom, 1.0),
+                bottom.value_right()
+            );
+        }
+    }
+
     #[test]
     fn label_weight_can_change_without_resizing_text() {
         let mut panel = Panel::new(Language::Chinese).unwrap();
@@ -909,8 +1062,8 @@ mod tests {
                 let mut weight = DWRITE_FONT_WEIGHT::default();
                 let mut size = 0.0;
                 unsafe {
-                    label.GetFontWeight(0, &mut weight, None).unwrap();
-                    label.GetFontSize(0, &mut size, None).unwrap();
+                    label.layout.GetFontWeight(0, &mut weight, None).unwrap();
+                    label.layout.GetFontSize(0, &mut size, None).unwrap();
                 }
                 assert_eq!(weight, expected);
                 assert_eq!(size, 14.0);
@@ -935,26 +1088,30 @@ mod tests {
                 available: 999_400_000_000,
             }),
             disk: Some(100.0),
-            cpu_mhz: Some(5670.0),
+            cpu_mhz: Some(10_000.0),
             uptime: Some(std::time::Duration::from_secs(999 * 86_400 + 23 * 3_600)),
             battery: Some(100.0),
             ..Default::default()
         };
         let selections = [
-            (Metrics::default(), [381, 328]),
+            (Metrics::default(), [357, 328]),
+            (
+                Metrics::parse("upload,download,cpu_frequency,memory,disk,traffic"),
+                [386, 355],
+            ),
             (
                 Metrics::parse(
                     "uptime,upload,available_memory,cpu_frequency,battery,download,traffic",
                 ),
-                [639, 567],
+                [646, 598],
             ),
             (
                 Metrics::parse("traffic,disk,upload,download,cpu_frequency,available_memory"),
-                [444, 400],
+                [453, 415],
             ),
             (
                 Metrics::parse("available_memory_percent,used_memory,available_memory"),
-                [350, 322],
+                [376, 348],
             ),
             (Metrics::parse(""), [132, 112]),
         ];
@@ -969,152 +1126,186 @@ mod tests {
                 };
                 panel.set_layout(mode, display);
                 panel
-                    .update_text(&readings(sample, 999_000_000, Language::Chinese))
+                    .update_text(&readings(sample, 999_000_000, Language::Chinese), 1.0)
                     .unwrap();
-                assert_eq!(mode.size(display).0, expected_width);
+                assert_eq!(mode.size(display).pixels(96).0, expected_width);
                 assert!(
-                    mode.slots(display)
+                    mode.slots(display, 1.0)
                         .map(|(metric, _)| metric)
                         .eq(metrics.iter())
                 );
-                for (metric, slot) in mode.slots(display) {
+                for (metric, slot) in mode.slots(display, 1.0) {
                     let text = panel.values[metric.index()].as_ref().unwrap();
                     let gap = if text.displayed.unit == "%" {
                         PERCENT_GAP
                     } else {
                         UNIT_GAP
                     };
-                    let number_width = text_width(&text.number).unwrap();
-                    let unit_width = text_width(&text.unit).unwrap();
-                    assert!((text.unit_x + unit_width - slot.number_end).abs() < 0.01);
-                    if text.displayed.unit.is_empty() {
-                        assert!((text.number_x + number_width - text.unit_x).abs() < 0.01);
-                    } else {
-                        assert!((text.number_x + number_width + gap - text.unit_x).abs() < 0.01);
+                    if !text.displayed.unit.is_empty() {
+                        let number_right = text.number_x + text_right_edge(&text.number).unwrap();
+                        let unit_left = text.unit_x + text_bounds(&text.unit).unwrap().0;
+                        assert!((unit_left - number_right - gap).abs() < 0.01);
                     }
-                    if let Some(label) = &panel.labels[metric.index()] {
-                        let label_gap = text.number_x - slot.label_x - text_width(label).unwrap();
-                        assert!(
-                            label_gap >= 3.0,
-                            "{mode:?} {metric:?} label gap: {label_gap}"
-                        );
-                    } else {
-                        let arrow_x = text.arrow_x(slot.label_x);
-                        let inset = arrow_x - ARROW_WING - slot.label_x;
-                        let gap = text.number_x - arrow_x - ARROW_WING;
-                        assert!(
-                            inset + 0.01 >= MIN_ARROW_INSET,
-                            "{mode:?} {metric:?} arrow inset: {inset}"
-                        );
-                        assert!(
-                            gap + 0.01 >= MIN_ARROW_GAP,
-                            "{mode:?} {metric:?} arrow gap: {gap}"
-                        );
-                    }
+                    assert_row_alignment(&panel, metric, &slot, 1.0);
                 }
             }
         }
     }
 
     #[test]
-    fn density_narrows_columns_and_repositions_unchanged_readings() {
+    fn density_preserves_pixel_gaps_at_different_dpis_and_text_sizes() {
         let mut panel = Panel::new(Language::Chinese).unwrap();
         let values = readings(Sample::default(), 16_000_000, Language::Chinese);
         for (mode, widths) in [
-            (Layout::Floating, [381, 351, 326]),
-            (Layout::Taskbar, [328, 303, 283]),
+            (Layout::Floating, [357, 321, 290]),
+            (Layout::Taskbar, [328, 297, 271]),
         ] {
-            let height = mode.size(DisplayOptions::default()).1;
-            for (density, width) in [Density::Standard, Density::Compact, Density::Tight]
-                .into_iter()
-                .zip(widths)
+            let height = mode.size(DisplayOptions::default()).pixels(96).1;
+            for ((density, gap), width) in [
+                (Density::Standard, 8),
+                (Density::Compact, 6),
+                (Density::Tight, 4),
+            ]
+            .into_iter()
+            .zip(widths)
             {
                 let display = DisplayOptions {
                     density,
                     ..Default::default()
                 };
-                assert_eq!(mode.size(display), (width, height));
-                panel.set_layout(mode, display);
-                panel.update_text(&values).unwrap();
-                for (metric, slot) in mode.slots(display) {
-                    let reading = panel.values[metric.index()].as_ref().unwrap();
-                    let right = reading.unit_x + text_width(&reading.unit).unwrap();
-                    assert!((right - slot.number_end).abs() < 0.01);
+                assert_eq!(mode.size(display).pixels(96), (width, height));
+                for (dpi, text_size) in [(96, 16), (168, 15), (192, 24), (120, 10)] {
+                    let display = DisplayOptions {
+                        text_size: TextSize::new(text_size).unwrap(),
+                        ..display
+                    };
+                    let scale = pixel_scale(display.text_size, dpi);
+                    let size = mode.size(display);
+                    let width = size.pixels(dpi).0;
+                    let available = width * 3 / 4;
+                    let preview_dpi = size.fitting_dpi(dpi, available);
+                    assert!(size.pixels(preview_dpi).0 <= available);
+                    for column in mode.columns(display) {
+                        let slot = column.slot(0.0, scale);
+                        let gap_px =
+                            (slot.value_x - slot.label_x - column.label_width as f32) * scale;
+                        assert!((gap_px - gap as f32).abs() < 0.01);
+                    }
+                    panel.set_layout(mode, display);
+                    panel.update_text(&values, scale).unwrap();
+                    for (metric, slot) in mode.slots(display, scale) {
+                        assert_row_alignment(&panel, metric, &slot, scale);
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn english_labels_fit_beside_full_width_readings() {
+    fn individual_metrics_fit_in_both_languages() {
         let sample = Sample {
+            upload: Some(999_000_000.0),
+            download: Some(999_000_000.0),
             cpu: Some(100.0),
             memory: Some(PhysicalMemory {
-                total: 2_000_000_000_000,
-                available: 999_400_000_000,
+                total: 64_000_000_000_000,
+                available: 32_000_000_000_000,
             }),
             disk: Some(100.0),
-            cpu_mhz: Some(5670.0),
+            cpu_mhz: Some(10_000.0),
             uptime: Some(std::time::Duration::from_secs(999 * 86_400 + 23 * 3_600)),
             battery: Some(100.0),
+            disk_read: Some(999_000_000.0),
+            disk_write: Some(999_000_000.0),
+            gpu_memory: Some(crate::model::GpuMemory {
+                used: 1_000_000_000_000,
+                total: 1_000_000_000_000,
+            }),
             ..Default::default()
         };
-        let display = DisplayOptions {
-            language: Language::English,
-            metrics: Metrics::parse(
-                "cpu,memory,disk,battery,cpu_frequency,traffic,uptime,used_memory,available_memory,available_memory_percent",
-            ),
-            ..Default::default()
-        };
-        let mut panel = Panel::new(display.language).unwrap();
-        let values = readings(sample, 999_000_000, display.language);
-        for mode in [Layout::Floating, Layout::Taskbar] {
-            panel.set_layout(mode, display);
-            panel.update_text(&values).unwrap();
-            for (metric, slot) in mode.slots(display) {
-                let reading = panel.values[metric.index()].as_ref().unwrap();
-                let label = panel.labels[metric.index()].as_ref().unwrap();
-                let gap = reading.number_x - slot.label_x - text_width(label).unwrap();
-                assert!(gap >= 3.0, "{mode:?} {metric:?} label gap: {gap}");
+        for language in [Language::Chinese, Language::English] {
+            let mut panel = Panel::new(language).unwrap();
+            let mut values = readings(sample, 999_000_000, language);
+            for metric in [Metric::Memory, Metric::AvailableMemoryPercent] {
+                values[metric.index()].number = "100".into();
+            }
+            for mode in [Layout::Floating, Layout::Taskbar] {
+                for metric in Metric::ALL {
+                    let display = DisplayOptions {
+                        language,
+                        metrics: Metrics::parse(metric.key()),
+                        ..Default::default()
+                    };
+                    panel.set_layout(mode, display);
+                    panel.update_text(&values, 1.0).unwrap();
+                    let (_, slot) = mode.slots(display, 1.0).next().unwrap();
+                    assert_row_alignment(&panel, metric, &slot, 1.0);
+                }
             }
         }
     }
 
     #[test]
-    fn taskbar_traffic_gap_is_close_to_the_middle_column() {
-        let mode = Layout::Taskbar;
-        let display = DisplayOptions::default();
+    fn readings_stay_against_column_edges_when_digits_and_units_change() {
         let mut panel = Panel::new(Language::Chinese).unwrap();
-        panel.set_layout(mode, display);
-        let sample = Sample {
-            cpu: Some(9.0),
-            memory: Some(PhysicalMemory {
-                total: 100,
-                available: 45,
-            }),
-            disk: Some(3.0),
-            ..Default::default()
-        };
-        panel
-            .update_text(&readings(sample, 16_000_000, Language::Chinese))
-            .unwrap();
-
-        let label_gap = |metric: Metric| {
-            let (_, slot) = mode
-                .slots(display)
-                .find(|(item, _)| *item == metric)
-                .unwrap();
-            let label = panel.labels[metric.index()].as_ref().unwrap();
-            let value = panel.values[metric.index()].as_ref().unwrap();
-            value.number_x - slot.label_x - text_width(label).unwrap()
-        };
-        let traffic_gap = label_gap(Metric::Traffic);
-        let memory_gap = label_gap(Metric::Memory);
-        let cpu_gap = label_gap(Metric::Cpu);
-        assert!(
-            (memory_gap..=cpu_gap).contains(&traffic_gap),
-            "traffic gap {traffic_gap} is outside the middle-column range {memory_gap} to {cpu_gap}"
-        );
+        for mode in [Layout::Floating, Layout::Taskbar] {
+            for density in [Density::Standard, Density::Compact, Density::Tight] {
+                let display = DisplayOptions {
+                    density,
+                    ..Default::default()
+                };
+                panel.set_layout(mode, display);
+                let padding = mode.column_padding(density) as f32;
+                let columns: Vec<_> = mode.columns(display).collect();
+                let slots: Vec<_> = mode.slots(display, 1.0).collect();
+                for (cpu, disk, upload, total) in [
+                    (9.0, 1.0, 322_000.0, 8_000_000_000),
+                    (100.0, 100.0, 999_000_000.0, 125_000_000_000),
+                    (4.0, 0.0, 22.0, 975_000_000),
+                ] {
+                    let sample = Sample {
+                        cpu: Some(cpu),
+                        disk: Some(disk),
+                        upload: Some(upload),
+                        memory: Some(PhysicalMemory {
+                            total: 100,
+                            available: 38,
+                        }),
+                        ..Default::default()
+                    };
+                    panel
+                        .update_text(&readings(sample, total, display.language), 1.0)
+                        .unwrap();
+                    for (index, rows) in slots.chunks_exact(2).enumerate() {
+                        let [(first, top), (second, bottom)] = rows else {
+                            unreachable!();
+                        };
+                        let top_right = assert_row_alignment(&panel, *first, top, 1.0);
+                        let bottom_right = assert_row_alignment(&panel, *second, bottom, 1.0);
+                        let column = &columns[index];
+                        let column_end =
+                            (column.left + column.width + column.left_gap_px + column.gap_px)
+                                as f32;
+                        assert!((column_end - top_right - padding).abs() < 0.01);
+                        assert!((column_end - bottom_right - padding).abs() < 0.01);
+                        if (*first, *second) == (Metric::Cpu, Metric::Memory) {
+                            let digit_right = |metric: Metric| {
+                                let text = panel.values[metric.index()].as_ref().unwrap();
+                                text.number_x + text_right_edge(&text.number).unwrap()
+                            };
+                            assert!((digit_right(*first) - digit_right(*second)).abs() < 0.01);
+                        }
+                        if index != 0 {
+                            assert_eq!(
+                                top.label_x,
+                                (column.left + column.left_gap_px) as f32 + padding
+                            );
+                            assert_eq!(bottom.label_x, top.label_x);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1153,15 +1344,16 @@ mod tests {
         let sample = Sample {
             upload: Some(409_000.0),
             download: Some(26_000.0),
-            cpu: Some(9.0),
+            cpu: Some(1.0),
             memory: Some(PhysicalMemory {
                 total: 100,
-                available: 44,
+                available: 38,
             }),
             disk: Some(1.0),
+            cpu_mhz: Some(4_230.0),
             ..Default::default()
         };
-        let readings = readings(sample, 145_060_000, Language::Chinese);
+        let readings = readings(sample, 8_000_000_000, Language::Chinese);
         let custom = DisplayOptions {
             language: Language::Chinese,
             metrics: Metrics::parse(
@@ -1174,21 +1366,31 @@ mod tests {
             text_size: TextSize::new(TextSize::MIN).unwrap(),
             ..custom
         };
+        let taskbar = DisplayOptions {
+            density: Density::Tight,
+            text_size: TextSize::new(15).unwrap(),
+            ..Default::default()
+        };
+        let taskbar_compact = DisplayOptions {
+            density: Density::Compact,
+            ..taskbar
+        };
         for (mode, display) in [
             (Layout::Floating, custom),
             (Layout::Taskbar, compact),
             (Layout::Taskbar, DisplayOptions::default()),
+            (Layout::Taskbar, taskbar_compact),
+            (Layout::Taskbar, taskbar),
         ] {
-            let (width, height) = mode.size(display);
-            let scale = super::super::scale;
+            let (width, height) = mode.size(display).pixels(dpi);
             unsafe {
                 SetWindowPos(
                     hwnd,
                     None,
                     0,
                     0,
-                    scale(width, dpi),
-                    scale(height, dpi),
+                    width,
+                    height,
                     SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER,
                 )
             }
@@ -1233,12 +1435,78 @@ mod tests {
                 assert_eq!(pixels[pixels.len() - bitmap.size.cx as usize], 0);
                 assert_eq!(pixels[pixels.len() - 1], 0);
                 assert!(pixels.contains(&if dark { 0xffffffff } else { 0xff000000 }));
-                let (start, end) = mode.dividers(display).next().unwrap();
-                let pixel_scale = dpi as f32 / 96.0 * display.text_size.factor();
+                let pixel_scale = pixel_scale(display.text_size, dpi);
+                let (start, end) = mode.dividers(display, pixel_scale).next().unwrap();
                 let x = (start.X * pixel_scale) as usize;
                 let y = ((start.Y + end.Y) * 0.5 * pixel_scale) as usize;
                 let divider_alpha = pixels[y * bitmap.size.cx as usize + x] >> 24;
                 assert!((2..=127).contains(&divider_alpha));
+                if display == taskbar || display == taskbar_compact {
+                    let pitch = bitmap.size.cx as usize;
+                    let (top_row, bottom_row) =
+                        pixels.split_at(pitch * (bitmap.size.cy as usize / 2));
+                    let visible_right = |row: &[u32], left: usize, right: usize| {
+                        row.chunks_exact(pitch)
+                            .filter_map(|line| {
+                                line[left..right]
+                                    .iter()
+                                    .rposition(|pixel| pixel >> 24 >= 128)
+                            })
+                            .max()
+                            .unwrap()
+                            + left
+                    };
+                    let top_right = visible_right(top_row, 0, pitch);
+                    let bottom_right = visible_right(bottom_row, 0, pitch);
+                    assert!(
+                        top_right.abs_diff(bottom_right) <= 1,
+                        "1% ends at {top_right}px, 8 GB ends at {bottom_right}px"
+                    );
+                    let (_, cpu_slot) = mode
+                        .slots(display, pixel_scale)
+                        .find(|(m, _)| *m == Metric::Cpu)
+                        .unwrap();
+                    let cpu = panel.values[Metric::Cpu.index()].as_ref().unwrap();
+                    let number_right = cpu.number_x + text_right_edge(&cpu.number).unwrap();
+                    let left = (cpu_slot.label_x * pixel_scale) as usize;
+                    let split = ((number_right + PERCENT_GAP / 2.0) * pixel_scale) as usize;
+                    let limit = (cpu_slot.value_right() * pixel_scale).ceil() as usize;
+                    let top_digits = visible_right(top_row, left, split);
+                    let bottom_digits = visible_right(bottom_row, left, split);
+                    assert!(
+                        top_digits.abs_diff(bottom_digits) <= 1,
+                        "CPU digits end at {top_digits}px, RAM digits end at {bottom_digits}px"
+                    );
+                    assert_eq!(
+                        visible_right(top_row, split, limit),
+                        visible_right(bottom_row, split, limit),
+                        "CPU and RAM percent signs must have the same right edge"
+                    );
+                    let padding = mode.column_padding(display.density) as f32 * pixel_scale;
+                    for (start, _) in mode.dividers(display, pixel_scale) {
+                        let divider_x = start.X * pixel_scale;
+                        let left = divider_x.ceil() as usize;
+                        for row in [top_row, bottom_row] {
+                            let reading_end = visible_right(row, 0, divider_x.floor() as usize);
+                            assert!(
+                                (divider_x - reading_end as f32 - padding).abs() <= 2.0,
+                                "reading ends at {reading_end}px, right divider at {divider_x}px"
+                            );
+                            let label_start = row
+                                .chunks_exact(pitch)
+                                .filter_map(|line| {
+                                    line[left..].iter().position(|pixel| pixel >> 24 >= 128)
+                                })
+                                .min()
+                                .unwrap()
+                                + left;
+                            assert!(
+                                (label_start as f32 - divider_x - padding).abs() <= 2.0,
+                                "label starts at {label_start}px, divider at {divider_x}px"
+                            );
+                        }
+                    }
+                }
             }
         }
     }

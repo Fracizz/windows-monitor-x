@@ -10,15 +10,16 @@ Keep live network speeds, CPU and memory use, disk activity, and traffic totals 
 
 ## Quick start
 
-1. Download and run `windows-monitor-x.exe`. It runs as your Windows user on 64-bit Windows 10 version 1703 and later, and Windows 11.
-2. Drag the panel from the lower-right corner of the primary display's work area to move it. It snaps to nearby screen edges. Click the tray icon to show or hide it.
-3. Right-click the panel or tray icon and open **Edit Metrics**. Choose metrics, drag to reorder them, and click **Apply** when the preview matches what you want.
+1. Download and run `windows-monitor-x.exe` on 64-bit Windows 10 version 1703 or later, or Windows 11. The app runs as your Windows user and opens a separate manager window for live readings and settings.
+2. Closing the manager keeps monitoring active. To reopen it, run the executable again or choose **Open Manager** from the tray or panel context menu. Drag the floating panel to move it and snap it to screen edges. Click the tray icon to show or hide it.
+3. In the manager, click **Edit Metrics**. Choose metrics, drag to reorder them, and click **Apply** when you are happy with the preview.
 
 ## Usage
 
 - **Floating or taskbar layout.** Enable **Embed in Taskbar** and choose **Left** or **Right** in **Settings → Taskbar Position**. Right is the default and uses the space between the app buttons and the notification area. The panel floats when the selected position has too little space, or when the taskbar auto-hides or is vertical.
 - **Appearance.** In **Edit Metrics**, preview both layouts, choose a density, and set the display size from 10 to 24 px (16 px by default, scaled by Windows DPI). Both layouts share these settings. Turn **Bold Labels** off for regular-weight labels, or select the **Transparent** theme to let the taskbar's light or dark setting determine text and divider colours.
-- **Refresh and sign-in.** The default refresh interval is one second. You can choose two, three, or five seconds, set the panel to stay on top, or enable **Run at Sign-in** for your Windows user. Update the startup path through the same menu if you move the executable. Use the context menu to reset total traffic or exit.
+- **Refresh and sign-in.** The default refresh interval is one second. You can choose two, three, or five seconds, set the panel to stay on top, or enable **Run at Sign-in** to start monitoring when your Windows user signs in. Update the startup path through the same setting if you move the executable. Use the manager to reset total traffic or exit the app.
+- **History.** Open **History** from the manager or context menu and turn on **Record history** to start collecting samples. Recording is off by default and uses the current refresh interval. Choose a start and end in local time and click **Query**, or click **Now** to query through the current time. Switch metrics to view charts, sample counts, minimums, averages, and peaks. Data from the last seven days remains available after pausing recording or restarting the app.
 - **Language.** Choose English, Simplified Chinese, or **Use System Language** in **Settings → Language** (设置 → 语言). The default follows Windows. Changes take effect immediately and are saved.
 - **Version and updates.** Use **About** to see the version or visit GitHub. **Settings → Check for Updates** verifies the SHA-256 of the release download before replacing the executable and restarting. The executable's directory must be writable.
 
@@ -35,7 +36,8 @@ Keep live network speeds, CPU and memory use, disk activity, and traffic totals 
 ## Metrics
 
 - By default, the panel displays upload and download speeds, CPU and memory usage, disk activity, and total network traffic. You can also enable available memory as a percentage, available and used memory in GB, current CPU frequency, system uptime, and battery level. Disk activity is the percentage of time the busiest physical disk is active. A dash indicates that a battery reading or other sample is unavailable.
-- Percentages and transfer rates are displayed as integers. Physical memory in GB (1 GB = 1 billion bytes) and current CPU frequency in GHz are displayed with two decimal places. The panel labels both CPU usage and frequency as `CPU`, with `%` for usage and `GHz` for frequency. Both layouts use the same metrics, order, and display size, with items arranged from top to bottom in each column.
+- **Disk Read Speed** and **Disk Write Speed** show the combined throughput of all physical disks. **VRAM Usage (%)** and **Used VRAM (GB)** show dedicated memory usage across graphics adapters with valid readings. Enable each of these optional metrics in **Edit Metrics**.
+- Percentages and transfer rates are displayed as integers. Physical memory and VRAM in GB (1 GB = 1 billion bytes) and current CPU frequency in GHz are displayed with two decimal places. The panel labels both CPU usage and frequency as `CPU`, with `%` for usage and `GHz` for frequency. Both layouts use the same metrics, order, and display size, with items arranged from top to bottom in each column.
 - Network speeds aggregate traffic from active physical Ethernet and Wi-Fi adapters, including local network traffic. Total traffic counts bytes uploaded and downloaded while the app is running and is saved in `%LOCALAPPDATA%\WindowsMonitor\state.ini`.
 
 ## Packaging
