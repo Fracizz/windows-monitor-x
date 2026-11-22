@@ -17,6 +17,8 @@ const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
 const VALUE_NAME: PCWSTR = w!("WindowsMonitor");
 const RUN_COMMAND_LIMIT: usize = 260;
 
+use crate::language::Language;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Status {
     Disabled,
@@ -28,8 +30,8 @@ pub fn status() -> io::Result<Status> {
     status_at(RUN_KEY, &quoted_path(&env::current_exe()?))
 }
 
-pub fn toggle() -> io::Result<()> {
-    toggle_at(RUN_KEY, &quoted_path(&env::current_exe()?))
+pub fn toggle(language: Language) -> io::Result<()> {
+    toggle_at(RUN_KEY, &quoted_path(&env::current_exe()?), language)
 }
 
 fn quoted_path(path: &Path) -> Vec<u16> {
@@ -68,7 +70,7 @@ fn status_at(key: PCWSTR, command: &[u16]) -> io::Result<Status> {
     }
 }
 
-fn toggle_at(key: PCWSTR, command: &[u16]) -> io::Result<()> {
+fn toggle_at(key: PCWSTR, command: &[u16], language: Language) -> io::Result<()> {
     let result = if status_at(key, command)? == Status::Enabled {
         let result = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key, VALUE_NAME) };
         if result == ERROR_FILE_NOT_FOUND {
@@ -79,7 +81,10 @@ fn toggle_at(key: PCWSTR, command: &[u16]) -> io::Result<()> {
         if command.len() > RUN_COMMAND_LIMIT + 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "程序路径过长。请将程序移到较短的路径，再启用自启。",
+                language.choose(
+                    "程序路径过长。请将程序移到较短的路径，再启用自启。",
+                    "The app path is too long. Move the app to a shorter path before enabling run at sign-in.",
+                ),
             ));
         }
         unsafe {
@@ -127,12 +132,12 @@ mod tests {
 
         let moved_command = quoted_path(Path::new(r"D:\新目录\windows-monitor.exe"));
         assert_eq!(status_at(key, &command).unwrap(), Status::Disabled);
-        toggle_at(key, &command).unwrap();
+        toggle_at(key, &command, Language::English).unwrap();
         assert_eq!(status_at(key, &command).unwrap(), Status::Enabled);
         assert_eq!(status_at(key, &moved_command).unwrap(), Status::OtherPath);
-        toggle_at(key, &moved_command).unwrap();
+        toggle_at(key, &moved_command, Language::English).unwrap();
         assert_eq!(status_at(key, &moved_command).unwrap(), Status::Enabled);
-        toggle_at(key, &moved_command).unwrap();
+        toggle_at(key, &moved_command, Language::English).unwrap();
         assert_eq!(status_at(key, &moved_command).unwrap(), Status::Disabled);
     }
 }

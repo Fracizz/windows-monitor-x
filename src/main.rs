@@ -1,6 +1,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(any(windows, test))]
+mod language;
+#[cfg(any(windows, test))]
 mod model;
 #[cfg(windows)]
 mod windows;

@@ -39,7 +39,10 @@ use ::windows::{
 use windows_numerics::{Matrix3x2, Vector2};
 
 use super::state::{Density, DisplayOptions, TextSize};
-use crate::model::{Metric, Reading};
+use crate::{
+    language::Language,
+    model::{Metric, Reading},
+};
 
 const ROW_HEIGHT: f32 = 24.0;
 const ROW_BASELINE: f32 = 17.0;
@@ -100,13 +103,18 @@ impl Layout {
         }
     }
 
-    fn content_width(self, metric: Metric) -> i32 {
+    fn content_width(self, metric: Metric, language: Language) -> i32 {
         let (floating, taskbar) = match metric {
             Metric::Upload | Metric::Download => (77, 71),
+            Metric::Battery if language == Language::English => (94, 90),
             Metric::Cpu | Metric::Memory | Metric::Disk | Metric::Battery => (94, 76),
             Metric::Traffic => (120, 116),
+            Metric::AvailableMemory | Metric::UsedMemory if language == Language::English => {
+                (154, 150)
+            }
             Metric::AvailableMemory | Metric::UsedMemory => (139, 135),
             Metric::AvailableMemoryPercent => (112, 106),
+            Metric::CpuFrequency if language == Language::English => (132, 126),
             Metric::CpuFrequency => (126, 120),
             Metric::Uptime => (142, 136),
         };
@@ -124,8 +132,8 @@ impl Layout {
             let first = selected.next()?;
             let second = selected.next();
             let content_width = self
-                .content_width(first)
-                .max(second.map_or(0, |metric| self.content_width(metric)));
+                .content_width(first, display.language)
+                .max(second.map_or(0, |metric| self.content_width(metric, display.language)));
             // At the outer edge, the network reading already leaves room for its arrow.
             let inset = if left == 0 && is_network_rate(first) && second.is_none_or(is_network_rate)
             {
@@ -389,6 +397,7 @@ pub struct Panel {
     tabular: IDWriteTypography,
     mode: Layout,
     display: DisplayOptions,
+    label_language: Language,
     label_bold: bool,
     labels: [Option<IDWriteTextLayout>; Metric::ALL.len()],
     empty_label: IDWriteTextLayout,
@@ -397,18 +406,19 @@ pub struct Panel {
 }
 
 impl Panel {
-    pub fn new() -> Result<Self> {
+    pub fn new(language: Language) -> Result<Self> {
         let factory = unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
         let fonts = unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED)? };
-        let labels = metric_labels(&fonts, true)?;
+        let labels = metric_labels(&fonts, language, true)?;
         let number_format = text_format(
             &fonts,
             TextSize::DEFAULT as f32,
             DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            language,
         )?;
-        let compact_format = text_format(&fonts, 15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
-        let percent_format = text_format(&fonts, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
-        let unit_format = text_format(&fonts, 11.5, DWRITE_FONT_WEIGHT_NORMAL)?;
+        let compact_format = text_format(&fonts, 15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, language)?;
+        let percent_format = text_format(&fonts, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, language)?;
+        let unit_format = text_format(&fonts, 11.5, DWRITE_FONT_WEIGHT_NORMAL, language)?;
         let tabular = unsafe {
             let typography = fonts.CreateTypography()?;
             typography.AddFontFeature(DWRITE_FONT_FEATURE {
@@ -417,9 +427,7 @@ impl Panel {
             })?;
             typography
         };
-        let empty_format = text_format(&fonts, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?;
-        let empty_label = layout(&fonts, &empty_format, "未选择监控项", 112.0)?;
-        unsafe { empty_label.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)? };
+        let empty_label = empty_label(&fonts, language)?;
         Ok(Self {
             factory,
             fonts,
@@ -430,6 +438,7 @@ impl Panel {
             tabular,
             mode: Layout::Floating,
             display: DisplayOptions::default(),
+            label_language: language,
             label_bold: true,
             labels,
             empty_label,
@@ -438,9 +447,14 @@ impl Panel {
         })
     }
 
-    pub fn set_label_bold(&mut self, bold: bool) -> Result<()> {
-        if self.label_bold != bold {
-            self.labels = metric_labels(&self.fonts, bold)?;
+    pub fn set_label_style(&mut self, language: Language, bold: bool) -> Result<()> {
+        if self.label_language != language || self.label_bold != bold {
+            let labels = metric_labels(&self.fonts, language, bold)?;
+            if self.label_language != language {
+                self.empty_label = empty_label(&self.fonts, language)?;
+            }
+            self.labels = labels;
+            self.label_language = language;
             self.label_bold = bold;
         }
         Ok(())
@@ -450,6 +464,7 @@ impl Panel {
         if self.mode != mode
             || self.display.metrics != display.metrics
             || self.display.density != display.density
+            || self.display.language != display.language
         {
             self.values = [const { None }; Metric::ALL.len()];
         }
@@ -713,14 +728,14 @@ impl Panel {
 }
 
 // The first frame uses GDI before DirectWrite and the system counters are ready.
-pub fn paint_starting(hwnd: HWND, dc: HDC, dpi: u32, dark: bool, text_size: TextSize) {
+pub fn paint_starting(hwnd: HWND, dc: HDC, dpi: u32, dark: bool, display: DisplayOptions) {
     let mut rect = RECT::default();
     if unsafe { GetClientRect(hwnd, &mut rect) }.is_err() {
         return;
     }
     let colors = if dark { DARK } else { LIGHT };
     let mut font = LOGFONTW {
-        lfHeight: -super::scale(text_size.scale(14), dpi),
+        lfHeight: -super::scale(display.text_size.scale(14), dpi),
         lfWeight: 400,
         lfCharSet: DEFAULT_CHARSET,
         ..Default::default()
@@ -728,7 +743,11 @@ pub fn paint_starting(hwnd: HWND, dc: HDC, dpi: u32, dark: bool, text_size: Text
     for (dst, src) in font.lfFaceName.iter_mut().zip("Segoe UI".encode_utf16()) {
         *dst = src;
     }
-    let mut text: Vec<_> = "正在读取系统指标…".encode_utf16().collect();
+    let mut text: Vec<_> = display
+        .language
+        .choose("正在读取系统指标…", "Reading system metrics…")
+        .encode_utf16()
+        .collect();
     unsafe {
         let background = CreateSolidBrush(gdi_color(colors.surface));
         if !background.is_invalid() {
@@ -771,6 +790,7 @@ fn text_format(
     fonts: &IDWriteFactory,
     size: f32,
     weight: DWRITE_FONT_WEIGHT,
+    language: Language,
 ) -> Result<IDWriteTextFormat> {
     unsafe {
         let format = fonts.CreateTextFormat(
@@ -780,7 +800,7 @@ fn text_format(
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
             size,
-            w!("zh-CN"),
+            language.choose(w!("zh-CN"), w!("en-US")),
         )?;
         format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
         format.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, ROW_HEIGHT, ROW_BASELINE)?;
@@ -790,6 +810,7 @@ fn text_format(
 
 fn metric_labels(
     fonts: &IDWriteFactory,
+    language: Language,
     bold: bool,
 ) -> Result<[Option<IDWriteTextLayout>; Metric::ALL.len()]> {
     let weight = if bold {
@@ -797,7 +818,7 @@ fn metric_labels(
     } else {
         DWRITE_FONT_WEIGHT_NORMAL
     };
-    let format = text_format(fonts, 14.0, weight)?;
+    let format = text_format(fonts, 14.0, weight, language)?;
     let mut labels = [const { None }; Metric::ALL.len()];
     for metric in Metric::ALL
         .into_iter()
@@ -805,17 +826,28 @@ fn metric_labels(
     {
         let label = match metric {
             Metric::Cpu => "CPU",
-            Metric::Memory => "内存",
-            Metric::AvailableMemory | Metric::AvailableMemoryPercent => "可用内存",
-            Metric::UsedMemory => "已用内存",
-            Metric::Disk => "磁盘",
-            Metric::CpuFrequency => "CPU 频率",
-            Metric::Battery => "电量",
-            _ => super::metric_name(metric),
+            Metric::Memory => language.choose("内存", "RAM"),
+            Metric::AvailableMemory | Metric::AvailableMemoryPercent => {
+                language.choose("可用内存", "Free RAM")
+            }
+            Metric::UsedMemory => language.choose("已用内存", "Used RAM"),
+            Metric::Disk => language.choose("磁盘", "Disk"),
+            Metric::CpuFrequency => language.choose("CPU 频率", "CPU Clock"),
+            Metric::Battery => language.choose("电量", "Battery"),
+            Metric::Traffic => language.choose("累计流量", "Traffic"),
+            _ => super::metric_name(metric, language),
         };
         labels[metric.index()] = Some(layout(fonts, &format, label, 80.0)?);
     }
     Ok(labels)
+}
+
+fn empty_label(fonts: &IDWriteFactory, language: Language) -> Result<IDWriteTextLayout> {
+    let format = text_format(fonts, 12.0, DWRITE_FONT_WEIGHT_NORMAL, language)?;
+    let text = language.choose("未选择监控项", "No metrics selected");
+    let label = layout(fonts, &format, text, 112.0)?;
+    unsafe { label.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)? };
+    Ok(label)
 }
 
 fn layout(
@@ -873,7 +905,7 @@ mod tests {
 
     #[test]
     fn label_weight_can_change_without_resizing_text() {
-        let mut panel = Panel::new().unwrap();
+        let mut panel = Panel::new(Language::Chinese).unwrap();
         let verify = |panel: &Panel, expected| {
             for label in panel.labels.iter().flatten() {
                 let mut weight = DWRITE_FONT_WEIGHT::default();
@@ -887,15 +919,15 @@ mod tests {
             }
         };
         verify(&panel, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-        panel.set_label_bold(false).unwrap();
+        panel.set_label_style(Language::Chinese, false).unwrap();
         verify(&panel, DWRITE_FONT_WEIGHT_NORMAL);
-        panel.set_label_bold(true).unwrap();
+        panel.set_label_style(Language::Chinese, true).unwrap();
         verify(&panel, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     }
 
     #[test]
     fn text_fits_in_both_layouts() {
-        let mut panel = Panel::new().unwrap();
+        let mut panel = Panel::new(Language::Chinese).unwrap();
         let sample = Sample {
             upload: Some(1.0),
             download: Some(999_000_000.0),
@@ -938,7 +970,9 @@ mod tests {
                     ..Default::default()
                 };
                 panel.set_layout(mode, display);
-                panel.update_text(&readings(sample, 999_000_000)).unwrap();
+                panel
+                    .update_text(&readings(sample, 999_000_000, Language::Chinese))
+                    .unwrap();
                 assert_eq!(mode.size(display).0, expected_width);
                 assert!(
                     mode.slots(display)
@@ -986,8 +1020,8 @@ mod tests {
 
     #[test]
     fn density_narrows_columns_and_repositions_unchanged_readings() {
-        let mut panel = Panel::new().unwrap();
-        let values = readings(Sample::default(), 16_000_000);
+        let mut panel = Panel::new(Language::Chinese).unwrap();
+        let values = readings(Sample::default(), 16_000_000, Language::Chinese);
         for (mode, widths) in [
             (Layout::Floating, [381, 351, 326]),
             (Layout::Taskbar, [328, 303, 283]),
@@ -1014,10 +1048,45 @@ mod tests {
     }
 
     #[test]
+    fn english_labels_fit_beside_full_width_readings() {
+        let sample = Sample {
+            cpu: Some(100.0),
+            memory: Some(PhysicalMemory {
+                total: 2_000_000_000_000,
+                available: 999_400_000_000,
+            }),
+            disk: Some(100.0),
+            cpu_mhz: Some(5670.0),
+            uptime: Some(std::time::Duration::from_secs(999 * 86_400 + 23 * 3_600)),
+            battery: Some(100.0),
+            ..Default::default()
+        };
+        let display = DisplayOptions {
+            language: Language::English,
+            metrics: Metrics::parse(
+                "cpu,memory,disk,battery,cpu_frequency,traffic,uptime,used_memory,available_memory,available_memory_percent",
+            ),
+            ..Default::default()
+        };
+        let mut panel = Panel::new(display.language).unwrap();
+        let values = readings(sample, 999_000_000, display.language);
+        for mode in [Layout::Floating, Layout::Taskbar] {
+            panel.set_layout(mode, display);
+            panel.update_text(&values).unwrap();
+            for (metric, slot) in mode.slots(display) {
+                let reading = panel.values[metric.index()].as_ref().unwrap();
+                let label = panel.labels[metric.index()].as_ref().unwrap();
+                let gap = reading.number_x - slot.label_x - text_width(label).unwrap();
+                assert!(gap >= 3.0, "{mode:?} {metric:?} label gap: {gap}");
+            }
+        }
+    }
+
+    #[test]
     fn taskbar_traffic_gap_is_close_to_the_middle_column() {
         let mode = Layout::Taskbar;
         let display = DisplayOptions::default();
-        let mut panel = Panel::new().unwrap();
+        let mut panel = Panel::new(Language::Chinese).unwrap();
         panel.set_layout(mode, display);
         let sample = Sample {
             cpu: Some(9.0),
@@ -1028,7 +1097,9 @@ mod tests {
             disk: Some(3.0),
             ..Default::default()
         };
-        panel.update_text(&readings(sample, 16_000_000)).unwrap();
+        panel
+            .update_text(&readings(sample, 16_000_000, Language::Chinese))
+            .unwrap();
 
         let label_gap = |metric: Metric| {
             let (_, slot) = mode
@@ -1080,7 +1151,7 @@ mod tests {
         }
         .unwrap();
         let _window = super::super::Window(hwnd);
-        let mut panel = Panel::new().unwrap();
+        let mut panel = Panel::new(Language::Chinese).unwrap();
         let sample = Sample {
             upload: Some(409_000.0),
             download: Some(26_000.0),
@@ -1092,8 +1163,9 @@ mod tests {
             disk: Some(1.0),
             ..Default::default()
         };
-        let readings = readings(sample, 145_060_000);
+        let readings = readings(sample, 145_060_000, Language::Chinese);
         let custom = DisplayOptions {
+            language: Language::Chinese,
             metrics: Metrics::parse(
                 "cpu_frequency,upload,battery,uptime,used_memory,available_memory,available_memory_percent",
             ),

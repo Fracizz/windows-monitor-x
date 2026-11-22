@@ -3,12 +3,51 @@ use std::{env, fs, io, path::PathBuf, time::Duration};
 use ::windows::{
     Win32::{
         Foundation::{ERROR_SUCCESS, POINT},
+        Globalization::GetUserDefaultUILanguage,
         System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     },
     core::w,
 };
 
-use crate::model::Metrics;
+use crate::{language::Language, model::Metrics};
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub enum LanguagePreference {
+    #[default]
+    System,
+    Chinese,
+    English,
+}
+
+impl LanguagePreference {
+    fn parse(value: &str) -> Self {
+        match value {
+            "zh-CN" => Self::Chinese,
+            "en-US" => Self::English,
+            _ => Self::System,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Chinese => "zh-CN",
+            Self::English => "en-US",
+        }
+    }
+
+    pub fn resolve(self) -> Language {
+        match self {
+            Self::Chinese => Language::Chinese,
+            Self::English => Language::English,
+            // The low 10 bits are the primary language ID (LANG_CHINESE = 4).
+            Self::System if (unsafe { GetUserDefaultUILanguage() } & 0x03ff) == 4 => {
+                Language::Chinese
+            }
+            Self::System => Language::English,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub enum Theme {
@@ -116,6 +155,7 @@ impl TaskbarSide {
 #[derive(Clone, Copy)]
 pub struct Settings {
     pub traffic: u64,
+    pub language: LanguagePreference,
     pub theme: Theme,
     pub label_bold: bool,
     pub topmost: bool,
@@ -130,13 +170,17 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             traffic: 0,
+            language: LanguagePreference::System,
             theme: Theme::System,
             label_bold: true,
             topmost: true,
             taskbar: false,
             taskbar_side: TaskbarSide::default(),
             refresh: Refresh::default(),
-            display: DisplayOptions::default(),
+            display: DisplayOptions {
+                language: LanguagePreference::System.resolve(),
+                ..Default::default()
+            },
             position: None,
         }
     }
@@ -153,6 +197,7 @@ impl Settings {
                 if let Some((key, value)) = line.split_once('=') {
                     match key {
                         "traffic" => settings.traffic = value.parse().unwrap_or_default(),
+                        "language" => settings.language = LanguagePreference::parse(value),
                         "theme" => settings.theme = Theme::parse(value),
                         "label_bold" => settings.label_bold = value.parse().unwrap_or(true),
                         "topmost" => settings.topmost = value.parse().unwrap_or(true),
@@ -174,6 +219,7 @@ impl Settings {
                 }
             }
         }
+        settings.display.language = settings.language.resolve();
         settings
     }
 
@@ -201,8 +247,9 @@ impl Settings {
         fs::write(
             &temp,
             format!(
-                "traffic={}\ntheme={theme}\nlabel_bold={}\ntopmost={}\ntaskbar={}\ntaskbar_side={}\nrefresh={}\nposition={position}\nmetrics={metrics}\ntext_size={text_size}\ndensity={density}\n",
+                "traffic={}\ntheme={theme}\nlanguage={}\nlabel_bold={}\ntopmost={}\ntaskbar={}\ntaskbar_side={}\nrefresh={}\nposition={position}\nmetrics={metrics}\ntext_size={text_size}\ndensity={density}\n",
                 self.traffic,
+                self.language.key(),
                 self.label_bold,
                 self.topmost,
                 self.taskbar,
@@ -216,6 +263,7 @@ impl Settings {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DisplayOptions {
+    pub language: Language,
     pub metrics: Metrics,
     pub text_size: TextSize,
     pub density: Density,

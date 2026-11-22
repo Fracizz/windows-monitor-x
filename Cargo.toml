@@ -1,6 +1,6 @@
 [package]
 name = "windows-monitor"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 rust-version = "1.88"
 build = "build.rs"
@@ -13,6 +13,7 @@ sha2 = "0.10.9"
 windows-numerics = "0.3.1"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_DirectWrite",

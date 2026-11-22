@@ -1,5 +1,7 @@
 use std::{collections::HashMap, time::Duration};
 
+use crate::language::Language;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Sample {
     pub upload: Option<f64>,
@@ -262,7 +264,7 @@ impl Reading {
         })
     }
 
-    fn uptime(duration: Duration) -> Self {
+    fn uptime(duration: Duration, language: Language) -> Self {
         let seconds = duration.as_secs();
         let days = seconds / 86_400;
         let hours = seconds / 3_600;
@@ -270,27 +272,33 @@ impl Reading {
         if days >= 1000 {
             Self {
                 number: days.to_string(),
-                unit: "天",
+                unit: language.choose("天", "d"),
             }
         } else if days > 0 {
             Self {
-                number: format!("{days}天 {}时", hours % 24),
+                number: match language {
+                    Language::Chinese => format!("{days}天 {}时", hours % 24),
+                    Language::English => format!("{days}d {}h", hours % 24),
+                },
                 unit: "",
             }
         } else if hours > 0 {
             Self {
-                number: format!("{hours}时 {}分", minutes % 60),
+                number: match language {
+                    Language::Chinese => format!("{hours}时 {}分", minutes % 60),
+                    Language::English => format!("{hours}h {}m", minutes % 60),
+                },
                 unit: "",
             }
         } else if minutes > 0 {
             Self {
                 number: minutes.to_string(),
-                unit: "分钟",
+                unit: language.choose("分钟", "min"),
             }
         } else {
             Self {
                 number: seconds.to_string(),
-                unit: "秒",
+                unit: language.choose("秒", "s"),
             }
         }
     }
@@ -319,7 +327,7 @@ impl Reading {
     }
 }
 
-pub fn readings(sample: Sample, total: u64) -> [Reading; Metric::ALL.len()] {
+pub fn readings(sample: Sample, total: u64, language: Language) -> [Reading; Metric::ALL.len()] {
     let memory = sample
         .memory
         .filter(|memory| memory.total > 0 && memory.available <= memory.total);
@@ -336,9 +344,9 @@ pub fn readings(sample: Sample, total: u64) -> [Reading; Metric::ALL.len()] {
         Metric::AvailableMemory => Reading::gigabytes(memory.map(|memory| memory.available)),
         Metric::CpuFrequency => Reading::frequency(sample.cpu_mhz),
         Metric::Battery => Reading::percent(sample.battery),
-        Metric::Uptime => sample
-            .uptime
-            .map_or_else(Reading::unavailable, Reading::uptime),
+        Metric::Uptime => sample.uptime.map_or_else(Reading::unavailable, |uptime| {
+            Reading::uptime(uptime, language)
+        }),
         Metric::AvailableMemoryPercent => {
             Reading::percent(memory.map(|memory| memory.percent(memory.available)))
         }
@@ -349,6 +357,20 @@ pub fn readings(sample: Sample, total: u64) -> [Reading; Metric::ALL.len()] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uptime_uses_the_selected_language() {
+        for (seconds, expected) in [
+            (5, ("5", "s")),
+            (90, ("1", "min")),
+            (7_500, ("2h 5m", "")),
+            (90_000, ("1d 1h", "")),
+            (86_400_000, ("1000", "d")),
+        ] {
+            let value = Reading::uptime(Duration::from_secs(seconds), Language::English);
+            assert_eq!((value.number.as_str(), value.unit), expected);
+        }
+    }
 
     #[test]
     fn network_rebases_new_and_reset_interfaces() {
@@ -412,7 +434,7 @@ mod tests {
             battery: None,
             uptime: Some(Duration::from_secs(86_400 + 3_600)),
         };
-        let displayed = readings(sample, sample.traffic);
+        let displayed = readings(sample, sample.traffic, Language::Chinese);
         let pairs = displayed
             .each_ref()
             .map(|value| (value.number.as_str(), value.unit));
@@ -441,15 +463,15 @@ mod tests {
             memory: Some(PhysicalMemory { total, available }),
             ..Default::default()
         };
-        let full = readings(sample(20_000_000_000, 0), 0);
+        let full = readings(sample(20_000_000_000, 0), 0, Language::Chinese);
         assert_eq!(full[Metric::AvailableMemory.index()].number, "0.00");
         assert_eq!(full[Metric::AvailableMemory.index()].unit, "GB");
         assert_eq!(full[Metric::UsedMemory.index()].number, "20.00");
-        let empty = readings(sample(20_000_000_000, 20_000_000_000), 0);
+        let empty = readings(sample(20_000_000_000, 20_000_000_000), 0, Language::Chinese);
         assert_eq!(empty[Metric::UsedMemory.index()].number, "0.00");
         assert_eq!(empty[Metric::AvailableMemoryPercent.index()].number, "100");
         for sample in [Sample::default(), sample(0, 0), sample(1, 2)] {
-            let values = readings(sample, 0);
+            let values = readings(sample, 0, Language::Chinese);
             for metric in [
                 Metric::Memory,
                 Metric::AvailableMemory,

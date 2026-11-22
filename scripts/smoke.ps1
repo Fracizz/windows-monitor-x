@@ -15,6 +15,7 @@ if (-not ('MonitorSmoke.Native' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace MonitorSmoke {
     public static class Native {
@@ -33,6 +34,8 @@ namespace MonitorSmoke {
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern IntPtr FindWindow(string className, IntPtr title);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int capacity);
         [DllImport("user32.dll")]
         public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
         [DllImport("user32.dll")]
@@ -91,6 +94,12 @@ function Start-Monitor {
 
 function Get-PanelWindow {
     [MonitorSmoke.Native]::FindWindow('WindowsMonitor.Panel', [intptr]::Zero)
+}
+
+function Get-WindowTitle([intptr]$Handle) {
+    $text = [Text.StringBuilder]::new(128)
+    [void][MonitorSmoke.Native]::GetWindowText($Handle, $text, $text.Capacity)
+    $text.ToString()
 }
 
 function Test-Setting([string]$Entry) {
@@ -237,6 +246,10 @@ try {
         $handle -ne [intptr]::Zero -and [MonitorSmoke.Native]::IsWindowVisible($handle)
     } 'The metric editor did not open.'
     $editor = [MonitorSmoke.Native]::FindWindow($editorClass, [intptr]::Zero)
+    Send-Panel 0x111 122
+    Wait-For { (Test-Setting 'language=zh-CN') -and (Get-WindowTitle $editor) -cne 'Edit Metrics' } 'Chinese did not apply to the open editor.'
+    Send-Panel 0x111 123
+    Wait-For { (Test-Setting 'language=en-US') -and (Get-WindowTitle $editor) -ceq 'Edit Metrics' } 'English did not apply to the open editor.'
     $density = [MonitorSmoke.Native]::GetDlgItem($editor, 15)
     Assert-True ($density -ne [intptr]::Zero) 'The density dropdown was missing.'
     $selected = [MonitorSmoke.Native]::SendMessageW($density, 0x14e, [uintptr]2, [intptr]::Zero)
@@ -303,6 +316,12 @@ try {
         Wait-For { Test-Setting 'taskbar=false' } 'Taskbar mode did not turn off.'
     }
     Wait-For { Test-PanelSize 326 68 } 'Tight floating dimensions were not restored after restart.'
+    Send-Panel 0x111 116
+    Wait-For {
+        $script:editor = [MonitorSmoke.Native]::FindWindow($editorClass, [intptr]::Zero)
+        $editor -ne [intptr]::Zero -and (Get-WindowTitle $editor) -ceq 'Edit Metrics'
+    } 'The English preference was not restored after restart.'
+    Assert-True ([MonitorSmoke.Native]::PostMessageW($editor, 0x111, [uintptr]2, [intptr]::Zero)) 'Closing the metrics editor failed.'
     Send-Panel 0x111 119
     Wait-For { Test-Setting 'label_bold=true' } 'The label weight preference was not restored after restart.'
     Send-Panel 0x111 107

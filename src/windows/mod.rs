@@ -21,6 +21,7 @@ use ::windows::{
             CloseHandle, D2DERR_RECREATE_TARGET, ERROR_ALREADY_EXISTS, GetLastError, HANDLE,
             HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
         },
+        Globalization::SetThreadUILanguage,
         Graphics::{
             Dwm::{
                 DWMNCRP_DISABLED, DWMNCRP_USEWINDOWSTYLE, DWMWA_BORDER_COLOR, DWMWA_COLOR_DEFAULT,
@@ -54,11 +55,14 @@ use ::windows::{
     core::{Error, HSTRING, PCWSTR, Result, w},
 };
 
-use crate::model::{Metric, Reading, Sample, readings};
+use crate::{
+    language::Language,
+    model::{Metric, Reading, Sample, readings},
+};
 use panel::{Appearance, Layout, Panel};
 use panel_input::PanelInput;
 use sampler::Sampler;
-use state::{DisplayOptions, Refresh, Settings, TaskbarSide, TextSize, Theme};
+use state::{DisplayOptions, LanguagePreference, Refresh, Settings, TaskbarSide, TextSize, Theme};
 use taskbar::{
     DockPlacement, Observation, Placement, Taskbar, covered_by_taskbar, is_taskbar_window,
     is_tray_overflow, primary_taskbar, taskbar_has_focus, taskbar_menu_open,
@@ -97,11 +101,14 @@ const CHECK_UPDATE: usize = 117;
 const TRANSPARENT_THEME: usize = 118;
 const LABEL_BOLD: usize = 119;
 const ABOUT: usize = 120;
-const REFRESH_OPTIONS: [(usize, Refresh, PCWSTR); 4] = [
-    (109, Refresh::One, w!("1 秒")),
-    (110, Refresh::Two, w!("2 秒")),
-    (111, Refresh::Three, w!("3 秒")),
-    (112, Refresh::Five, w!("5 秒")),
+const LANGUAGE_SYSTEM: usize = 121;
+const LANGUAGE_CHINESE: usize = 122;
+const LANGUAGE_ENGLISH: usize = 123;
+const REFRESH_OPTIONS: [(usize, Refresh); 4] = [
+    (109, Refresh::One),
+    (110, Refresh::Two),
+    (111, Refresh::Three),
+    (112, Refresh::Five),
 ];
 
 thread_local! {
@@ -192,7 +199,7 @@ impl App {
             dock_timer: None,
             sample,
             waiting_sample: true,
-            displayed: readings(sample, settings.traffic),
+            displayed: readings(sample, settings.traffic, settings.display.language),
             display: settings.display,
             starting_traffic: settings.traffic,
             traffic_at_reset: 0,
@@ -273,7 +280,7 @@ impl App {
     }
 
     fn update_display(&mut self) -> bool {
-        let displayed = readings(self.sample, self.total());
+        let displayed = readings(self.sample, self.total(), self.display.language);
         let changed = self
             .display
             .metrics
@@ -313,7 +320,7 @@ impl App {
 
     fn paint(&mut self, hwnd: HWND, dc: HDC) {
         if self.waiting_sample {
-            panel::paint_starting(hwnd, dc, self.dpi, self.dark, self.display.text_size);
+            panel::paint_starting(hwnd, dc, self.dpi, self.dark, self.display);
             return;
         }
 
@@ -331,12 +338,12 @@ impl App {
             Appearance::Solid { dark: self.dark }
         };
         if self.panel.is_none() {
-            let mut panel = Panel::new()?;
+            let mut panel = Panel::new(self.display.language)?;
             panel.set_layout(self.layout(), self.display);
             self.panel = Some(panel);
         }
         let panel = self.panel.as_mut().expect("panel initialized");
-        panel.set_label_bold(self.settings.label_bold)?;
+        panel.set_label_style(self.display.language, self.settings.label_bold)?;
         let mut painted = panel.paint(hwnd, self.dpi, appearance, &self.displayed);
         if painted
             .as_ref()
@@ -669,7 +676,9 @@ fn keep_dock_above_taskbar(bar: HWND, hwnd: HWND, rect: RECT) {
 }
 
 pub fn run() -> Result<()> {
-    if let Some(result) = updater::handle_startup_args() {
+    let settings = Settings::load();
+    set_thread_language(settings.display.language);
+    if let Some(result) = updater::handle_startup_args(settings.display.language) {
         if let Err(error) = result {
             show_update_error(None, &error);
         }
@@ -689,7 +698,6 @@ pub fn run() -> Result<()> {
         }
         instance
     };
-    let settings = Settings::load();
     let feed = Feed::default();
     let module = unsafe { HINSTANCE(GetModuleHandleW(PCWSTR::null())?.0) };
     let icon = unsafe { LoadIconW(Some(module), ICON_ID)? };
@@ -733,8 +741,18 @@ fn app_title() -> &'static HSTRING {
     TITLE.get_or_init(|| HSTRING::from(PRODUCT_NAME))
 }
 
+fn ui_language() -> Language {
+    with_app(|app| app.settings.display.language)
+        .unwrap_or_else(|| Settings::load().display.language)
+}
+
+fn set_thread_language(language: Language) {
+    unsafe { SetThreadUILanguage(language.choose(0x0804, 0x0409)) };
+}
+
 pub fn show_error(error: &Error) {
-    let message = HSTRING::from(format!("系统监控启动失败。\n\n{error}"));
+    let heading = ui_language().choose("系统监控启动失败。", "Windows Monitor could not start.");
+    let message = HSTRING::from(format!("{heading}\n\n{error}"));
     unsafe { MessageBoxW(None, &message, app_title(), MB_OK | MB_ICONERROR) };
 }
 
@@ -979,7 +997,11 @@ fn apply_placement(hwnd: HWND) {
     let Some((placement, position, topmost, layout, display, waiting_sample, transparent)) =
         with_app(|app| {
             let layout = app.layout();
+            let language_changed = app.display.language != app.settings.display.language;
             app.display = app.settings.display;
+            if language_changed {
+                app.update_display();
+            }
             if let Some(panel) = &mut app.panel {
                 panel.set_layout(layout, app.display);
             }
@@ -1375,22 +1397,31 @@ fn make_menu(
     startup: Option<startup::Status>,
     update_busy: bool,
 ) -> Result<Menu> {
+    let language = settings.display.language;
     let menu = Menu::new()?;
     let visibility = if shown {
-        w!("隐藏监控")
+        language.choose(w!("隐藏监控"), w!("Hide Monitor"))
     } else {
-        w!("显示监控")
+        language.choose(w!("显示监控"), w!("Show Monitor"))
     };
     let available = if tray_ready { MF_ENABLED } else { MF_GRAYED };
     menu.item(TOGGLE, visibility, available)?;
     menu.submenu(
-        w!("设置"),
+        language.choose(w!("设置"), w!("Settings")),
         make_settings_menu(settings, placement, startup, update_busy)?,
     )?;
     menu.separator()?;
-    menu.item(RESET_TRAFFIC, w!("清零总流量"), MF_ENABLED)?;
-    menu.item(ABOUT, w!("关于…"), MF_ENABLED)?;
-    menu.item(EXIT, w!("退出"), MF_ENABLED)?;
+    menu.item(
+        RESET_TRAFFIC,
+        language.choose(w!("清零总流量"), w!("Reset Total Traffic")),
+        MF_ENABLED,
+    )?;
+    menu.item(
+        ABOUT,
+        language.choose(w!("关于…"), w!("About…")),
+        MF_ENABLED,
+    )?;
+    menu.item(EXIT, language.choose(w!("退出"), w!("Exit")), MF_ENABLED)?;
     Ok(menu)
 }
 
@@ -1400,18 +1431,25 @@ fn make_settings_menu(
     startup: Option<startup::Status>,
     update_busy: bool,
 ) -> Result<Menu> {
+    let language = settings.display.language;
     let menu = Menu::new()?;
     let checked = |condition| if condition { MF_CHECKED } else { MF_UNCHECKED };
     let startup_label = if startup == Some(startup::Status::OtherPath) {
-        w!("开机自启（更新路径）")
+        language.choose(
+            w!("开机自启（更新路径）"),
+            w!("Run at Sign-in (Update Path)"),
+        )
     } else {
-        w!("开机自启")
+        language.choose(w!("开机自启"), w!("Run at Sign-in"))
     };
     let docked = matches!(placement, Placement::Docked(_));
     let dock_label = if settings.taskbar && placement == Placement::Floating {
-        w!("嵌入任务栏（等候空位）")
+        language.choose(
+            w!("嵌入任务栏（等候空位）"),
+            w!("Embed in Taskbar (Waiting for Space)"),
+        )
     } else {
-        w!("嵌入任务栏")
+        language.choose(w!("嵌入任务栏"), w!("Embed in Taskbar"))
     };
     let topmost = if docked { MF_GRAYED } else { MF_ENABLED };
     menu.item(
@@ -1422,65 +1460,123 @@ fn make_settings_menu(
     menu.item(DOCK, dock_label, checked(settings.taskbar))?;
     menu.item(
         TOPMOST,
-        w!("窗口置顶"),
+        language.choose(w!("窗口置顶"), w!("Always on Top")),
         topmost | checked(settings.topmost || docked),
     )?;
     menu.separator()?;
 
     let refresh = Menu::new()?;
-    for (id, interval, label) in REFRESH_OPTIONS {
+    let labels = language.choose(
+        [w!("1 秒"), w!("2 秒"), w!("3 秒"), w!("5 秒")],
+        [
+            w!("1 second"),
+            w!("2 seconds"),
+            w!("3 seconds"),
+            w!("5 seconds"),
+        ],
+    );
+    for ((id, interval), label) in REFRESH_OPTIONS.into_iter().zip(labels) {
         refresh.item(id, label, checked(settings.refresh == interval))?;
     }
-    menu.submenu(w!("刷新频率"), refresh)?;
+    menu.submenu(
+        language.choose(w!("刷新频率"), w!("Refresh Interval")),
+        refresh,
+    )?;
 
     let theme = Menu::new()?;
     for (id, choice, label) in [
-        (FOLLOW_SYSTEM, Theme::System, w!("跟随系统")),
-        (LIGHT, Theme::Light, w!("浅色")),
-        (DARK, Theme::Dark, w!("深色")),
-        (TRANSPARENT_THEME, Theme::Transparent, w!("透明")),
+        (
+            FOLLOW_SYSTEM,
+            Theme::System,
+            language.choose(w!("跟随系统"), w!("Use System Theme")),
+        ),
+        (
+            LIGHT,
+            Theme::Light,
+            language.choose(w!("浅色"), w!("Light")),
+        ),
+        (DARK, Theme::Dark, language.choose(w!("深色"), w!("Dark"))),
+        (
+            TRANSPARENT_THEME,
+            Theme::Transparent,
+            language.choose(w!("透明"), w!("Transparent")),
+        ),
     ] {
         theme.item(id, label, checked(settings.theme == choice))?;
     }
-    menu.submenu(w!("主题"), theme)?;
-    menu.item(LABEL_BOLD, w!("标签加粗"), checked(settings.label_bold))?;
+    menu.submenu(language.choose(w!("主题"), w!("Theme")), theme)?;
+    menu.item(
+        LABEL_BOLD,
+        language.choose(w!("标签加粗"), w!("Bold Labels")),
+        checked(settings.label_bold),
+    )?;
 
     let taskbar_position = Menu::new()?;
     taskbar_position.item(
         DOCK_LEFT,
-        w!("靠左"),
+        language.choose(w!("靠左"), w!("Left")),
         checked(settings.taskbar_side == TaskbarSide::Left),
     )?;
     taskbar_position.item(
         DOCK_RIGHT,
-        w!("靠右"),
+        language.choose(w!("靠右"), w!("Right")),
         checked(settings.taskbar_side == TaskbarSide::Right),
     )?;
-    menu.submenu(w!("任务栏位置"), taskbar_position)?;
-    menu.item(EDIT_METRICS, w!("编辑监控项…"), MF_ENABLED)?;
+    menu.submenu(
+        language.choose(w!("任务栏位置"), w!("Taskbar Position")),
+        taskbar_position,
+    )?;
+    menu.item(
+        EDIT_METRICS,
+        language.choose(w!("编辑监控项…"), w!("Edit Metrics…")),
+        MF_ENABLED,
+    )?;
     let (update_label, update_flags) = if update_busy {
-        (w!("正在处理更新…"), MF_GRAYED)
+        (
+            language.choose(w!("正在处理更新…"), w!("Working on Update…")),
+            MF_GRAYED,
+        )
     } else {
-        (w!("检查更新…"), MF_ENABLED)
+        (
+            language.choose(w!("检查更新…"), w!("Check for Updates…")),
+            MF_ENABLED,
+        )
     };
     menu.item(CHECK_UPDATE, update_label, update_flags)?;
+    let languages = Menu::new()?;
+    for (id, preference, label) in [
+        (
+            LANGUAGE_SYSTEM,
+            LanguagePreference::System,
+            language.choose(w!("跟随系统"), w!("Use System Language")),
+        ),
+        (
+            LANGUAGE_CHINESE,
+            LanguagePreference::Chinese,
+            w!("简体中文"),
+        ),
+        (LANGUAGE_ENGLISH, LanguagePreference::English, w!("English")),
+    ] {
+        languages.item(id, label, checked(settings.language == preference))?;
+    }
+    menu.submenu(language.choose(w!("语言"), w!("Language")), languages)?;
     Ok(menu)
 }
 
-fn metric_name(metric: Metric) -> &'static str {
+fn metric_name(metric: Metric, language: Language) -> &'static str {
     match metric {
-        Metric::Upload => "上传速度",
-        Metric::Download => "下载速度",
-        Metric::Cpu => "CPU 使用率",
-        Metric::Memory => "内存使用率",
-        Metric::Disk => "磁盘活动率",
-        Metric::Traffic => "累计流量",
-        Metric::AvailableMemory => "可用内存（GB）",
-        Metric::AvailableMemoryPercent => "可用内存百分比",
-        Metric::UsedMemory => "已用内存（GB）",
-        Metric::CpuFrequency => "CPU 当前频率",
-        Metric::Uptime => "运行时长",
-        Metric::Battery => "电池电量",
+        Metric::Upload => language.choose("上传速度", "Upload Speed"),
+        Metric::Download => language.choose("下载速度", "Download Speed"),
+        Metric::Cpu => language.choose("CPU 使用率", "CPU Usage"),
+        Metric::Memory => language.choose("内存使用率", "Memory Usage"),
+        Metric::Disk => language.choose("磁盘活动率", "Disk Activity"),
+        Metric::Traffic => language.choose("累计流量", "Total Traffic"),
+        Metric::AvailableMemory => language.choose("可用内存（GB）", "Available Memory (GB)"),
+        Metric::AvailableMemoryPercent => language.choose("可用内存百分比", "Available Memory (%)"),
+        Metric::UsedMemory => language.choose("已用内存（GB）", "Used Memory (GB)"),
+        Metric::CpuFrequency => language.choose("CPU 当前频率", "CPU Frequency"),
+        Metric::Uptime => language.choose("运行时长", "Uptime"),
+        Metric::Battery => language.choose("电池电量", "Battery Level"),
     }
 }
 
@@ -1505,10 +1601,35 @@ fn set_display(hwnd: HWND, display: DisplayOptions) {
     }
 }
 
+fn set_language(hwnd: HWND, preference: LanguagePreference) {
+    let language = preference.resolve();
+    let display = with_app(|app| {
+        let previous = app.settings.display;
+        if app.settings.language == preference && previous.language == language {
+            return None;
+        }
+        app.settings.language = preference;
+        if previous.language == language {
+            app.save();
+            return None;
+        }
+        Some(DisplayOptions {
+            language,
+            ..previous
+        })
+    })
+    .flatten();
+    if let Some(display) = display {
+        set_thread_language(language);
+        set_display(hwnd, display);
+        editor::set_language(language);
+    }
+}
+
 fn start_update(hwnd: HWND, action: updater::Action) {
     let result = with_app(|app| {
         if app.update.is_none() {
-            app.update = Some(updater::start(hwnd, action)?);
+            app.update = Some(updater::start(hwnd, action, app.settings.display.language)?);
         }
         Ok::<_, std::io::Error>(())
     });
@@ -1526,10 +1647,13 @@ fn finish_update(hwnd: HWND) {
     .flatten();
     match event {
         Some(updater::Event::Checked(Ok(Some(release)))) => {
-            let text = HSTRING::from(format!(
-                "GitHub 上有新版本 v{}。是否下载并重启应用？",
-                release.version
-            ));
+            let version = release.version.to_string();
+            let text = HSTRING::from(match ui_language() {
+                Language::Chinese => format!("GitHub 上有新版本 v{version}。是否下载并重启应用？"),
+                Language::English => format!(
+                    "Version v{version} is available on GitHub. Download it and restart the app?"
+                ),
+            });
             let answer = unsafe {
                 MessageBoxW(
                     Some(hwnd),
@@ -1543,14 +1667,17 @@ fn finish_update(hwnd: HWND) {
             }
         }
         Some(updater::Event::Checked(Ok(None))) => {
-            let text = HSTRING::from(concat!(
-                "当前已是最新版本 v",
-                env!("CARGO_PKG_VERSION"),
-                "。"
+            let text = HSTRING::from(ui_language().choose(
+                concat!("当前已是最新版本 v", env!("CARGO_PKG_VERSION"), "。"),
+                concat!(
+                    "You are using the latest version, v",
+                    env!("CARGO_PKG_VERSION"),
+                    "."
+                ),
             ));
             unsafe { MessageBoxW(Some(hwnd), &text, app_title(), MB_OK | MB_ICONINFORMATION) };
         }
-        Some(updater::Event::Downloaded(Ok(update))) => match update.launch() {
+        Some(updater::Event::Downloaded(Ok(update))) => match update.launch(ui_language()) {
             Ok(()) => {
                 let _ = unsafe { DestroyWindow(hwnd) };
             }
@@ -1564,7 +1691,15 @@ fn finish_update(hwnd: HWND) {
 }
 
 fn show_update_error(hwnd: Option<HWND>, error: &impl std::fmt::Display) {
-    let text = HSTRING::from(format!("无法完成在线更新。\n\n{error}"));
+    show_warning(
+        hwnd,
+        ui_language().choose("无法完成在线更新。", "The update could not be completed."),
+        error,
+    );
+}
+
+fn show_warning(hwnd: Option<HWND>, heading: &str, error: &impl std::fmt::Display) {
+    let text = HSTRING::from(format!("{heading}\n\n{error}"));
     unsafe { MessageBoxW(hwnd, &text, app_title(), MB_OK | MB_ICONWARNING) };
 }
 
@@ -1572,22 +1707,51 @@ fn command(hwnd: HWND, selection: usize) {
     match selection {
         ABOUT => {
             if let Err(error) = about::open(hwnd) {
-                let message = HSTRING::from(format!("无法打开关于窗口。\n\n{error}"));
-                unsafe { MessageBoxW(Some(hwnd), &message, app_title(), MB_OK | MB_ICONWARNING) };
+                show_warning(
+                    Some(hwnd),
+                    ui_language().choose(
+                        "无法打开关于窗口。",
+                        "The About dialog could not be opened.",
+                    ),
+                    &error,
+                );
             }
         }
         CHECK_UPDATE => start_update(hwnd, updater::Action::Check),
         EDIT_METRICS => {
             if let Err(error) = editor::open(hwnd) {
-                let message = HSTRING::from(format!("无法打开监控项编辑器。\n\n{error}"));
-                unsafe { MessageBoxW(Some(hwnd), &message, app_title(), MB_OK | MB_ICONWARNING) };
+                show_warning(
+                    Some(hwnd),
+                    ui_language().choose(
+                        "无法打开监控项编辑器。",
+                        "The metrics editor could not be opened.",
+                    ),
+                    &error,
+                );
             }
         }
         AUTOSTART => {
-            if let Err(error) = startup::toggle() {
-                let message = HSTRING::from(format!("无法更改开机自启设置。\n\n{error}"));
-                unsafe { MessageBoxW(Some(hwnd), &message, app_title(), MB_OK | MB_ICONWARNING) };
+            let language = ui_language();
+            if let Err(error) = startup::toggle(language) {
+                show_warning(
+                    Some(hwnd),
+                    language.choose(
+                        "无法更改开机自启设置。",
+                        "The run-at-sign-in setting could not be changed.",
+                    ),
+                    &error,
+                );
             }
+        }
+        LANGUAGE_SYSTEM | LANGUAGE_CHINESE | LANGUAGE_ENGLISH => {
+            set_language(
+                hwnd,
+                match selection {
+                    LANGUAGE_CHINESE => LanguagePreference::Chinese,
+                    LANGUAGE_ENGLISH => LanguagePreference::English,
+                    _ => LanguagePreference::System,
+                },
+            );
         }
         TOGGLE => {
             let changed = with_app(|app| {
@@ -1670,9 +1834,8 @@ fn command(hwnd: HWND, selection: usize) {
             let _ = unsafe { DestroyWindow(hwnd) };
         }
         _ => {
-            if let Some((_, interval, _)) = REFRESH_OPTIONS
-                .into_iter()
-                .find(|(id, _, _)| *id == selection)
+            if let Some((_, interval)) =
+                REFRESH_OPTIONS.into_iter().find(|(id, _)| *id == selection)
             {
                 with_app(|app| {
                     app.settings.refresh = interval;

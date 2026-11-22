@@ -23,6 +23,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::GITHUB_REPOSITORY;
+use crate::language::Language;
 
 const EXECUTABLE: &str = "windows-monitor-x.exe";
 const MAX_RELEASE_JSON: usize = 1024 * 1024;
@@ -66,15 +67,15 @@ struct GitHubAsset {
     digest: Option<String>,
 }
 
-pub fn start(hwnd: HWND, action: Action) -> io::Result<mpsc::Receiver<Event>> {
+pub fn start(hwnd: HWND, action: Action, language: Language) -> io::Result<mpsc::Receiver<Event>> {
     let handle = hwnd.0 as usize;
     let (sender, receiver) = mpsc::channel();
     thread::Builder::new()
         .name("monitor-updater".into())
         .spawn(move || {
             let event = match action {
-                Action::Check => Event::Checked(check()),
-                Action::Download(release) => Event::Downloaded(download(release)),
+                Action::Check => Event::Checked(check(language)),
+                Action::Download(release) => Event::Downloaded(download(release, language)),
             };
             if sender.send(event).is_ok() {
                 super::notify(HWND(handle as *mut _), super::UPDATE_READY);
@@ -83,7 +84,7 @@ pub fn start(hwnd: HWND, action: Action) -> io::Result<mpsc::Receiver<Event>> {
     Ok(receiver)
 }
 
-fn check() -> Result<Option<Release>> {
+fn check(language: Language) -> Result<Option<Release>> {
     let current = Version::parse(env!("CARGO_PKG_VERSION"))?;
     let path = format!("/repos/{GITHUB_REPOSITORY}/releases/latest");
     let json = get(
@@ -91,11 +92,16 @@ fn check() -> Result<Option<Release>> {
         &path,
         "Accept: application/vnd.github+json\r\n",
         MAX_RELEASE_JSON,
+        language,
     )?;
-    release_from_json(&json, &current)
+    release_from_json(&json, &current, language)
 }
 
-fn release_from_json(json: &[u8], current: &Version) -> Result<Option<Release>> {
+fn release_from_json(
+    json: &[u8],
+    current: &Version,
+    language: Language,
+) -> Result<Option<Release>> {
     let release: GitHubRelease = serde_json::from_slice(json)?;
     let tag = &release.tag_name;
     let version = Version::parse(tag.strip_prefix('v').unwrap_or(tag))?;
@@ -106,15 +112,29 @@ fn release_from_json(json: &[u8], current: &Version) -> Result<Option<Release>> 
         .assets
         .into_iter()
         .find(|asset| asset.name == EXECUTABLE)
-        .ok_or_else(|| io::Error::other("新版缺少 Windows 可执行文件。"))?;
+        .ok_or_else(|| {
+            io::Error::other(language.choose(
+                "新版缺少 Windows 可执行文件。",
+                "The release is missing the Windows executable.",
+            ))
+        })?;
     let digest = asset
         .digest
         .as_deref()
         .and_then(|digest| digest.strip_prefix("sha256:"))
         .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| io::Error::other("GitHub 没有提供有效的 SHA-256 校验值。"))?;
+        .ok_or_else(|| {
+            io::Error::other(language.choose(
+                "GitHub 没有提供有效的 SHA-256 校验值。",
+                "GitHub did not provide a valid SHA-256 checksum.",
+            ))
+        })?;
     if !(1..=MAX_EXECUTABLE).contains(&asset.size) {
-        return Err(io::Error::other("新版文件大小无效。").into());
+        return Err(io::Error::other(language.choose(
+            "新版文件大小无效。",
+            "The release contains an invalid file size.",
+        ))
+        .into());
     }
     Ok(Some(Release {
         version,
@@ -124,14 +144,17 @@ fn release_from_json(json: &[u8], current: &Version) -> Result<Option<Release>> 
     }))
 }
 
-fn download(release: Release) -> Result<StagedUpdate> {
-    let bytes = get(w!("github.com"), &release.path, "", release.size)?;
-    verify_download(&release, &bytes)?;
+fn download(release: Release, language: Language) -> Result<StagedUpdate> {
+    let bytes = get(w!("github.com"), &release.path, "", release.size, language)?;
+    verify_download(&release, &bytes, language)?;
 
     let target = env::current_exe()?;
-    let parent = target
-        .parent()
-        .ok_or_else(|| io::Error::other("无法确定程序目录。"))?;
+    let parent = target.parent().ok_or_else(|| {
+        io::Error::other(language.choose(
+            "无法确定程序目录。",
+            "The app directory could not be determined.",
+        ))
+    })?;
     let time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -148,9 +171,13 @@ fn download(release: Release) -> Result<StagedUpdate> {
     Ok(update)
 }
 
-fn verify_download(release: &Release, bytes: &[u8]) -> Result<()> {
+fn verify_download(release: &Release, bytes: &[u8], language: Language) -> Result<()> {
     if bytes.len() != release.size || format!("{:x}", Sha256::digest(bytes)) != release.digest {
-        return Err(io::Error::other("下载文件校验失败，请重新检查更新。").into());
+        return Err(io::Error::other(language.choose(
+            "下载文件校验失败，请重新检查更新。",
+            "The download did not pass verification. Check for updates again.",
+        ))
+        .into());
     }
     Ok(())
 }
@@ -173,7 +200,13 @@ impl Drop for HttpHandle {
     }
 }
 
-fn get(host: PCWSTR, path: &str, headers: &str, limit: usize) -> Result<Vec<u8>> {
+fn get(
+    host: PCWSTR,
+    path: &str,
+    headers: &str,
+    limit: usize,
+    language: Language,
+) -> Result<Vec<u8>> {
     let path = HSTRING::from(path);
     let agent = HSTRING::from(concat!("windows-monitor-x/", env!("CARGO_PKG_VERSION")));
     let headers: Vec<_> = headers.encode_utf16().collect();
@@ -217,7 +250,11 @@ fn get(host: PCWSTR, path: &str, headers: &str, limit: usize) -> Result<Vec<u8>>
             ptr::null_mut(),
         )?;
         if status != 200 {
-            return Err(io::Error::other(format!("GitHub 返回 HTTP {status}。")).into());
+            return Err(io::Error::other(match language {
+                Language::Chinese => format!("GitHub 返回 HTTP {status}。"),
+                Language::English => format!("GitHub returned HTTP {status}."),
+            })
+            .into());
         }
         let mut buffer = [0u8; 16 * 1024];
         loop {
@@ -232,7 +269,11 @@ fn get(host: PCWSTR, path: &str, headers: &str, limit: usize) -> Result<Vec<u8>>
                 return Ok(bytes);
             }
             if bytes.len() + read as usize > limit {
-                return Err(io::Error::other("GitHub 响应超过文件大小限制。").into());
+                return Err(io::Error::other(language.choose(
+                    "GitHub 响应超过文件大小限制。",
+                    "The GitHub response exceeds the file size limit.",
+                ))
+                .into());
             }
             bytes.extend_from_slice(&buffer[..read as usize]);
         }
@@ -246,11 +287,13 @@ pub struct StagedUpdate {
 }
 
 impl StagedUpdate {
-    pub fn launch(mut self) -> Result<()> {
-        let filename = self
-            .target
-            .file_name()
-            .ok_or_else(|| io::Error::other("无法确定程序文件名。"))?;
+    pub fn launch(mut self, language: Language) -> Result<()> {
+        let filename = self.target.file_name().ok_or_else(|| {
+            io::Error::other(language.choose(
+                "无法确定程序文件名。",
+                "The app filename could not be determined.",
+            ))
+        })?;
         Command::new(self.directory.join(HELPER))
             .arg(APPLY_ARG)
             .arg(process::id().to_string())
@@ -269,48 +312,57 @@ impl Drop for StagedUpdate {
     }
 }
 
-pub fn handle_startup_args() -> Option<Result<()>> {
+pub fn handle_startup_args(language: Language) -> Option<Result<()>> {
     let mut args = env::args_os().skip(1);
     let action = args.next()?;
     if action == APPLY_ARG {
-        return Some(apply(&args.next()?, &args.next()?));
+        return Some(apply(&args.next()?, &args.next()?, language));
     }
     if action == CLEANUP_ARG
         && let (Some(helper), Some(directory)) = (args.next(), args.next())
     {
-        cleanup(&helper, &directory);
+        cleanup(&helper, &directory, language);
     }
     None
 }
 
-fn apply(parent: &OsStr, filename: &OsStr) -> Result<()> {
+fn apply(parent: &OsStr, filename: &OsStr, language: Language) -> Result<()> {
     let helper = env::current_exe()?;
     let directory = helper.parent().filter(|path| {
         helper.file_name() == Some(OsStr::new(HELPER))
             && path.file_name().is_some_and(is_staging_name)
     });
-    let directory = directory.ok_or_else(|| io::Error::other("更新目录无效。"))?;
+    let directory = directory.ok_or_else(|| {
+        io::Error::other(language.choose("更新目录无效。", "The update directory is invalid."))
+    })?;
     if !is_filename(filename)
         || !Path::new(filename)
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
     {
-        return Err(io::Error::other("更新目标无效。").into());
+        return Err(io::Error::other(
+            language.choose("更新目标无效。", "The update destination is invalid."),
+        )
+        .into());
     }
     let target = directory
         .parent()
-        .ok_or_else(|| io::Error::other("更新目标无效。"))?
+        .ok_or_else(|| {
+            io::Error::other(
+                language.choose("更新目标无效。", "The update destination is invalid."),
+            )
+        })?
         .join(filename);
-    wait_for_exit(parent)?;
+    wait_for_exit(parent, language)?;
 
-    if let Err(error) = replace_and_restart(&target, directory) {
+    if let Err(error) = replace_and_restart(&target, directory, language) {
         let _ = Command::new(&target).spawn();
         return Err(error);
     }
     Ok(())
 }
 
-fn replace_and_restart(target: &Path, directory: &Path) -> Result<()> {
+fn replace_and_restart(target: &Path, directory: &Path, language: Language) -> Result<()> {
     let backup = directory.join(BACKUP);
     fs::copy(target, &backup)?;
     fs::rename(directory.join(STAGED), target)?;
@@ -321,21 +373,22 @@ fn replace_and_restart(target: &Path, directory: &Path) -> Result<()> {
         .spawn();
     if let Err(error) = result {
         fs::rename(&backup, target).map_err(|restore| {
-            io::Error::other(format!(
-                "无法启动新版或恢复旧版。旧版备份位于 {}。{restore}",
-                backup.display()
-            ))
+            let path = backup.display();
+            io::Error::other(match language {
+                Language::Chinese => format!("无法启动新版或恢复旧版。旧版备份位于 {path}。{restore}"),
+                Language::English => format!("The new version could not start and the previous one could not be restored. The backup is at {path}. {restore}"),
+            })
         })?;
         return Err(error.into());
     }
     Ok(())
 }
 
-fn cleanup(helper: &OsStr, directory: &OsStr) {
+fn cleanup(helper: &OsStr, directory: &OsStr, language: Language) {
     if is_staging_name(directory)
         && let Ok(exe) = env::current_exe()
         && let Some(parent) = exe.parent()
-        && wait_for_exit(helper).is_ok()
+        && wait_for_exit(helper, language).is_ok()
     {
         let _ = fs::remove_dir_all(parent.join(directory));
     }
@@ -356,12 +409,16 @@ fn is_staging_name(value: &OsStr) -> bool {
         .is_some_and(|(pid, time)| pid.parse::<u32>().is_ok() && time.parse::<u128>().is_ok())
 }
 
-fn wait_for_exit(pid: &OsStr) -> Result<()> {
+fn wait_for_exit(pid: &OsStr, language: Language) -> Result<()> {
     let pid = pid
         .to_str()
         .and_then(|pid| pid.parse::<u32>().ok())
         .filter(|&pid| pid != 0 && pid != process::id())
-        .ok_or_else(|| io::Error::other("更新进程编号无效。"))?;
+        .ok_or_else(|| {
+            io::Error::other(
+                language.choose("更新进程编号无效。", "The update process ID is invalid."),
+            )
+        })?;
     let handle = match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
         Ok(handle) => handle,
         Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => return Ok(()),
@@ -369,7 +426,14 @@ fn wait_for_exit(pid: &OsStr) -> Result<()> {
     };
     let result = match unsafe { WaitForSingleObject(handle, 15_000) } {
         WAIT_OBJECT_0 => Ok(()),
-        WAIT_TIMEOUT => Err(io::Error::new(io::ErrorKind::TimedOut, "等待旧进程关闭超时。").into()),
+        WAIT_TIMEOUT => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            language.choose(
+                "等待旧进程关闭超时。",
+                "Timed out waiting for the previous process to exit.",
+            ),
+        )
+        .into()),
         _ => Err(Error::from_thread().into()),
     };
     let _ = unsafe { CloseHandle(handle) };
@@ -395,31 +459,48 @@ mod tests {
             ]
         });
         let payload = json.to_string();
-        let release = release_from_json(payload.as_bytes(), &Version::new(0, 3, 1))
-            .unwrap()
-            .unwrap();
+        let release = release_from_json(
+            payload.as_bytes(),
+            &Version::new(0, 3, 1),
+            Language::English,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(release.version, Version::new(0, 4, 0));
         assert_eq!(
             release.path,
             format!("/{GITHUB_REPOSITORY}/releases/download/v0.4.0/{EXECUTABLE}")
         );
-        assert!(verify_download(&release, bytes).is_ok());
-        assert!(verify_download(&release, b"bad! executable").is_err());
+        assert!(verify_download(&release, bytes, Language::English).is_ok());
+        assert!(verify_download(&release, b"bad! executable", Language::English).is_err());
         assert!(
-            release_from_json(payload.as_bytes(), &Version::new(0, 4, 0))
-                .unwrap()
-                .is_none()
+            release_from_json(
+                payload.as_bytes(),
+                &Version::new(0, 4, 0),
+                Language::English
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(
-            release_from_json(payload.as_bytes(), &Version::new(0, 5, 0))
-                .unwrap()
-                .is_none()
+            release_from_json(
+                payload.as_bytes(),
+                &Version::new(0, 5, 0),
+                Language::English
+            )
+            .unwrap()
+            .is_none()
         );
 
         let mut malformed = json;
         malformed["assets"][1]["digest"] = serde_json::Value::Null;
         assert!(
-            release_from_json(malformed.to_string().as_bytes(), &Version::new(0, 3, 1)).is_err()
+            release_from_json(
+                malformed.to_string().as_bytes(),
+                &Version::new(0, 3, 1),
+                Language::English
+            )
+            .is_err()
         );
     }
 }

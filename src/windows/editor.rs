@@ -26,7 +26,10 @@ use ::windows::{
 use super::panel::{Appearance, Layout, Panel};
 use super::state::{Density, DisplayOptions, TextSize, Theme};
 use super::{Window, invalidate, metric_name, scale, set_display, window_dpi, with_app};
-use crate::model::Metric;
+use crate::{
+    language::Language,
+    model::{Metric, readings},
+};
 
 const CLASS: PCWSTR = w!("WindowsMonitor.MetricsEditor");
 const PREVIEW_CLASS: PCWSTR = w!("WindowsMonitor.MetricsPreview");
@@ -40,11 +43,7 @@ const TEXT_SIZE: usize = 14;
 const DENSITY: usize = 15;
 const GRIP_COLUMN: usize = 1;
 const GRIP_WIDTH: i32 = 24;
-const DENSITY_OPTIONS: [(Density, PCWSTR); 3] = [
-    (Density::Standard, w!("标准")),
-    (Density::Compact, w!("紧凑")),
-    (Density::Tight, w!("更紧凑")),
-];
+const DENSITY_OPTIONS: [Density; 3] = [Density::Standard, Density::Compact, Density::Tight];
 
 thread_local! {
     static EDITOR: RefCell<Option<Editor>> = const { RefCell::new(None) };
@@ -145,7 +144,7 @@ pub fn open(owner: HWND) -> Result<()> {
         CreateWindowExW(
             EX_STYLE,
             CLASS,
-            w!("编辑监控项"),
+            PCWSTR::null(),
             EDITOR_STYLE,
             work.left + (work.right - work.left - width) / 2,
             work.top + (work.bottom - work.top - height) / 2,
@@ -202,13 +201,7 @@ fn register_class(
 
 impl Editor {
     fn new(hwnd: HWND, owner: HWND, display: DisplayOptions, layout: Layout) -> Result<Self> {
-        let hint = control(
-            hwnd,
-            WC_STATICW,
-            w!("勾选要显示的项目\r\n按住行首把手，上下拖动排序"),
-            0,
-            0,
-        )?;
+        let hint = control(hwnd, WC_STATICW, PCWSTR::null(), 0, 0)?;
         let list = control(
             hwnd,
             WC_LISTVIEWW,
@@ -224,14 +217,14 @@ impl Editor {
         let up = control(
             hwnd,
             WC_BUTTONW,
-            w!("上移"),
+            PCWSTR::null(),
             WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
             UP,
         )?;
         let down = control(
             hwnd,
             WC_BUTTONW,
-            w!("下移"),
+            PCWSTR::null(),
             WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
             DOWN,
         )?;
@@ -242,7 +235,7 @@ impl Editor {
             WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32,
             PREVIEW_MODE,
         )?;
-        let size_label = control(hwnd, WC_STATICW, w!("显示大小"), 0, 0)?;
+        let size_label = control(hwnd, WC_STATICW, PCWSTR::null(), 0, 0)?;
         let size = control(
             hwnd,
             WC_COMBOBOXW,
@@ -250,7 +243,7 @@ impl Editor {
             WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
             TEXT_SIZE,
         )?;
-        let density_label = control(hwnd, WC_STATICW, w!("紧凑度"), 0, 0)?;
+        let density_label = control(hwnd, WC_STATICW, PCWSTR::null(), 0, 0)?;
         let density = control(
             hwnd,
             WC_COMBOBOXW,
@@ -262,14 +255,14 @@ impl Editor {
         let apply = control(
             hwnd,
             WC_BUTTONW,
-            w!("应用"),
+            PCWSTR::null(),
             WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32,
             IDOK.0 as usize,
         )?;
         let cancel = control(
             hwnd,
             WC_BUTTONW,
-            w!("取消"),
+            PCWSTR::null(),
             WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
             IDCANCEL.0 as usize,
         )?;
@@ -299,14 +292,6 @@ impl Editor {
             columns.len(),
             columns.as_ptr() as isize,
         );
-        send(mode, CB_ADDSTRING, 0, w!("浮窗预览").as_ptr() as isize);
-        send(mode, CB_ADDSTRING, 0, w!("任务栏预览").as_ptr() as isize);
-        send(
-            mode,
-            CB_SETCURSEL,
-            usize::from(layout == Layout::Taskbar),
-            0,
-        );
         for pixels in TextSize::MIN..=TextSize::MAX {
             let text = format!("{pixels} px\0").encode_utf16().collect::<Vec<_>>();
             send(size, CB_ADDSTRING, 0, text.as_ptr() as isize);
@@ -317,12 +302,6 @@ impl Editor {
             (display.text_size.pixels() - TextSize::MIN) as usize,
             0,
         );
-        for (index, (choice, label)) in DENSITY_OPTIONS.into_iter().enumerate() {
-            send(density, CB_ADDSTRING, 0, label.as_ptr() as isize);
-            if choice == display.density {
-                send(density, CB_SETCURSEL, index, 0);
-            }
-        }
         let editor = Self {
             hwnd,
             owner,
@@ -338,7 +317,7 @@ impl Editor {
             preview,
             apply,
             cancel,
-            panel: Panel::new()?,
+            panel: Panel::new(display.language)?,
             display,
             layout,
             preview_dpi: window_dpi(hwnd),
@@ -347,8 +326,65 @@ impl Editor {
         for (index, metric) in display.metrics.ordered().into_iter().enumerate() {
             editor.write_item(index, metric, LVM_INSERTITEMW);
         }
+        editor.translate_controls();
         editor.select(0);
         Ok(editor)
+    }
+
+    fn translate_controls(&self) {
+        let language = self.display.language;
+        for (hwnd, text) in [
+            (
+                self.hwnd,
+                language.choose(w!("编辑监控项"), w!("Edit Metrics")),
+            ),
+            (
+                self.hint,
+                language.choose(
+                    w!("勾选要显示的项目\r\n按住行首把手，上下拖动排序"),
+                    w!("Choose metrics to display\r\nDrag the handles to reorder."),
+                ),
+            ),
+            (self.up, language.choose(w!("上移"), w!("Move Up"))),
+            (self.down, language.choose(w!("下移"), w!("Move Down"))),
+            (
+                self.size_label,
+                language.choose(w!("显示大小"), w!("Display Size")),
+            ),
+            (
+                self.density_label,
+                language.choose(w!("紧凑度"), w!("Density")),
+            ),
+            (self.apply, language.choose(w!("应用"), w!("Apply"))),
+            (self.cancel, language.choose(w!("取消"), w!("Cancel"))),
+        ] {
+            let _ = unsafe { SetWindowTextW(hwnd, text) };
+        }
+        send(self.mode, CB_RESETCONTENT, 0, 0);
+        for label in [
+            language.choose(w!("浮窗预览"), w!("Floating Preview")),
+            language.choose(w!("任务栏预览"), w!("Taskbar Preview")),
+        ] {
+            send(self.mode, CB_ADDSTRING, 0, label.as_ptr() as isize);
+        }
+        send(
+            self.mode,
+            CB_SETCURSEL,
+            usize::from(self.layout == Layout::Taskbar),
+            0,
+        );
+
+        send(self.density, CB_RESETCONTENT, 0, 0);
+        let labels = language.choose(
+            [w!("标准"), w!("紧凑"), w!("更紧凑")],
+            [w!("Standard"), w!("Compact"), w!("Tight")],
+        );
+        for (index, (choice, label)) in DENSITY_OPTIONS.into_iter().zip(labels).enumerate() {
+            send(self.density, CB_ADDSTRING, 0, label.as_ptr() as isize);
+            if choice == self.display.density {
+                send(self.density, CB_SETCURSEL, index, 0);
+            }
+        }
     }
 
     fn arrange(&mut self) {
@@ -500,7 +536,10 @@ impl Editor {
     }
 
     fn write_item(&self, index: usize, metric: Metric, message: u32) {
-        let mut label: Vec<_> = metric_name(metric).encode_utf16().chain([0]).collect();
+        let mut label: Vec<_> = metric_name(metric, self.display.language)
+            .encode_utf16()
+            .chain([0])
+            .collect();
         let item = LVITEMW {
             mask: LVIF_TEXT,
             iItem: index as i32,
@@ -827,6 +866,17 @@ pub fn refresh_preview() {
     }
 }
 
+pub fn set_language(language: Language) {
+    with_editor(|editor| {
+        editor.display.language = language;
+        editor.translate_controls();
+        for (index, metric) in editor.display.metrics.ordered().into_iter().enumerate() {
+            editor.write_item(index, metric, LVM_SETITEMW);
+        }
+        editor.arrange_preview();
+    });
+}
+
 unsafe extern "system" fn editor_proc(
     hwnd: HWND,
     message: u32,
@@ -876,7 +926,7 @@ unsafe extern "system" fn editor_proc(
             DENSITY if wparam.0 >> 16 == CBN_SELCHANGE as usize => {
                 with_editor(|editor| {
                     let index = send(editor.density, CB_GETCURSEL, 0, 0);
-                    if let Some(&(density, _)) = DENSITY_OPTIONS.get(index as usize) {
+                    if let Some(&density) = DENSITY_OPTIONS.get(index as usize) {
                         editor.display.density = density;
                         editor.arrange_preview();
                     }
@@ -965,7 +1015,7 @@ unsafe extern "system" fn preview_proc(
                 with_editor(|editor| {
                     if editor
                         .panel
-                        .set_label_bold(app.settings.label_bold)
+                        .set_label_style(editor.display.language, app.settings.label_bold)
                         .is_err()
                     {
                         return;
@@ -976,10 +1026,12 @@ unsafe extern "system" fn preview_proc(
                     } else {
                         Appearance::Solid { dark }
                     };
-                    let _ =
-                        editor
-                            .panel
-                            .paint(hwnd, editor.preview_dpi, appearance, &app.displayed);
+                    let localized = (editor.display.language != app.display.language)
+                        .then(|| readings(app.sample, app.total(), editor.display.language));
+                    let values = localized.as_ref().unwrap_or(&app.displayed);
+                    let _ = editor
+                        .panel
+                        .paint(hwnd, editor.preview_dpi, appearance, values);
                 });
             });
             unsafe {

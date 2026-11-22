@@ -4,19 +4,28 @@
 
 A desktop monitor for 64-bit Windows 10 version 1703 or later and Windows 11. Run `windows-monitor-x.exe` to get started. The app runs with the current Windows user's permissions and shows a centered loading indicator while it starts.
 
+## Screenshots
+
+**Floating panel**
+
+![English floating panel showing network rates, CPU, RAM, traffic and uptime](docs/images/panel-en-US.png)
+
+**Metrics editor**
+
+![English metrics editor with a live floating panel preview](docs/images/editor-en-US.png)
+
 ## Usage
 
-The menu labels below include the Chinese text shown in the app.
-
+- In Settings → Language (设置 → 语言), choose English, Simplified Chinese, or Use System Language. By default, the app uses Simplified Chinese on Chinese-language Windows and English on other systems. Language changes take effect immediately and are saved across restarts.
 - The floating panel starts in the bottom-right corner of the primary display's work area. Drag it to move it. It snaps to nearby screen edges.
-- Right-click the panel or the system tray icon and open Settings (设置) to configure startup, taskbar mode, always-on-top behavior, the refresh interval, and the theme. In Edit Metrics (编辑监控项), select the metrics to show, drag them to reorder them, and set the display size from 10 to 24 px (default 16 px). The size is based on 100% Windows scaling and follows the system DPI. You can preview both the floating and taskbar layouts. Click Apply (应用) to save your changes across restarts. The refresh interval can be set to 1, 2, 3, or 5 seconds and defaults to 1 second. The main context menu also lets you reset total traffic or exit. Click the tray icon to show or hide the panel.
-- Select Transparent (透明) under Settings (设置) → Theme (主题) to reveal the background behind the metrics. Text and column dividers automatically use white for a dark Windows taskbar and black for a light one. Right-click anywhere inside the panel or on the tray icon to open the menu.
-- In Edit Metrics → Density (编辑监控项 → 紧凑度), choose Standard (标准), Compact (紧凑), or Tight (更紧凑). This setting adjusts column spacing and side padding in both layouts.
-- Bold Labels (标签加粗) in Settings is on by default. Clear the checkmark to use regular-weight metric labels in both layouts. The setting is saved across restarts.
-- Enable Settings → Run at Sign-in (设置 → 开机自启) to start the monitor when the current Windows user signs in. This option is off by default. If you move the executable, use the same menu option to update the startup path.
-- Enable Embed in Taskbar (嵌入任务栏) to fit the compact panel into available space on the primary display's horizontal taskbar. Under Settings → Taskbar Position (设置 → 任务栏位置), select Left (靠左) or Right (靠右). The default is Right. The panel floats when the taskbar has too little space, is set to auto-hide, or is vertical. The refresh interval, taskbar mode, and taskbar position are saved across restarts.
-- Right-click the panel or tray icon and select About (关于) to see the current version. Click Visit GitHub (访问 GitHub) to open the project repository in your default browser.
-- Use Settings → Check for Updates (设置 → 检查更新) to check GitHub for the latest stable release. After confirmation, the app verifies the download's SHA-256 digest, replaces the executable, and restarts. Updating requires write access to the directory containing the executable. [GitHub Releases](https://github.com/Fracizz/windows-monitor-x/releases)
+- Right-click the panel or the system tray icon and open Settings to configure startup, taskbar mode, always-on-top behavior, the refresh interval, and the theme. In Edit Metrics, select the metrics to show, drag them to reorder them, and set the display size from 10 to 24 px (default 16 px). The size is based on 100% Windows scaling and follows the system DPI. You can preview both the floating and taskbar layouts. Click Apply to save your changes across restarts. The refresh interval can be set to 1, 2, 3, or 5 seconds and defaults to 1 second. The main context menu also lets you reset total traffic or exit. Click the tray icon to show or hide the panel.
+- Select Transparent under Settings → Theme to reveal the background behind the metrics. Text and column dividers automatically use white for a dark Windows taskbar and black for a light one. Right-click anywhere inside the panel or on the tray icon to open the menu.
+- In Edit Metrics → Density, choose Standard, Compact, or Tight. This setting adjusts column spacing and side padding in both layouts.
+- Bold Labels in Settings is on by default. Clear the checkmark to use regular-weight metric labels in both layouts. The setting is saved across restarts.
+- Enable Settings → Run at Sign-in to start the monitor when the current Windows user signs in. This option is off by default. If you move the executable, use the same menu option to update the startup path.
+- Enable Embed in Taskbar to fit the compact panel into available space on the primary display's horizontal taskbar. Under Settings → Taskbar Position, select Left or Right. The default is Right. The panel floats when the taskbar has too little space, is set to auto-hide, or is vertical. The refresh interval, taskbar mode, and taskbar position are saved across restarts.
+- Right-click the panel or tray icon and select About to see the current version. Click Visit GitHub to open the project repository in your default browser.
+- Use Settings → Check for Updates to check GitHub for the latest stable release. After confirmation, the app verifies the download's SHA-256 digest, replaces the executable, and restarts. Updating requires write access to the directory containing the executable. [GitHub Releases](https://github.com/Fracizz/windows-monitor-x/releases)
 
 ## Metrics
 
