@@ -21,9 +21,10 @@ use ::windows::{
 
 use super::{
     ABOUT, AUTOSTART, CHECK_UPDATE, DARK, DOCK, DOCK_LEFT, DOCK_RIGHT, EDIT_METRICS, EXIT,
-    FOLLOW_SYSTEM, LABEL_BOLD, LANGUAGE_CHINESE, LANGUAGE_ENGLISH, LANGUAGE_SYSTEM, LIGHT,
-    OPEN_HISTORY, PRODUCT_NAME, REFRESH_OPTIONS, RESET_TRAFFIC, TOGGLE, TOPMOST, TRANSPARENT_THEME,
-    Window, command, control, metric_name, position, register_class, scale, send,
+    EXPORT_HISTORY, FOLLOW_SYSTEM, LABEL_BOLD, LANGUAGE_CHINESE, LANGUAGE_ENGLISH, LANGUAGE_SYSTEM,
+    LIGHT, PRODUCT_NAME, RECORD_HISTORY, REFRESH_OPTIONS, RESET_TRAFFIC, TOGGLE, TOPMOST,
+    TRANSPARENT_THEME, Window, command, control, metric_name, position, register_class, scale,
+    send,
     startup::{self, Status},
     state::{LanguagePreference, TaskbarSide, Theme},
     taskbar::Placement,
@@ -70,7 +71,8 @@ struct Manager {
     refresh: (HWND, HWND),
     language_select: (HWND, HWND),
     edit: HWND,
-    history: HWND,
+    export_history: HWND,
+    record_history: HWND,
     autostart: HWND,
     reset: HWND,
     update: HWND,
@@ -232,11 +234,12 @@ impl Manager {
         let taskbar_position = combo(SELECT_POSITION)?;
         let theme = combo(SELECT_THEME)?;
         let edit = push(EDIT_METRICS)?;
-        let history = push(OPEN_HISTORY)?;
+        let export_history = push(EXPORT_HISTORY)?;
         let app_group = group()?;
         let refresh = combo(SELECT_REFRESH)?;
         let language_select = combo(SELECT_LANGUAGE)?;
         let autostart = check(AUTOSTART)?;
+        let record_history = check(RECORD_HISTORY)?;
         let live_heading = static_text()?;
         let live_list = control(
             hwnd,
@@ -289,7 +292,8 @@ impl Manager {
             refresh,
             language_select,
             edit,
-            history,
+            export_history,
+            record_history,
             autostart,
             reset: push(RESET_TRAFFIC)?,
             update: push(CHECK_UPDATE)?,
@@ -331,7 +335,11 @@ impl Manager {
             (self.refresh.0, w!("刷新频率"), w!("Refresh Interval")),
             (self.language_select.0, w!("语言"), w!("Language")),
             (self.edit, w!("编辑监控项…"), w!("Edit Metrics…")),
-            (self.history, w!("历史记录…"), w!("History…")),
+            (
+                self.record_history,
+                w!("记录监控数据"),
+                w!("Record History"),
+            ),
             (self.reset, w!("清零总流量"), w!("Reset Total Traffic")),
             (self.about, w!("关于…"), w!("About…")),
             (self.exit, w!("退出程序"), w!("Exit App")),
@@ -404,6 +412,7 @@ impl Manager {
             (self.dock, settings.taskbar),
             (self.bold, settings.label_bold),
             (self.autostart, startup == Some(Status::Enabled)),
+            (self.record_history, settings.record_history),
         ] {
             send(control, BM_SETCHECK, usize::from(checked), 0);
         }
@@ -419,6 +428,14 @@ impl Manager {
             },
         );
         set_text(
+            self.export_history,
+            if app.history_exporting {
+                language.choose(w!("正在导出…"), w!("Exporting…"))
+            } else {
+                language.choose(w!("导出 JSON…"), w!("Export JSON…"))
+            },
+        );
+        set_text(
             self.update,
             if app.update.is_some() {
                 language.choose(w!("正在检查或下载…"), w!("Updating…"))
@@ -429,6 +446,7 @@ impl Manager {
         unsafe {
             let _ = EnableWindow(self.show_panel, app.tray_ready);
             let _ = EnableWindow(self.update, app.update.is_none());
+            let _ = EnableWindow(self.export_history, !app.history_exporting);
         }
         send(
             self.taskbar_position.1,
@@ -467,27 +485,33 @@ impl Manager {
 
     fn update_status(&mut self, app: &super::App) {
         let language = app.settings.display.language;
-        let status = if !app.shown {
-            language.choose(w!("监控面板已隐藏"), w!("Monitor panel hidden"))
-        } else if app.waiting_sample {
-            language.choose(w!("正在读取监控数据…"), w!("Collecting the first sample…"))
-        } else {
-            match app.placement {
-                Some(Placement::Docked(_)) => language.choose(
-                    w!("监控面板已嵌入任务栏"),
-                    w!("Monitor panel embedded in the taskbar"),
-                ),
-                Some(Placement::Hidden) => language.choose(
-                    w!("任务栏被覆盖，监控面板暂时隐藏"),
-                    w!("Monitor panel hidden while the taskbar is covered"),
-                ),
-                _ if app.settings.taskbar => language.choose(
-                    w!("当前为浮窗，正在等待任务栏空位"),
-                    w!("Floating panel · Waiting for taskbar space"),
-                ),
-                _ => language.choose(w!("监控面板以浮窗显示"), w!("Monitor panel floating")),
-            }
-        };
+        let status =
+            if app.settings.record_history && app.feed.lock().unwrap().history_error.is_some() {
+                language.choose(
+                    w!("无法写入监控记录"),
+                    w!("Could not record monitoring history"),
+                )
+            } else if !app.shown {
+                language.choose(w!("监控面板已隐藏"), w!("Monitor panel hidden"))
+            } else if app.waiting_sample {
+                language.choose(w!("正在读取监控数据…"), w!("Collecting the first sample…"))
+            } else {
+                match app.placement {
+                    Some(Placement::Docked(_)) => language.choose(
+                        w!("监控面板已嵌入任务栏"),
+                        w!("Monitor panel embedded in the taskbar"),
+                    ),
+                    Some(Placement::Hidden) => language.choose(
+                        w!("任务栏被覆盖，监控面板暂时隐藏"),
+                        w!("Monitor panel hidden while the taskbar is covered"),
+                    ),
+                    _ if app.settings.taskbar => language.choose(
+                        w!("当前为浮窗，正在等待任务栏空位"),
+                        w!("Floating panel · Waiting for taskbar space"),
+                    ),
+                    _ => language.choose(w!("监控面板以浮窗显示"), w!("Monitor panel floating")),
+                }
+            };
         if status != self.status_text {
             set_text(self.status, status);
             self.status_text = status;
@@ -580,8 +604,21 @@ impl Manager {
             set(field, column, y, panel_width / 2 - 14, 150);
         }
         set(self.edit, inside, 219 - compact / 2, 136, 28);
-        set(self.history, inside + 146, 219 - compact / 2, 116, 28);
-        set(self.autostart, inside, 347 - compact, panel_width - 28, 24);
+        set(
+            self.export_history,
+            inside + 146,
+            219 - compact / 2,
+            116,
+            28,
+        );
+        set(self.autostart, inside, 347 - compact, 172, 24);
+        set(
+            self.record_history,
+            inside + 174,
+            347 - compact,
+            panel_width - 202,
+            24,
+        );
 
         let live_width = (right - live_x).max(1);
         set(self.live_heading, live_x, 80, live_width, 24);
@@ -644,7 +681,8 @@ impl Manager {
             self.language_select.0,
             self.language_select.1,
             self.edit,
-            self.history,
+            self.export_history,
+            self.record_history,
             self.autostart,
             self.reset,
             self.update,
@@ -768,8 +806,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             let selection = match (id, notification) {
                 (id, CBN_SELCHANGE) => selected(source, id),
                 (
-                    TOGGLE | TOPMOST | DOCK | LABEL_BOLD | EDIT_METRICS | OPEN_HISTORY | AUTOSTART
-                    | RESET_TRAFFIC | CHECK_UPDATE | ABOUT | EXIT,
+                    TOGGLE | TOPMOST | DOCK | LABEL_BOLD | EDIT_METRICS | EXPORT_HISTORY
+                    | RECORD_HISTORY | AUTOSTART | RESET_TRAFFIC | CHECK_UPDATE | ABOUT | EXIT,
                     BN_CLICKED,
                 ) if !source.is_invalid() => Some(id),
                 _ => None,

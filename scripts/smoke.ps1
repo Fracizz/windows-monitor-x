@@ -34,6 +34,8 @@ namespace MonitorSmoke {
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern IntPtr FindWindow(string className, IntPtr title);
+        [DllImport("user32.dll", EntryPoint = "FindWindowW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        public static extern IntPtr FindWindowByTitle(string className, string title);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int capacity);
         [DllImport("user32.dll")]
@@ -250,13 +252,24 @@ try {
     Send-ManagerControl 101
     Wait-For { -not [MonitorSmoke.Native]::IsWindowVisible($window) } 'The manager did not hide the panel.'
 
+    Send-ManagerControl 126
+    Wait-For { Test-Setting 'record_history=true' } 'Recording could not be enabled from the manager.'
+    Wait-For {
+        $sample = Get-ChildItem -LiteralPath (Join-Path $testData 'WindowsMonitor\history-v1') -Filter '*.bin' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if (-not $sample) { return $false }
+        $stream = [IO.File]::Open($sample.FullName, 'Open', 'Read', [IO.FileShare]::ReadWrite)
+        try { $stream.Length -gt 0 } finally { $stream.Dispose() }
+    } 'No monitoring sample was recorded.'
     Send-ManagerControl 124
     Wait-For {
-        $script:historyWindow = [MonitorSmoke.Native]::FindWindow('WindowsMonitor.History', [intptr]::Zero)
-        $historyWindow -ne [intptr]::Zero -and [MonitorSmoke.Native]::IsWindowVisible($historyWindow)
-    } 'History did not open from the manager.'
-    Assert-True ([MonitorSmoke.Native]::PostMessageW($historyWindow, 0x10, [uintptr]0, [intptr]::Zero)) 'Closing History failed.'
-    Wait-For { [MonitorSmoke.Native]::FindWindow('WindowsMonitor.History', [intptr]::Zero) -eq [intptr]::Zero } 'History did not close.'
+        $script:exportDialog = [MonitorSmoke.Native]::FindWindowByTitle('#32770', 'Export Monitoring History')
+        $exportDialog -ne [intptr]::Zero -and [MonitorSmoke.Native]::IsWindowVisible($exportDialog)
+    } 'The JSON export save dialog did not open.'
+    Assert-True ([MonitorSmoke.Native]::PostMessageW($exportDialog, 0x111, [uintptr]2, [intptr]::Zero)) 'Canceling JSON export failed.'
+    Wait-For { [MonitorSmoke.Native]::FindWindowByTitle('#32770', 'Export Monitoring History') -eq [intptr]::Zero } 'The JSON export save dialog did not close.'
+    Send-ManagerControl 126
+    Wait-For { Test-Setting 'record_history=false' } 'Recording could not be paused from the manager.'
     Send-ManagerControl 101
     Wait-For { [MonitorSmoke.Native]::IsWindowVisible($window) } 'The manager did not show the panel again.'
 

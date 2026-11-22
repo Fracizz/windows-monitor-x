@@ -1,8 +1,12 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, Read, Write},
+    io::{self, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+use serde::{Serialize, Serializer, ser::SerializeMap};
 
 use crate::model::{Metric, Sample};
 
@@ -11,7 +15,7 @@ const HOUR: u64 = 60 * 60 * 1_000;
 // Change the versioned history directory if the order or layout of stored values changes.
 const STORED_METRICS: [Metric; 16] = Metric::ALL;
 const RECORD_SIZE: usize = (2 + STORED_METRICS.len()) * 8;
-pub const COLUMNS: usize = 960;
+static NEXT_EXPORT: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(windows)]
 pub fn now_ms() -> u64 {
@@ -20,20 +24,6 @@ pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() as u64)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Range {
-    pub start: u64,
-    pub end: u64,
-}
-
-impl Range {
-    pub fn recent(start: u64, end: u64, now: u64) -> Option<Self> {
-        let start = start.max(now.saturating_sub(RETENTION));
-        let end = end.min(now);
-        (start <= end).then_some(Self { start, end })
-    }
 }
 
 pub fn prune(directory: &Path, now: u64) -> io::Result<()> {
@@ -147,42 +137,80 @@ fn values(sample: Sample, traffic: u64) -> [Option<f64>; Metric::ALL.len()] {
     })
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Column {
-    pub first: f64,
-    pub last: f64,
-    pub min: f64,
-    pub max: f64,
-    pub join: Option<usize>,
+pub fn export_json(directory: &Path, destination: &Path, now: u64) -> io::Result<u64> {
+    let export = NEXT_EXPORT.fetch_add(1, Ordering::Relaxed);
+    let temporary = destination.with_file_name(format!(
+        ".windows-monitor-export-{}-{now}-{export}.tmp",
+        std::process::id()
+    ));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        let mut output = BufWriter::new(file);
+        let count = write_json(directory, now, &mut output)?;
+        output.flush()?;
+        drop(output);
+        fs::rename(&temporary, destination)?;
+        Ok(count)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
-pub struct Series {
-    pub range: Range,
-    pub columns: Vec<Option<Column>>,
-    pub count: u64,
-    pub min: f64,
-    pub max: f64,
-    sum: f64,
+#[derive(Serialize)]
+struct ExportSample {
+    timestamp_ms: u64,
+    interval_ms: u64,
+    #[serde(serialize_with = "serialize_metrics")]
+    metrics: [Option<f64>; STORED_METRICS.len()],
 }
 
-impl Series {
-    pub fn average(&self) -> f64 {
-        self.sum / self.count as f64
+fn serialize_metrics<S: Serializer>(
+    values: &[Option<f64>; STORED_METRICS.len()],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut map = serializer.serialize_map(Some(values.len()))?;
+    for (metric, value) in STORED_METRICS.into_iter().zip(values) {
+        map.serialize_entry(metric.key(), value)?;
+    }
+    map.end()
+}
+
+fn unit(metric: Metric) -> &'static str {
+    match metric {
+        Metric::Upload | Metric::Download | Metric::DiskRead | Metric::DiskWrite => {
+            "bytes_per_second"
+        }
+        Metric::Traffic | Metric::AvailableMemory | Metric::UsedMemory | Metric::UsedGpuMemory => {
+            "bytes"
+        }
+        Metric::CpuFrequency => "megahertz",
+        Metric::Uptime => "seconds",
+        Metric::Cpu
+        | Metric::Memory
+        | Metric::Disk
+        | Metric::Battery
+        | Metric::AvailableMemoryPercent
+        | Metric::GpuMemoryPercent => "percent",
     }
 }
 
-pub fn query(directory: &Path, range: Range, metric: Metric) -> io::Result<Series> {
-    let mut data = Series {
-        range,
-        columns: vec![None; COLUMNS],
-        count: 0,
-        min: f64::INFINITY,
-        max: 0.0,
-        sum: 0.0,
-    };
-    let mut previous: Option<(u64, u64, usize)> = None;
-    let offset = 16 + 8 * metric.index();
-    for hour in (range.start / HOUR)..=(range.end / HOUR) {
+fn write_json(directory: &Path, now: u64, output: &mut impl Write) -> io::Result<u64> {
+    let start = now.saturating_sub(RETENTION);
+    let units: BTreeMap<_, _> = STORED_METRICS
+        .into_iter()
+        .map(|metric| (metric.key(), unit(metric)))
+        .collect();
+    output.write_all(br#"{"schema_version":1,"units":"#)?;
+    serde_json::to_writer(&mut *output, &units)?;
+    output.write_all(b",\"samples\":[\n")?;
+
+    let mut count = 0;
+    for hour in (start / HOUR)..=(now / HOUR) {
         let file = match File::open(hour_path(directory, hour)) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -196,45 +224,32 @@ pub fn query(directory: &Path, range: Range, metric: Metric) -> io::Result<Serie
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error),
             }
-            let time = u64::from_le_bytes(record[..8].try_into().unwrap());
-            if time < range.start || time > range.end {
+            let timestamp_ms = u64::from_le_bytes(record[..8].try_into().unwrap());
+            if timestamp_ms < start || timestamp_ms > now {
                 continue;
             }
-            let cadence = u64::from_le_bytes(record[8..16].try_into().unwrap());
-            let value = f64::from_le_bytes(record[offset..offset + 8].try_into().unwrap());
-            if !value.is_finite() || value < 0.0 {
-                previous = None;
-                continue;
+            let interval_ms = u64::from_le_bytes(record[8..16].try_into().unwrap());
+            let metrics = std::array::from_fn(|index| {
+                let offset = 16 + 8 * index;
+                let value = f64::from_le_bytes(record[offset..offset + 8].try_into().unwrap());
+                (value.is_finite() && value >= 0.0).then_some(value)
+            });
+            if count != 0 {
+                output.write_all(b",\n")?;
             }
-            data.count += 1;
-            data.min = data.min.min(value);
-            data.max = data.max.max(value);
-            data.sum += value;
-            let index = ((time - range.start) * (COLUMNS as u64 - 1)
-                / (range.end - range.start).max(1)) as usize;
-            let column = &mut data.columns[index];
-            if let Some(column) = column {
-                column.last = value;
-                column.min = column.min.min(value);
-                column.max = column.max.max(value);
-            } else {
-                let join = previous.and_then(|(last, last_cadence, last_index)| {
-                    let tolerance = last_cadence.max(cadence).min(5_000) * 2;
-                    (cadence > 0 && last_index < index && time - last <= tolerance)
-                        .then_some(last_index)
-                });
-                *column = Some(Column {
-                    first: value,
-                    last: value,
-                    min: value,
-                    max: value,
-                    join,
-                });
-            }
-            previous = Some((time, cadence, index));
+            serde_json::to_writer(
+                &mut *output,
+                &ExportSample {
+                    timestamp_ms,
+                    interval_ms,
+                    metrics,
+                },
+            )?;
+            count += 1;
         }
     }
-    Ok(data)
+    output.write_all(b"\n]}\n")?;
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -263,20 +278,10 @@ mod tests {
     }
 
     #[test]
-    fn history_reopens_filters_at_the_exact_cutoff_and_prunes_old_files() {
+    fn exports_existing_records_with_the_exact_retention_cutoff() {
         let dir = TestDir::new();
         let now = RETENTION + 2 * HOUR + 15;
         let cutoff = now - RETENTION;
-        let range = Range::recent(0, now + HOUR, now).unwrap();
-        assert_eq!(
-            range,
-            Range {
-                start: cutoff,
-                end: now
-            }
-        );
-        assert!(Range::recent(now + 1, now + HOUR, now).is_none());
-        assert!(Range::recent(0, cutoff - 1, now).is_none());
         let mut writer = Writer::new(dir.0.clone());
         for time in [HOUR, cutoff - 1, cutoff, now - 10] {
             writer.record(time, 1_000, Sample::default(), 17).unwrap();
@@ -289,75 +294,42 @@ mod tests {
             .unwrap()
             .write_all(&[1, 2, 3])
             .unwrap();
-        assert_eq!(query(&dir.0, range, Metric::Traffic).unwrap().count, 2);
-        Writer::new(dir.0.clone())
-            .record(now, 1_000, Sample::default(), 20)
-            .unwrap();
+        let destination = dir.0.join("export.json");
+        assert_eq!(export_json(&dir.0, &destination, now).unwrap(), 2);
+
+        let sample = Sample {
+            cpu: Some(42.5),
+            ..Default::default()
+        };
+        let mut writer = Writer::new(dir.0.clone());
+        writer.record(now, 0, sample, 20).unwrap();
+        writer.record(now + 1, 1_000, sample, 22).unwrap();
+        drop(writer);
         prune(&dir.0, now).unwrap();
         assert!(!hour_path(&dir.0, 1).exists());
-        let data = query(&dir.0, range, Metric::Traffic).unwrap();
-        assert_eq!(data.range, range);
-        assert_eq!(data.count, 3);
-        assert_eq!((data.min, data.average(), data.max), (17.0, 18.0, 20.0));
+        assert_eq!(export_json(&dir.0, &destination, now).unwrap(), 3);
+        let data: serde_json::Value =
+            serde_json::from_reader(File::open(destination).unwrap()).unwrap();
+        assert_eq!(data["schema_version"], 1);
+        assert_eq!(data["units"]["cpu"], "percent");
+        assert_eq!(data["units"]["traffic"], "bytes");
+        let samples = data["samples"].as_array().unwrap();
+        assert_eq!(samples[0]["timestamp_ms"], cutoff);
+        assert_eq!(samples[0]["interval_ms"], 1_000);
+        assert!(samples[0]["metrics"]["cpu"].is_null());
+        assert_eq!(samples[2]["timestamp_ms"], now);
+        assert_eq!(samples[2]["interval_ms"], 0);
+        assert_eq!(samples[2]["metrics"]["traffic"], 20.0);
+        assert_eq!(samples[2]["metrics"]["cpu"], 42.5);
+        assert_eq!(samples.len(), 3);
     }
 
     #[test]
-    fn chart_keeps_extrema_and_breaks_at_missing_samples_or_restarts() {
+    fn empty_history_exports_an_empty_samples_array() {
         let dir = TestDir::new();
-        let mut writer = Writer::new(dir.0.clone());
-        for (time, cadence, cpu) in [
-            (0, 0, Some(0.5)),
-            (1_000, 1_000, Some(99.75)),
-            (2_000, 1_000, Some(10.0)),
-            (3_000, 1_000, None),
-            (4_000, 1_000, Some(40.0)),
-            (5_000, 0, Some(50.0)),
-            (6_000, 1_000, Some(60.0)),
-            (20_000, 1_000, Some(20.0)),
-        ] {
-            writer
-                .record(
-                    time,
-                    cadence,
-                    Sample {
-                        cpu,
-                        ..Default::default()
-                    },
-                    0,
-                )
-                .unwrap();
-        }
-        let second = query(
-            &dir.0,
-            Range {
-                start: 0,
-                end: 20_000,
-            },
-            Metric::Cpu,
-        )
-        .unwrap();
-        let columns: Vec<_> = second.columns.iter().flatten().collect();
-        assert_eq!(second.count, 7);
-        assert_eq!(
-            columns
-                .iter()
-                .map(|column| column.join.is_some())
-                .collect::<Vec<_>>(),
-            [false, true, true, false, false, true, false]
-        );
-        let week = query(
-            &dir.0,
-            Range {
-                start: 0,
-                end: RETENTION,
-            },
-            Metric::Cpu,
-        )
-        .unwrap();
-        let first = week.columns[0].unwrap();
-        assert_eq!(
-            (first.first, first.min, first.max, first.last),
-            (0.5, 0.5, 99.75, 20.0)
-        );
+        let mut output = Vec::new();
+        assert_eq!(write_json(&dir.0, 5_000, &mut output).unwrap(), 0);
+        let data: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(data["samples"], serde_json::json!([]));
     }
 }

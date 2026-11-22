@@ -1,6 +1,6 @@
 mod about;
 mod editor;
-mod history_window;
+mod history_export;
 mod manager;
 mod panel;
 mod panel_input;
@@ -83,6 +83,7 @@ const DOCK_READY: u32 = WM_APP + 4;
 const UPDATE_READY: u32 = WM_APP + 5;
 const DOCK_Z_ORDER_CHECK: u32 = WM_APP + 6;
 const HISTORY_STATUS: u32 = WM_APP + 7;
+const HISTORY_EXPORTED: u32 = WM_APP + 8;
 const TRAY_ID: u32 = 1;
 const ICON_ID: PCWSTR = PCWSTR(101usize as *const u16);
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
@@ -110,8 +111,9 @@ const ABOUT: usize = 120;
 const LANGUAGE_SYSTEM: usize = 121;
 const LANGUAGE_CHINESE: usize = 122;
 const LANGUAGE_ENGLISH: usize = 123;
-const OPEN_HISTORY: usize = 124;
+const EXPORT_HISTORY: usize = 124;
 const OPEN_MANAGER: usize = 125;
+const RECORD_HISTORY: usize = 126;
 const REFRESH_OPTIONS: [(usize, Refresh); 4] = [
     (109, Refresh::One),
     (110, Refresh::Two),
@@ -128,6 +130,7 @@ struct Mailbox {
     sample: Option<Sample>,
     dock: Option<(u64, Placement)>,
     history_error: Option<String>,
+    history_export: Option<io::Result<u64>>,
 }
 
 type Feed = Arc<Mutex<Mailbox>>;
@@ -168,6 +171,7 @@ struct App {
     save_pending: bool,
     paint_error: Option<Error>,
     update: Option<mpsc::Receiver<updater::Event>>,
+    history_exporting: bool,
 }
 
 impl App {
@@ -218,6 +222,7 @@ impl App {
             save_pending: false,
             paint_error: None,
             update: None,
+            history_exporting: false,
         }
     }
 
@@ -853,7 +858,6 @@ pub fn run() -> Result<()> {
             0 => return Ok(()),
             _ => {
                 if editor::handle_dialog_message(&message)
-                    || history_window::handle_dialog_message(&message)
                     || manager::handle_dialog_message(&message)
                 {
                     continue;
@@ -1144,7 +1148,8 @@ unsafe extern "system" fn window_proc(
             }
         }
         UPDATE_READY => finish_update(hwnd),
-        HISTORY_STATUS => history_window::refresh_capture_status(),
+        HISTORY_STATUS => manager::refresh_settings(),
+        HISTORY_EXPORTED => finish_history_export(hwnd),
         REVEAL_WINDOW => {
             with_app(|app| app.shown = true);
             apply_visibility(hwnd);
@@ -1622,8 +1627,8 @@ fn make_menu(
     )?;
     menu.separator()?;
     menu.item(
-        OPEN_HISTORY,
-        language.choose(w!("历史记录…"), w!("History…")),
+        EXPORT_HISTORY,
+        language.choose(w!("导出监控记录（JSON）…"), w!("Export History (JSON)…")),
         MF_ENABLED,
     )?;
     menu.item(
@@ -1842,7 +1847,6 @@ fn set_language(hwnd: HWND, preference: LanguagePreference) {
         set_thread_language(language);
         set_display(hwnd, display);
         editor::set_language(language);
-        history_window::set_language(language);
     }
 }
 
@@ -1925,6 +1929,74 @@ fn show_warning(hwnd: Option<HWND>, heading: &str, error: &impl std::fmt::Displa
     unsafe { MessageBoxW(hwnd, &text, app_title(), MB_OK | MB_ICONWARNING) };
 }
 
+fn start_history_export(hwnd: HWND, owner: HWND) {
+    let Some(feed) = with_app(|app| {
+        if app.history_exporting {
+            return None;
+        }
+        app.history_exporting = true;
+        Some(app.feed.clone())
+    })
+    .flatten() else {
+        return;
+    };
+    let language = ui_language();
+    let started = (|| -> io::Result<bool> {
+        let Some(path) = history_export::destination(owner, language)? else {
+            return Ok(false);
+        };
+        let directory = history_directory()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA"))?;
+        let handle = hwnd.0 as usize;
+        thread::Builder::new()
+            .name("monitor-history-export".into())
+            .spawn(move || {
+                let result = history::export_json(&directory, &path, history::now_ms());
+                feed.lock().unwrap().history_export = Some(result);
+                notify(HWND(handle as *mut _), HISTORY_EXPORTED);
+            })?;
+        Ok(true)
+    })();
+    if !matches!(started, Ok(true)) {
+        with_app(|app| app.history_exporting = false);
+    }
+    if let Err(error) = started {
+        show_history_export_error(owner, &error);
+    }
+}
+
+fn finish_history_export(hwnd: HWND) {
+    let result = with_app(|app| {
+        let result = app.feed.lock().unwrap().history_export.take();
+        if result.is_some() {
+            app.history_exporting = false;
+        }
+        result
+    })
+    .flatten();
+    manager::refresh_settings();
+    let owner = manager::dialog_owner(hwnd);
+    match result {
+        Some(Ok(count)) => {
+            let text = HSTRING::from(ui_language().choose(
+                format!("已导出 {count} 条监控记录。"),
+                format!("Exported {count} monitoring samples."),
+            ));
+            unsafe { MessageBoxW(Some(owner), &text, app_title(), MB_OK | MB_ICONINFORMATION) };
+        }
+        Some(Err(error)) => show_history_export_error(owner, &error),
+        None => {}
+    }
+}
+
+fn show_history_export_error(owner: HWND, error: &io::Error) {
+    show_warning(
+        Some(owner),
+        ui_language().choose("无法导出监控记录。", "Could not export monitoring history."),
+        error,
+    );
+}
+
 fn command(hwnd: HWND, selection: usize) {
     let owner = manager::dialog_owner(hwnd);
     match selection {
@@ -1941,14 +2013,15 @@ fn command(hwnd: HWND, selection: usize) {
             }
             return;
         }
-        OPEN_HISTORY => {
-            if let Err(error) = history_window::open(hwnd, owner) {
-                show_warning(
-                    Some(owner),
-                    ui_language().choose("无法打开历史记录。", "History could not be opened."),
-                    &error,
-                );
-            }
+        EXPORT_HISTORY => start_history_export(hwnd, owner),
+        RECORD_HISTORY => {
+            with_app(|app| {
+                app.settings.record_history = !app.settings.record_history;
+                let _ = app
+                    .worker
+                    .send(WorkerCommand::RecordHistory(app.settings.record_history));
+                app.save();
+            });
         }
         ABOUT => {
             if let Err(error) = about::open(owner) {
@@ -2213,7 +2286,7 @@ mod tests {
             assert_eq!(GetMenuItemCount(Some(menu.0)), 8);
             assert_eq!(GetMenuItemID(menu.0, 0), OPEN_MANAGER as u32);
             assert_eq!(GetMenuItemID(menu.0, 1), TOGGLE as u32);
-            assert_eq!(GetMenuItemID(menu.0, 4), OPEN_HISTORY as u32);
+            assert_eq!(GetMenuItemID(menu.0, 4), EXPORT_HISTORY as u32);
             assert_eq!(GetMenuItemID(menu.0, 6), ABOUT as u32);
             assert_eq!(GetMenuItemID(menu.0, 7), EXIT as u32);
             let settings = GetSubMenu(menu.0, 2);
