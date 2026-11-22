@@ -24,6 +24,12 @@
 
 ## 界面截图
 
+**浅色浮窗**
+
+![浅色浮窗显示实时网速、CPU 使用率、内存、磁盘活动率和累计流量](docs/images/panel-light-zh-CN.png)
+
+**监控项编辑器**
+
 ![监控项编辑器和实时浮窗预览](docs/images/editor-zh-CN.png)
 
 ## 监控指标

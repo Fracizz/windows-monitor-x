@@ -24,6 +24,12 @@ Keep live network speeds, CPU and memory use, disk activity, and traffic totals 
 
 ## Screenshots
 
+**Floating panel in the light theme (Simplified Chinese)**
+
+![Light-theme floating panel showing network speeds, CPU usage, memory, disk activity, and total traffic](docs/images/panel-light-zh-CN.png)
+
+**Metrics editor**
+
 ![Metrics editor with a live preview of the floating panel](docs/images/editor-en-US.png)
 
 ## Metrics
