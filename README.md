@@ -1,49 +1,48 @@
 # windows-monitor-x
 
-简体中文 · [English](README.en.md)
+**English** · [简体中文](README.zh-CN.md)
 
-面向 Windows 10 1703 及以上和 Windows 11 x64 的桌面监控工具。运行 `windows-monitor-x.exe` 即可使用。程序使用当前 Windows 用户权限运行，启动时会先在屏幕中央显示加载状态。
+Keep live network speeds, CPU and memory use, disk activity, and traffic totals visible in a floating panel or in the Windows taskbar. Choose which metrics to show and arrange them to fit your desktop.
 
-## 界面截图
+[Download for Windows x64](https://github.com/Fracizz/windows-monitor-x/releases/latest) · [Quick start](#quick-start) · [Metrics](#metrics)
 
-**浮窗**
+![Floating panel showing network speeds, CPU, memory, traffic, and uptime](docs/images/panel-en-US.png)
 
-![简体中文浮窗，显示网速、CPU、内存、累计流量和运行时长](docs/images/panel-zh-CN.png)
+## Quick start
 
-**监控项编辑器**
+1. Download and run `windows-monitor-x.exe`. It runs as your Windows user on 64-bit Windows 10 version 1703 and later, and Windows 11.
+2. Drag the panel from the lower-right corner of the primary display's work area to move it. It snaps to nearby screen edges. Click the tray icon to show or hide it.
+3. Right-click the panel or tray icon and open **Edit Metrics**. Choose metrics, drag to reorder them, and click **Apply** when the preview matches what you want.
 
-![简体中文监控项编辑器和实时浮窗预览](docs/images/editor-zh-CN.png)
+## Usage
 
-## 使用方法
+- **Floating or taskbar layout.** Enable **Embed in Taskbar** and choose **Left** or **Right** in **Settings → Taskbar Position**. Right is the default. The panel floats when the primary taskbar is vertical, set to auto-hide, or short on space.
+- **Appearance.** In **Edit Metrics**, preview both layouts, choose a density, and set the display size from 10 to 24 px (16 px by default, scaled by Windows DPI). Both layouts share these settings. Turn **Bold Labels** off for regular-weight labels, or select the **Transparent** theme to let the taskbar's light or dark setting determine text and divider colours.
+- **Refresh and sign-in.** The default refresh interval is one second. You can choose two, three, or five seconds, set the panel to stay on top, or enable **Run at Sign-in** for your Windows user. Update the startup path through the same menu if you move the executable. Use the context menu to reset total traffic or exit.
+- **Language.** Choose English, Simplified Chinese, or **Use System Language** in **Settings → Language** (设置 → 语言). The default follows Windows. Changes take effect immediately and are saved.
+- **Version and updates.** Use **About** to see the version or visit GitHub. **Settings → Check for Updates** verifies the SHA-256 of the release download before replacing the executable and restarting. The executable's directory must be writable.
 
-- 在「设置 → 语言」可选择简体中文、English 或跟随系统。默认跟随 Windows 界面语言，中文系统显示简体中文，其他系统显示英文。切换后立即生效并随重启保留。
-- 浮窗默认位于主屏工作区右下角。拖动可调整位置，靠近屏幕边缘时会吸附。
-- 右键监控面板或托盘图标，在「设置」子菜单中调整自启、任务栏模式、置顶、刷新频率和主题。打开「编辑监控项」可勾选显示项、拖动排序、调整显示大小（10–24 px，默认 16 px），并即时预览浮窗或任务栏的显示效果。显示大小以 Windows 100% 缩放为基准，并随系统 DPI 缩放。点击「应用」保存，重启后会沿用设置。刷新间隔可选 1、2、3、5 秒，默认为 1 秒。右键主菜单还可清零总流量和退出，单击托盘图标可显示或隐藏面板。
-- 在「设置」→「主题」中选择「透明」可透出监控面板下方的背景。文字和列间竖线会跟随 Windows 任务栏配色，深色用白色，浅色用黑色。右键面板内的文字或空白处，或右键托盘图标，均可打开菜单。
-- 在「编辑监控项 → 紧凑度」可选择「标准」「紧凑」或「更紧凑」。此设置通过调整列间距和左右留白来改变面板宽度，浮窗和任务栏共用该设置。
-- 「设置 → 标签加粗」默认开启。取消勾选后，浮窗和任务栏的监控项标签会改用常规字重，设置会随重启保留。
-- 勾选「设置 → 开机自启」后，当前 Windows 用户登录时会启动监控。此项默认关闭。移动程序后可通过同一选项更新自启路径。
-- 勾选「嵌入任务栏」后，紧凑面板会对齐主屏水平任务栏的可用空位。在「设置 → 任务栏位置」可选「靠左」或「靠右」，默认靠右。任务栏空间不足、自动隐藏或垂直排列时使用浮窗。刷新间隔、任务栏模式和位置会随设置保存。
-- 右键监控面板或托盘图标，选择「关于」可查看当前版本，点击「访问 GitHub」可在默认浏览器中打开项目仓库。
-- 通过「设置 → 检查更新」查询 GitHub 上的最新正式版。确认后，程序会校验下载文件的 SHA-256、替换当前 EXE 并重启。更新需要对 EXE 所在目录有写入权限。[GitHub Releases](https://github.com/Fracizz/windows-monitor-x/releases)
+## Screenshots
 
-## 监控指标
+![Metrics editor with a live preview of the floating panel](docs/images/editor-en-US.png)
 
-- 默认显示上传、下载、CPU 使用率、内存使用率、磁盘活动率和累计流量。可另外启用可用内存百分比、可用内存容量、已用内存容量、CPU 当前频率、系统运行时长和电池电量。磁盘活动率显示最忙物理磁盘的活动时间比例。电池或其他采样数据不可用时显示破折号。
-- 百分比和网速等显示整数，物理内存容量以 GB 显示两位小数（1 GB = 10 亿字节），CPU 当前频率以 GHz 显示两位小数。浮窗和任务栏共用显示项、顺序和大小，每列从上到下排列。
-- 网速汇总在线的物理以太网和 Wi-Fi 网卡，包含局域网流量。总流量按工具运行期间的上传与下载累计，保存在 `%LOCALAPPDATA%\WindowsMonitor\state.ini`。
+## Metrics
 
-## 打包
+- By default, the panel displays upload and download speeds, CPU and memory usage, disk activity, and total network traffic. You can also enable available memory as a percentage, available and used memory in GB, current CPU frequency, system uptime, and battery level. Disk activity is the percentage of time the busiest physical disk is active. A dash indicates that a battery reading or other sample is unavailable.
+- Percentages and transfer rates are displayed as integers. Physical memory in GB (1 GB = 1 billion bytes) and current CPU frequency in GHz are displayed with two decimal places. Both layouts use the same metrics, order, and display size, with items arranged from top to bottom in each column.
+- Network speeds aggregate traffic from active physical Ethernet and Wi-Fi adapters, including local network traffic. Total traffic counts bytes uploaded and downloaded while the app is running and is saved in `%LOCALAPPDATA%\WindowsMonitor\state.ini`.
 
-Windows 上使用 Rust、MSVC Build Tools 和 Windows SDK。
+## Packaging
+
+On Windows, build with Rust, MSVC Build Tools, and the Windows SDK.
 
 ```powershell
 .\scripts\package.ps1
 ```
 
-打包脚本在 `dist` 生成「仓库名-x.exe」，EXE 的产品名称、文件描述和托盘名称使用同一名称。名称优先取 Git 的 `origin` 仓库名，没有远程时取本地仓库名。源码归档使用 Cargo 包名。仓库名已有 `-x` 或 `-X` 时统一为一个小写 `-x` 后缀。
+The script puts the executable in `dist` as `<repository-name>-x.exe`. The executable's product name, file description, and tray name use the same name without the file extension. The name comes from the Git `origin` remote when available or the local repository directory otherwise. Source archives use the Cargo package name. An existing `-x` or `-X` suffix is normalized to a single lowercase `-x`.
 
-## 验证
+## Verification
 
 ```powershell
 cargo test --locked
@@ -51,9 +50,9 @@ cargo test --locked -- --ignored --nocapture
 .\scripts\smoke.ps1 -Exe .\dist\windows-monitor-x.exe
 ```
 
-系统采样测试需要已启用的物理磁盘计数器。桌面冒烟测试需要登录到 Windows 桌面，覆盖浮窗尺寸、常用菜单操作、单实例、设置持久化与资源占用。
+System sampling tests require enabled physical disk performance counters. The smoke test requires a signed-in Windows desktop session and covers floating panel dimensions, common menu actions, single-instance behavior, settings persistence, and resource usage.
 
-桌面解锁且主屏水平任务栏有足够空位时，可运行以下命令验证嵌入、重启恢复和退出嵌入。
+With the desktop unlocked and enough space on the primary horizontal taskbar, use the following command to verify that the panel can embed, restore its embedded position after a restart, and return to floating mode.
 
 ```powershell
 .\scripts\smoke.ps1 -Exe .\dist\windows-monitor-x.exe -RequireTaskbar
