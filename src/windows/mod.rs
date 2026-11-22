@@ -1,3 +1,4 @@
+mod about;
 mod editor;
 mod panel;
 mod panel_input;
@@ -65,6 +66,7 @@ use taskbar::{
 
 const CLASS: PCWSTR = w!("WindowsMonitor.Panel");
 const PRODUCT_NAME: &str = env!("WINDOWS_MONITOR_PRODUCT_NAME");
+const GITHUB_REPOSITORY: &str = "Fracizz/windows-monitor-x";
 const SAMPLE_READY: u32 = WM_APP + 1;
 const TRAY_EVENT: u32 = WM_APP + 2;
 const REVEAL_WINDOW: u32 = WM_APP + 3;
@@ -94,6 +96,7 @@ const EDIT_METRICS: usize = 116;
 const CHECK_UPDATE: usize = 117;
 const TRANSPARENT_THEME: usize = 118;
 const LABEL_BOLD: usize = 119;
+const ABOUT: usize = 120;
 const REFRESH_OPTIONS: [(usize, Refresh, PCWSTR); 4] = [
     (109, Refresh::One, w!("1 秒")),
     (110, Refresh::Two, w!("2 秒")),
@@ -395,7 +398,11 @@ impl SamplerWorker {
                             }
                             bar.and_then(|bar| {
                                 taskbar.as_mut()?.observe(
-                                    bar, hwnd, taskbar_side, dock_size, dock_placement.preferred_x(),
+                                    bar,
+                                    hwnd,
+                                    taskbar_side,
+                                    dock_size,
+                                    dock_placement.preferred_x(),
                                 )
                             })
                         };
@@ -1382,6 +1389,7 @@ fn make_menu(
     )?;
     menu.separator()?;
     menu.item(RESET_TRAFFIC, w!("清零总流量"), MF_ENABLED)?;
+    menu.item(ABOUT, w!("关于…"), MF_ENABLED)?;
     menu.item(EXIT, w!("退出"), MF_ENABLED)?;
     Ok(menu)
 }
@@ -1562,6 +1570,12 @@ fn show_update_error(hwnd: Option<HWND>, error: &impl std::fmt::Display) {
 
 fn command(hwnd: HWND, selection: usize) {
     match selection {
+        ABOUT => {
+            if let Err(error) = about::open(hwnd) {
+                let message = HSTRING::from(format!("无法打开关于窗口。\n\n{error}"));
+                unsafe { MessageBoxW(Some(hwnd), &message, app_title(), MB_OK | MB_ICONWARNING) };
+            }
+        }
         CHECK_UPDATE => start_update(hwnd, updater::Action::Check),
         EDIT_METRICS => {
             if let Err(error) = editor::open(hwnd) {
@@ -1783,8 +1797,10 @@ mod tests {
         )
         .unwrap();
         unsafe {
-            assert_eq!(GetMenuItemCount(Some(menu.0)), 5);
+            assert_eq!(GetMenuItemCount(Some(menu.0)), 6);
             assert_eq!(GetMenuItemID(menu.0, 0), TOGGLE as u32);
+            assert_eq!(GetMenuItemID(menu.0, 4), ABOUT as u32);
+            assert_eq!(GetMenuItemID(menu.0, 5), EXIT as u32);
             let settings = GetSubMenu(menu.0, 1);
             assert!(!settings.is_invalid());
             let refresh = GetSubMenu(settings, 4);

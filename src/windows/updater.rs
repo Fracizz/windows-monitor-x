@@ -22,7 +22,8 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-const REPOSITORY: &str = "Fracizz/windows-monitor-x";
+use super::GITHUB_REPOSITORY;
+
 const EXECUTABLE: &str = "windows-monitor-x.exe";
 const MAX_RELEASE_JSON: usize = 1024 * 1024;
 const MAX_EXECUTABLE: usize = 32 * 1024 * 1024;
@@ -84,7 +85,7 @@ pub fn start(hwnd: HWND, action: Action) -> io::Result<mpsc::Receiver<Event>> {
 
 fn check() -> Result<Option<Release>> {
     let current = Version::parse(env!("CARGO_PKG_VERSION"))?;
-    let path = format!("/repos/{REPOSITORY}/releases/latest");
+    let path = format!("/repos/{GITHUB_REPOSITORY}/releases/latest");
     let json = get(
         w!("api.github.com"),
         &path,
@@ -117,7 +118,7 @@ fn release_from_json(json: &[u8], current: &Version) -> Result<Option<Release>> 
     }
     Ok(Some(Release {
         version,
-        path: format!("/{REPOSITORY}/releases/download/{tag}/{EXECUTABLE}"),
+        path: format!("/{GITHUB_REPOSITORY}/releases/download/{tag}/{EXECUTABLE}"),
         size: asset.size,
         digest: digest.to_ascii_lowercase(),
     }))
@@ -400,7 +401,7 @@ mod tests {
         assert_eq!(release.version, Version::new(0, 4, 0));
         assert_eq!(
             release.path,
-            format!("/{REPOSITORY}/releases/download/v0.4.0/{EXECUTABLE}")
+            format!("/{GITHUB_REPOSITORY}/releases/download/v0.4.0/{EXECUTABLE}")
         );
         assert!(verify_download(&release, bytes).is_ok());
         assert!(verify_download(&release, b"bad! executable").is_err());

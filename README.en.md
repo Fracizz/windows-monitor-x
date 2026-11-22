@@ -15,6 +15,7 @@ The menu labels below include the Chinese text shown in the app.
 - Bold Labels (标签加粗) in Settings is on by default. Clear the checkmark to use regular-weight metric labels in both layouts. The setting is saved across restarts.
 - Enable Settings → Run at Sign-in (设置 → 开机自启) to start the monitor when the current Windows user signs in. This option is off by default. If you move the executable, use the same menu option to update the startup path.
 - Enable Embed in Taskbar (嵌入任务栏) to fit the compact panel into available space on the primary display's horizontal taskbar. Under Settings → Taskbar Position (设置 → 任务栏位置), select Left (靠左) or Right (靠右). The default is Right. The panel floats when the taskbar has too little space, is set to auto-hide, or is vertical. The refresh interval, taskbar mode, and taskbar position are saved across restarts.
+- Right-click the panel or tray icon and select About (关于) to see the current version. Click Visit GitHub (访问 GitHub) to open the project repository in your default browser.
 - Use Settings → Check for Updates (设置 → 检查更新) to check GitHub for the latest stable release. After confirmation, the app verifies the download's SHA-256 digest, replaces the executable, and restarts. Updating requires write access to the directory containing the executable. [GitHub Releases](https://github.com/Fracizz/windows-monitor-x/releases)
 
 ## Metrics
