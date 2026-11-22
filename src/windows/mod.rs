@@ -38,10 +38,10 @@ use ::windows::{
 };
 
 use crate::model::{Metric, Reading, Sample, readings};
-use panel::{Layout, Panel};
+use panel::{Appearance, Layout, Panel};
 use sampler::Sampler;
 use state::{DisplayOptions, Refresh, Settings, TaskbarSide, TextSize, Theme};
-use taskbar::{Placement, Taskbar};
+use taskbar::{DockPlacement, Placement, Taskbar, covered_by_taskbar};
 
 const CLASS: PCWSTR = w!("WindowsMonitor.Panel");
 const PRODUCT_NAME: &str = env!("WINDOWS_MONITOR_PRODUCT_NAME");
@@ -69,6 +69,7 @@ const DOCK_LEFT: usize = 114;
 const DOCK_RIGHT: usize = 115;
 const EDIT_METRICS: usize = 116;
 const CHECK_UPDATE: usize = 117;
+const TRANSPARENT_THEME: usize = 118;
 const REFRESH_OPTIONS: [(usize, Refresh, PCWSTR); 4] = [
     (109, Refresh::One, w!("1 秒")),
     (110, Refresh::Two, w!("2 秒")),
@@ -260,18 +261,23 @@ impl App {
     }
 
     fn paint_metrics(&mut self, hwnd: HWND) -> Result<()> {
+        let appearance = if self.settings.theme == Theme::Transparent {
+            Appearance::Transparent { dark: self.dark }
+        } else {
+            Appearance::Solid { dark: self.dark }
+        };
         if self.panel.is_none() {
             let mut panel = Panel::new()?;
             panel.set_layout(self.layout(), self.display);
             self.panel = Some(panel);
         }
         let panel = self.panel.as_mut().expect("panel initialized");
-        let mut painted = panel.paint(hwnd, self.dpi, self.dark, &self.displayed);
+        let mut painted = panel.paint(hwnd, self.dpi, appearance, &self.displayed);
         if painted
             .as_ref()
             .is_err_and(|error| error.code() == D2DERR_RECREATE_TARGET)
         {
-            painted = panel.paint(hwnd, self.dpi, self.dark, &self.displayed);
+            painted = panel.paint(hwnd, self.dpi, appearance, &self.displayed);
         }
         painted
     }
@@ -302,6 +308,7 @@ impl SamplerWorker {
                 let mut taskbar_side = settings.taskbar_side;
                 let mut dock_size = Layout::Taskbar.size(settings.display);
                 let mut taskbar = None;
+                let mut dock_placement = DockPlacement::default();
                 let mut last_placement = None;
                 loop {
                     let now = Instant::now();
@@ -320,10 +327,13 @@ impl SamplerWorker {
                         if taskbar.is_none() {
                             taskbar = Taskbar::new().ok();
                         }
-                        let placement = taskbar.as_mut().map_or(Placement::Floating, |bar| {
-                            bar.placement(hwnd, taskbar_side, dock_size)
+                        let observed = taskbar.as_mut().and_then(|bar| {
+                            bar.placement(hwnd, taskbar_side, dock_size, dock_placement.preferred_x())
                         });
-                        if last_placement != Some(placement) {
+                        if let Some(placement) = dock_placement.resolve(observed, Instant::now())
+                            && (last_placement != Some(placement)
+                                || matches!(placement, Placement::Docked(rect) if covered_by_taskbar(hwnd, rect)))
+                        {
                             last_placement = Some(placement);
                             let pending = feed
                                 .lock()
@@ -349,6 +359,9 @@ impl SamplerWorker {
                             dock = generation.map(|id| (id, Instant::now()));
                             if dock.is_none() {
                                 taskbar = None;
+                                dock_placement = DockPlacement::default();
+                            } else {
+                                dock_placement.reset_preference();
                             }
                             last_placement = None;
                         }
@@ -568,10 +581,11 @@ unsafe extern "system" fn window_proc(
             };
             round_window(hwnd, dpi, layout.radius(display.text_size));
         }
-        WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+        WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_THEMECHANGED => {
             if with_app(|app| app.refresh_theme()) == Some(true) {
                 invalidate(hwnd);
             }
+            editor::refresh_preview();
             if msg == WM_DISPLAYCHANGE || wparam.0 == SPI_SETWORKAREA.0 as usize {
                 recheck_placement(hwnd);
             }
@@ -688,25 +702,29 @@ unsafe extern "system" fn window_proc(
 }
 
 fn apply_placement(hwnd: HWND) {
-    let Some((placement, position, topmost, layout, display, waiting_sample)) = with_app(|app| {
-        let layout = app.layout();
-        app.display = app.settings.display;
-        if let Some(panel) = &mut app.panel {
-            panel.set_layout(layout, app.display);
-        }
-        app.refresh_theme();
-        (
-            app.placement,
-            app.settings.position,
-            app.settings.topmost,
-            layout,
-            app.display,
-            app.waiting_sample,
-        )
-    }) else {
+    let Some((placement, position, topmost, layout, display, waiting_sample, transparent)) =
+        with_app(|app| {
+            let layout = app.layout();
+            app.display = app.settings.display;
+            if let Some(panel) = &mut app.panel {
+                panel.set_layout(layout, app.display);
+            }
+            app.refresh_theme();
+            (
+                app.placement,
+                app.settings.position,
+                app.settings.topmost,
+                layout,
+                app.display,
+                app.waiting_sample,
+                !app.waiting_sample && app.settings.theme == Theme::Transparent,
+            )
+        })
+    else {
         return;
     };
-    let shadow_changed = set_panel_shadow(hwnd, layout == Layout::Floating);
+    let shadow_changed = set_panel_shadow(hwnd, layout == Layout::Floating && !transparent);
+    set_panel_layered(hwnd, transparent);
     match (waiting_sample, placement) {
         (true, _) => {
             center_starting_panel(hwnd, window_dpi(hwnd), display.text_size);
@@ -746,6 +764,21 @@ fn apply_placement(hwnd: HWND) {
         };
     }
     apply_visibility(hwnd);
+}
+
+fn set_panel_layered(hwnd: HWND, enabled: bool) {
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let layered = WS_EX_LAYERED.0 as isize;
+        let updated = if enabled {
+            style | layered
+        } else {
+            style & !layered
+        };
+        if updated != style {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, updated);
+        }
+    }
 }
 
 fn set_panel_shadow(hwnd: HWND, enabled: bool) -> bool {
@@ -1087,6 +1120,7 @@ fn make_settings_menu(
         (FOLLOW_SYSTEM, Theme::System, w!("跟随系统")),
         (LIGHT, Theme::Light, w!("浅色")),
         (DARK, Theme::Dark, w!("深色")),
+        (TRANSPARENT_THEME, Theme::Transparent, w!("透明")),
     ] {
         theme.item(id, label, checked(settings.theme == choice))?;
     }
@@ -1275,17 +1309,18 @@ fn command(hwnd: HWND, selection: usize) {
                 set_topmost(hwnd, topmost);
             }
         }
-        FOLLOW_SYSTEM | LIGHT | DARK => {
+        FOLLOW_SYSTEM | LIGHT | DARK | TRANSPARENT_THEME => {
             with_app(|app| {
                 app.settings.theme = match selection {
                     LIGHT => Theme::Light,
                     DARK => Theme::Dark,
+                    TRANSPARENT_THEME => Theme::Transparent,
                     _ => Theme::System,
                 };
-                app.refresh_theme();
                 app.save();
             });
-            invalidate(hwnd);
+            apply_placement(hwnd);
+            editor::refresh_preview();
         }
         RESET_TRAFFIC => {
             with_app(|app| {
@@ -1340,6 +1375,7 @@ mod tests {
         };
         let settings = Settings {
             taskbar: true,
+            theme: Theme::Transparent,
             position: Some(position),
             ..Default::default()
         };
@@ -1374,6 +1410,8 @@ mod tests {
         }
         let metrics_visible =
             with_app(|app| !app.waiting_sample && app.panel.is_some() && app.paint_error.is_none());
+        let layered =
+            unsafe { GetWindowLongPtrW(window.0, GWL_EXSTYLE) } & WS_EX_LAYERED.0 as isize;
         let mut panel_rect = RECT::default();
         unsafe { GetWindowRect(window.0, &mut panel_rect).unwrap() };
 
@@ -1382,6 +1420,7 @@ mod tests {
         assert!(painted && visible);
         assert_eq!(status_visible, Some(true));
         assert_eq!(metrics_visible, Some(true));
+        assert_ne!(layered, 0);
         let screen = monitor.rcMonitor;
         assert!((starting_rect.left + starting_rect.right - screen.left - screen.right).abs() <= 1);
         assert!((starting_rect.top + starting_rect.bottom - screen.top - screen.bottom).abs() <= 1);
@@ -1396,7 +1435,7 @@ mod tests {
     fn settings_menu_groups_preferences_and_shows_current_choices() {
         let settings = Settings {
             refresh: Refresh::Three,
-            theme: Theme::Dark,
+            theme: Theme::Transparent,
             ..Default::default()
         };
         let menu = make_menu(
@@ -1424,7 +1463,7 @@ mod tests {
             for (submenu, command) in [
                 (settings, AUTOSTART),
                 (refresh, 111),
-                (theme, DARK),
+                (theme, TRANSPARENT_THEME),
                 (position, DOCK_RIGHT),
             ] {
                 let flags = GetMenuState(submenu, command as u32, MF_BYCOMMAND);

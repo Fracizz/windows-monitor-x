@@ -16,6 +16,7 @@ pub enum Theme {
     System,
     Light,
     Dark,
+    Transparent,
 }
 
 impl Theme {
@@ -23,20 +24,21 @@ impl Theme {
         match value {
             "light" => Self::Light,
             "dark" => Self::Dark,
+            "transparent" => Self::Transparent,
             _ => Self::System,
         }
     }
 
     pub fn is_dark(self, taskbar: bool) -> bool {
         match self {
-            Self::System => {
+            Self::System | Self::Transparent => {
                 let mut light = 1u32;
                 let mut size = size_of::<u32>() as u32;
                 let status = unsafe {
                     RegGetValueW(
                         HKEY_CURRENT_USER,
                         w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
-                        if taskbar {
+                        if taskbar || self == Self::Transparent {
                             w!("SystemUsesLightTheme")
                         } else {
                             w!("AppsUseLightTheme")
@@ -183,6 +185,7 @@ impl Settings {
             Theme::System => "system",
             Theme::Light => "light",
             Theme::Dark => "dark",
+            Theme::Transparent => "transparent",
         };
         let position = self
             .position

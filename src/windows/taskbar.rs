@@ -1,7 +1,15 @@
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
+
 use ::windows::{
     Win32::{
-        Foundation::{HWND, RECT},
-        Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromWindow},
+        Foundation::{HWND, POINT, RECT},
+        Graphics::{
+            Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
+            Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromWindow},
+        },
         System::Com::{
             CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
             CoUninitialize,
@@ -10,8 +18,9 @@ use ::windows::{
             Accessibility::*,
             Shell::{ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage},
             WindowsAndMessaging::{
-                FindWindowExW, FindWindowW, GetDesktopWindow, GetForegroundWindow, GetShellWindow,
-                GetWindowRect, IsWindowVisible,
+                FindWindowExW, FindWindowW, GA_ROOT, GW_HWNDPREV, GWL_EXSTYLE, GetAncestor,
+                GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetWindow,
+                GetWindowLongPtrW, GetWindowRect, IsWindowVisible, WS_EX_LAYERED, WindowFromPoint,
             },
         },
     },
@@ -26,6 +35,54 @@ pub enum Placement {
     Floating,
     Hidden,
     Docked(RECT),
+}
+
+#[derive(Default)]
+pub struct DockPlacement {
+    current: Placement,
+    pending: Option<(Placement, Instant)>,
+    preferred_x: Option<i32>,
+}
+
+impl DockPlacement {
+    pub fn preferred_x(&self) -> Option<i32> {
+        self.preferred_x
+    }
+
+    pub fn reset_preference(&mut self) {
+        self.preferred_x = None;
+        self.pending = None;
+    }
+
+    pub fn resolve(&mut self, observed: Option<Placement>, now: Instant) -> Option<Placement> {
+        let next = observed.unwrap_or_default();
+        // Explorer's layout and foreground bounds can be in transition for one poll.
+        let needs_confirmation = next != self.current
+            && (observed.is_none()
+                || next == Placement::Hidden
+                || matches!(
+                    (self.current, next),
+                    (Placement::Docked(_), Placement::Docked(_))
+                ));
+        if needs_confirmation {
+            let since = match self.pending {
+                Some((candidate, since)) if candidate == next => since,
+                _ => {
+                    self.pending = Some((next, now));
+                    now
+                }
+            };
+            if now.duration_since(since) < Duration::from_secs(1) {
+                return None;
+            }
+        }
+        self.pending = None;
+        self.current = next;
+        if let Placement::Docked(rect) = next {
+            self.preferred_x = Some(rect.left);
+        }
+        Some(next)
+    }
 }
 
 struct Apartment;
@@ -80,17 +137,8 @@ impl Taskbar {
         &mut self,
         own_window: HWND,
         side: TaskbarSide,
-        size: (i32, i32),
-    ) -> Placement {
-        self.find_position(own_window, side, size)
-            .unwrap_or(Placement::Floating)
-    }
-
-    fn find_position(
-        &mut self,
-        own_window: HWND,
-        side: TaskbarSide,
         (width, height): (i32, i32),
+        preferred_x: Option<i32>,
     ) -> Option<Placement> {
         let bar = unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) }.ok()?;
         let mut info = APPBARDATA {
@@ -98,11 +146,11 @@ impl Taskbar {
             ..Default::default()
         };
         if unsafe { SHAppBarMessage(ABM_GETSTATE, &mut info) } & ABS_AUTOHIDE as usize != 0 {
-            return None;
+            return Some(Placement::Floating);
         }
         let bounds = window_rect(bar)?;
         if bounds.right - bounds.left <= bounds.bottom - bounds.top {
-            return None;
+            return Some(Placement::Floating);
         }
         if !unsafe { IsWindowVisible(bar).as_bool() } || fullscreen_on_bar(bar, own_window) {
             return Some(Placement::Hidden);
@@ -111,7 +159,7 @@ impl Taskbar {
         let (width, height) = (scale(width, dpi), scale(height, dpi));
         let padding = scale(3, dpi);
         if height + scale(4, dpi) > bounds.bottom - bounds.top {
-            return None;
+            return Some(Placement::Floating);
         }
 
         let tray =
@@ -169,6 +217,7 @@ impl Taskbar {
             width,
             padding,
             side,
+            preferred_x,
         )?;
         let y = bounds.top + (bounds.bottom - bounds.top - height) / 2;
         Some(Placement::Docked(RECT {
@@ -178,6 +227,38 @@ impl Taskbar {
             bottom: y + height,
         }))
     }
+}
+
+pub fn covered_by_taskbar(window: HWND, rect: RECT) -> bool {
+    if !unsafe { IsWindowVisible(window).as_bool() } || window_rect(window) != Some(rect) {
+        return false;
+    }
+    let Ok(bar) = (unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) }) else {
+        return false;
+    };
+    let center = POINT {
+        x: rect.left + (rect.right - rect.left) / 2,
+        y: rect.top + (rect.bottom - rect.top) / 2,
+    };
+    if unsafe { GetAncestor(WindowFromPoint(center), GA_ROOT) } != bar {
+        return false;
+    }
+    if unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) } & WS_EX_LAYERED.0 as isize == 0 {
+        return true;
+    }
+    // Hit testing skips pixels with zero alpha even if the panel is above the taskbar.
+    let mut visited = HashSet::new();
+    let mut current = window;
+    while let Ok(above) = unsafe { GetWindow(current, GW_HWNDPREV) } {
+        if above == bar {
+            return true;
+        }
+        if !visited.insert(above.0) {
+            break;
+        }
+        current = above;
+    }
+    false
 }
 
 fn window_rect(hwnd: HWND) -> Option<RECT> {
@@ -229,13 +310,24 @@ fn fullscreen_on_bar(bar: HWND, own_window: HWND) -> bool {
     if !found.as_bool() {
         return false;
     }
+    let mut frame = RECT::default();
+    if unsafe {
+        DwmGetWindowAttribute(
+            foreground,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            (&raw mut frame).cast(),
+            size_of::<RECT>() as u32,
+        )
+    }
+    .is_err()
+    {
+        return false;
+    }
     let display = monitor.rcMonitor;
-    window_rect(foreground).is_some_and(|rect| {
-        rect.left <= display.left
-            && rect.top <= display.top
-            && rect.right >= display.right
-            && rect.bottom >= display.bottom
-    })
+    frame.left <= display.left
+        && frame.top <= display.top
+        && frame.right >= display.right
+        && frame.bottom >= display.bottom
 }
 
 fn taskbar_gap(
@@ -245,7 +337,14 @@ fn taskbar_gap(
     width: i32,
     padding: i32,
     side: TaskbarSide,
+    preferred_x: Option<i32>,
 ) -> Option<i32> {
+    if let Some(x) = preferred_x {
+        let (start, end) = (x - padding, x + width + padding);
+        if start >= left && end <= right && occupied.iter().all(|&(a, b)| b <= start || a >= end) {
+            return Some(x);
+        }
+    }
     occupied.sort_unstable();
     let mut found = None;
     let mut next = left;
@@ -270,20 +369,93 @@ mod tests {
     fn docking_prefers_the_selected_edge_and_keeps_clear_of_controls() {
         let mut occupied = [(850, 1000), (15, 65), (300, 440), (390, 500)];
         assert_eq!(
-            taskbar_gap(0, 1000, &mut occupied, 150, 6, TaskbarSide::Left),
+            taskbar_gap(0, 1000, &mut occupied, 150, 6, TaskbarSide::Left, None),
             Some(71)
         );
         assert_eq!(
-            taskbar_gap(0, 1000, &mut occupied, 150, 6, TaskbarSide::Right),
+            taskbar_gap(0, 1000, &mut occupied, 150, 6, TaskbarSide::Right, None),
             Some(694)
         );
         for side in [TaskbarSide::Left, TaskbarSide::Right] {
-            assert_eq!(taskbar_gap(0, 1000, &mut occupied, 350, 6, side), None);
+            assert_eq!(
+                taskbar_gap(0, 1000, &mut occupied, 350, 6, side, None),
+                None
+            );
         }
         let mut occupied = [(310, 650), (740, 999)];
         assert_eq!(
-            taskbar_gap(0, 1000, &mut occupied, 240, 6, TaskbarSide::Right),
+            taskbar_gap(0, 1000, &mut occupied, 240, 6, TaskbarSide::Right, None),
             Some(64)
+        );
+    }
+
+    #[test]
+    fn reuses_the_docked_slot_until_a_control_encroaches() {
+        let mut occupied = [(0, 60), (400, 480), (820, 1000)];
+        assert_eq!(
+            taskbar_gap(0, 1000, &mut occupied, 150, 6, TaskbarSide::Left, Some(200)),
+            Some(200)
+        );
+        occupied[1] = (355, 480);
+        assert_eq!(
+            taskbar_gap(0, 1000, &mut occupied, 150, 6, TaskbarSide::Left, Some(200)),
+            Some(66)
+        );
+    }
+
+    #[test]
+    fn confirms_layout_and_visibility_changes_before_leaving_a_slot() {
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+        let rect = RECT {
+            left: 80,
+            top: 800,
+            right: 230,
+            bottom: 836,
+        };
+        let docked = Placement::Docked(rect);
+        let moved = Placement::Docked(RECT {
+            left: 280,
+            right: 430,
+            ..rect
+        });
+        let mut placement = DockPlacement::default();
+
+        assert_eq!(placement.resolve(Some(docked), start), Some(docked));
+        assert_eq!(placement.resolve(None, start + second), None);
+        assert_eq!(
+            placement.resolve(Some(Placement::Hidden), start + second * 2),
+            None
+        );
+        assert_eq!(placement.resolve(Some(moved), start + second * 3), None);
+        assert_eq!(
+            placement.resolve(Some(docked), start + second * 4),
+            Some(docked)
+        );
+
+        assert_eq!(placement.resolve(Some(moved), start + second * 5), None);
+        assert_eq!(
+            placement.resolve(Some(moved), start + second * 6),
+            Some(moved)
+        );
+        assert_eq!(placement.preferred_x(), Some(280));
+        assert_eq!(
+            placement.resolve(Some(Placement::Hidden), start + second * 7),
+            None
+        );
+        assert_eq!(
+            placement.resolve(Some(Placement::Hidden), start + second * 8),
+            Some(Placement::Hidden)
+        );
+        assert_eq!(placement.preferred_x(), Some(280));
+        assert_eq!(
+            placement.resolve(Some(moved), start + second * 9),
+            Some(moved)
+        );
+        assert_eq!(placement.resolve(None, start + second * 10), None);
+        assert_eq!(
+            placement.resolve(None, start + second * 11),
+            Some(Placement::Floating)
         );
     }
 }

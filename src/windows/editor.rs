@@ -23,8 +23,8 @@ use ::windows::{
     core::{Error, PCWSTR, PWSTR, Result, w},
 };
 
-use super::panel::{Layout, Panel};
-use super::state::{Density, DisplayOptions, TextSize};
+use super::panel::{Appearance, Layout, Panel};
+use super::state::{Density, DisplayOptions, TextSize, Theme};
 use super::{Window, invalidate, metric_name, scale, set_display, window_dpi, with_app};
 use crate::model::Metric;
 
@@ -964,9 +964,15 @@ unsafe extern "system" fn preview_proc(
             with_app(|app| {
                 with_editor(|editor| {
                     let dark = app.settings.theme.is_dark(editor.layout == Layout::Taskbar);
-                    let _ = editor
-                        .panel
-                        .paint(hwnd, editor.preview_dpi, dark, &app.displayed);
+                    let appearance = if app.settings.theme == Theme::Transparent {
+                        Appearance::TransparentPreview { dark }
+                    } else {
+                        Appearance::Solid { dark }
+                    };
+                    let _ =
+                        editor
+                            .panel
+                            .paint(hwnd, editor.preview_dpi, appearance, &app.displayed);
                 });
             });
             unsafe {

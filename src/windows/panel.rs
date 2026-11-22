@@ -1,14 +1,18 @@
 use ::windows::{
     Win32::{
-        Foundation::{COLORREF, HWND, RECT},
+        Foundation::{COLORREF, HWND, POINT, RECT, SIZE},
         Graphics::{
             Direct2D::{
-                Common::{D2D_RECT_F, D2D_SIZE_U, D2D1_COLOR_F},
+                Common::{
+                    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F,
+                    D2D1_PIXEL_FORMAT,
+                },
                 D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
                 D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_IMMEDIATELY,
                 D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_ROUNDED_RECT,
-                D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE, D2D1CreateFactory, ID2D1Factory,
-                ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
+                D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+                D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1HwndRenderTarget,
+                ID2D1RenderTarget, ID2D1SolidColorBrush,
             },
             DirectWrite::{
                 DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_FEATURE,
@@ -19,15 +23,18 @@ use ::windows::{
                 DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
                 IDWriteTypography,
             },
+            Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::{
-                CreateFontIndirectW, CreateSolidBrush, DEFAULT_CHARSET, DT_CENTER, DT_NOPREFIX,
-                DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FillRect, HDC, HGDIOBJ,
-                LOGFONTW, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+                AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+                CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, CreateSolidBrush,
+                DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+                DeleteDC, DeleteObject, DrawTextW, FillRect, HBITMAP, HDC, HGDIOBJ, LOGFONTW,
+                SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
             },
         },
-        UI::WindowsAndMessaging::GetClientRect,
+        UI::WindowsAndMessaging::{GetClientRect, ULW_ALPHA, UpdateLayeredWindow},
     },
-    core::{Result, w},
+    core::{Error, Result, w},
 };
 use windows_numerics::{Matrix3x2, Vector2};
 
@@ -234,9 +241,125 @@ const DARK: Colors = Colors {
     download: 0xe7bd7b,
 };
 
+const TRANSPARENT_LIGHT: Colors = Colors {
+    surface: 0xf3f3f3,
+    number: 0x000000,
+    label: 0x000000,
+    upload: 0x000000,
+    download: 0x000000,
+    ..LIGHT
+};
+const TRANSPARENT_DARK: Colors = Colors {
+    surface: 0x202020,
+    number: 0xffffff,
+    label: 0xffffff,
+    upload: 0xffffff,
+    download: 0xffffff,
+    ..DARK
+};
+
+#[derive(Clone, Copy)]
+pub enum Appearance {
+    Solid { dark: bool },
+    Transparent { dark: bool },
+    TransparentPreview { dark: bool },
+}
+
+enum Surface {
+    Window(ID2D1HwndRenderTarget),
+    Layered(ID2D1DCRenderTarget, LayeredBitmap),
+}
+
+impl Surface {
+    fn render_target(&self) -> &ID2D1RenderTarget {
+        match self {
+            Self::Window(target) => target,
+            Self::Layered(target, _) => target,
+        }
+    }
+}
+
 struct Target {
-    window: ID2D1HwndRenderTarget,
+    surface: Surface,
     brush: ID2D1SolidColorBrush,
+}
+
+struct LayeredBitmap {
+    dc: HDC,
+    bitmap: HBITMAP,
+    size: SIZE,
+}
+
+impl LayeredBitmap {
+    fn new(size: D2D_SIZE_U) -> Result<Self> {
+        let size = SIZE {
+            cx: size.width as i32,
+            cy: size.height as i32,
+        };
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: size.cx,
+                biHeight: -size.cy,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        unsafe {
+            let bitmap = CreateDIBSection(
+                None,
+                &info,
+                DIB_RGB_COLORS,
+                &mut std::ptr::null_mut(),
+                None,
+                0,
+            )?;
+            let surface = Self {
+                dc: CreateCompatibleDC(None),
+                bitmap,
+                size,
+            };
+            if surface.dc.is_invalid() || SelectObject(surface.dc, HGDIOBJ(bitmap.0)).is_invalid() {
+                return Err(Error::from_thread());
+            }
+            Ok(surface)
+        }
+    }
+
+    fn present(&self, hwnd: HWND) -> Result<()> {
+        unsafe {
+            UpdateLayeredWindow(
+                hwnd,
+                None,
+                None,
+                Some(&self.size),
+                Some(self.dc),
+                Some(&POINT::default()),
+                COLORREF(0),
+                Some(&BLENDFUNCTION {
+                    BlendOp: AC_SRC_OVER as u8,
+                    BlendFlags: 0,
+                    SourceConstantAlpha: 255,
+                    AlphaFormat: AC_SRC_ALPHA as u8,
+                }),
+                ULW_ALPHA,
+            )
+        }
+    }
+}
+
+impl Drop for LayeredBitmap {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.dc.is_invalid() {
+                let _ = DeleteDC(self.dc);
+            }
+            let _ = DeleteObject(HGDIOBJ(self.bitmap.0));
+        }
+    }
 }
 
 struct TextReading {
@@ -340,11 +463,21 @@ impl Panel {
 
     pub fn resize(&mut self, hwnd: HWND, dpi: u32) {
         if let Some(target) = &self.target {
-            let result = client_size(hwnd).and_then(|size| unsafe {
-                target.window.SetDpi(dpi as f32, dpi as f32);
-                target.window.Resize(&size)
+            let keep_target = client_size(hwnd).is_ok_and(|size| match &target.surface {
+                Surface::Window(window) => unsafe {
+                    window.SetDpi(dpi as f32, dpi as f32);
+                    window.Resize(&size).is_ok()
+                },
+                Surface::Layered(render, bitmap) => {
+                    let same_size =
+                        size.width == bitmap.size.cx as u32 && size.height == bitmap.size.cy as u32;
+                    if same_size {
+                        unsafe { render.SetDpi(dpi as f32, dpi as f32) };
+                    }
+                    same_size
+                }
             });
-            if result.is_err() {
+            if !keep_target {
                 self.target = None;
             }
         }
@@ -354,24 +487,42 @@ impl Panel {
         &mut self,
         hwnd: HWND,
         dpi: u32,
-        dark: bool,
+        appearance: Appearance,
         readings: &[Reading; Metric::ALL.len()],
     ) -> Result<()> {
         self.update_text(readings)?;
-        if self.target.is_none() {
-            self.target = Some(self.create_target(hwnd, dpi)?);
+        let layered = matches!(appearance, Appearance::Transparent { .. });
+        if !self
+            .target
+            .as_ref()
+            .is_some_and(|target| matches!(target.surface, Surface::Layered(..)) == layered)
+        {
+            self.target = Some(self.create_target(hwnd, dpi, layered)?);
         }
         let target = self.target.as_ref().expect("render target initialized");
-        let colors = if dark { DARK } else { LIGHT };
+        let colors = match appearance {
+            Appearance::Solid { dark: false } => LIGHT,
+            Appearance::Solid { dark: true } => DARK,
+            Appearance::Transparent { dark: false }
+            | Appearance::TransparentPreview { dark: false } => TRANSPARENT_LIGHT,
+            Appearance::Transparent { dark: true }
+            | Appearance::TransparentPreview { dark: true } => TRANSPARENT_DARK,
+        };
+        let background = if layered {
+            D2D1_COLOR_F::default()
+        } else {
+            color(colors.surface)
+        };
+        let chrome = matches!(appearance, Appearance::Solid { .. });
         let (width, height) = self.mode.base_size(self.display);
         let factor = self.display.text_size.factor();
         let result = unsafe {
-            let window = &target.window;
+            let window = target.surface.render_target();
             let brush = &target.brush;
             window.BeginDraw();
-            window.Clear(Some(&color(colors.surface)));
+            window.Clear(Some(&background));
             window.SetTransform(&Matrix3x2::scale(factor, factor));
-            if self.mode == Layout::Floating {
+            if chrome && self.mode == Layout::Floating {
                 let radius = self.mode.base_radius() as f32 - 0.5;
                 brush.SetColor(&color(colors.border));
                 window.DrawRoundedRectangle(
@@ -390,9 +541,11 @@ impl Panel {
                     None,
                 );
             }
-            brush.SetColor(&color(colors.divider));
-            for (start, end) in self.mode.dividers(self.display) {
-                window.DrawLine(start, end, brush, 1.0, None);
+            if chrome {
+                brush.SetColor(&color(colors.divider));
+                for (start, end) in self.mode.dividers(self.display) {
+                    window.DrawLine(start, end, brush, 1.0, None);
+                }
             }
             if self.display.metrics.iter().next().is_none() {
                 brush.SetColor(&color(colors.label));
@@ -425,7 +578,13 @@ impl Panel {
                     } else {
                         colors.download
                     }));
-                    draw_arrow(target, text.arrow_x(slot.label_x), slot.row_y, upload);
+                    draw_arrow(
+                        window,
+                        brush,
+                        text.arrow_x(slot.label_x),
+                        slot.row_y,
+                        upload,
+                    );
                 }
                 brush.SetColor(&color(colors.number));
                 window.DrawTextLayout(
@@ -443,7 +602,11 @@ impl Panel {
                 );
             }
             window.EndDraw(None, None)
-        };
+        }
+        .and_then(|()| match &target.surface {
+            Surface::Window(_) => Ok(()),
+            Surface::Layered(_, bitmap) => bitmap.present(hwnd),
+        });
         if result.is_err() {
             self.target = None;
         }
@@ -505,25 +668,48 @@ impl Panel {
         Ok(())
     }
 
-    fn create_target(&self, hwnd: HWND, dpi: u32) -> Result<Target> {
+    fn create_target(&self, hwnd: HWND, dpi: u32, layered: bool) -> Result<Target> {
         let size = client_size(hwnd)?;
+        let mut properties = D2D1_RENDER_TARGET_PROPERTIES {
+            r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+            dpiX: dpi as f32,
+            dpiY: dpi as f32,
+            ..Default::default()
+        };
         unsafe {
-            let window = self.factory.CreateHwndRenderTarget(
-                &D2D1_RENDER_TARGET_PROPERTIES {
-                    r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-                    dpiX: dpi as f32,
-                    dpiY: dpi as f32,
-                    ..Default::default()
-                },
-                &D2D1_HWND_RENDER_TARGET_PROPERTIES {
-                    hwnd,
-                    pixelSize: size,
-                    presentOptions: D2D1_PRESENT_OPTIONS_IMMEDIATELY,
-                },
-            )?;
-            window.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
-            let brush = window.CreateSolidColorBrush(&color(LIGHT.number), None)?;
-            Ok(Target { window, brush })
+            let surface = if layered {
+                let bitmap = LayeredBitmap::new(size)?;
+                properties.pixelFormat = D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                };
+                let target = self.factory.CreateDCRenderTarget(&properties)?;
+                target.BindDC(
+                    bitmap.dc,
+                    &RECT {
+                        right: bitmap.size.cx,
+                        bottom: bitmap.size.cy,
+                        ..Default::default()
+                    },
+                )?;
+                target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+                Surface::Layered(target, bitmap)
+            } else {
+                let target = self.factory.CreateHwndRenderTarget(
+                    &properties,
+                    &D2D1_HWND_RENDER_TARGET_PROPERTIES {
+                        hwnd,
+                        pixelSize: size,
+                        presentOptions: D2D1_PRESENT_OPTIONS_IMMEDIATELY,
+                    },
+                )?;
+                target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+                Surface::Window(target)
+            };
+            let brush = surface
+                .render_target()
+                .CreateSolidColorBrush(&color(LIGHT.number), None)?;
+            Ok(Target { surface, brush })
         }
     }
 }
@@ -620,30 +806,22 @@ fn text_width(text: &IDWriteTextLayout) -> Result<f32> {
     Ok(metrics.width)
 }
 
-fn draw_arrow(target: &Target, x: f32, row_y: f32, up: bool) {
+fn draw_arrow(
+    window: &ID2D1RenderTarget,
+    brush: &ID2D1SolidColorBrush,
+    x: f32,
+    row_y: f32,
+    up: bool,
+) {
     let mid = row_y + 13.0;
     let tip = mid + if up { -4.5 } else { 4.5 };
     let tail = 2.0 * mid - tip;
     let wing = tip + if up { ARROW_WING } else { -ARROW_WING };
     let center = point(x, tip);
     unsafe {
-        target
-            .window
-            .DrawLine(point(x, tail), center, &target.brush, 1.45, None);
-        target.window.DrawLine(
-            point(x - ARROW_WING, wing),
-            center,
-            &target.brush,
-            1.45,
-            None,
-        );
-        target.window.DrawLine(
-            point(x + ARROW_WING, wing),
-            center,
-            &target.brush,
-            1.45,
-            None,
-        );
+        window.DrawLine(point(x, tail), center, brush, 1.45, None);
+        window.DrawLine(point(x - ARROW_WING, wing), center, brush, 1.45, None);
+        window.DrawLine(point(x + ARROW_WING, wing), center, brush, 1.45, None);
     }
 }
 
@@ -824,9 +1002,12 @@ mod tests {
     #[test]
     fn draws_both_layouts_at_175_percent_scaling() {
         use ::windows::{
-            Win32::UI::WindowsAndMessaging::{
-                CreateWindowExW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos,
-                WINDOW_EX_STYLE, WS_POPUP,
+            Win32::{
+                Graphics::Gdi::{DIBSECTION, GdiFlush, GetObjectW},
+                UI::WindowsAndMessaging::{
+                    CreateWindowExW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos,
+                    WINDOW_EX_STYLE, WS_POPUP,
+                },
             },
             core::PCWSTR,
         };
@@ -895,8 +1076,41 @@ mod tests {
             .unwrap();
             panel.set_layout(mode, display);
             panel.resize(hwnd, dpi);
+            super::super::set_panel_layered(hwnd, false);
             for dark in [false, true] {
-                panel.paint(hwnd, dpi, dark, &readings).unwrap();
+                panel
+                    .paint(hwnd, dpi, Appearance::Solid { dark }, &readings)
+                    .unwrap();
+            }
+            super::super::set_panel_layered(hwnd, true);
+            for dark in [false, true] {
+                panel
+                    .paint(hwnd, dpi, Appearance::Transparent { dark }, &readings)
+                    .unwrap();
+                let Some(Target {
+                    surface: Surface::Layered(_, bitmap),
+                    ..
+                }) = &panel.target
+                else {
+                    panic!("transparent theme requires a layered render target");
+                };
+                let mut dib = DIBSECTION::default();
+                let bytes = size_of::<DIBSECTION>() as i32;
+                unsafe {
+                    assert!(GdiFlush().as_bool());
+                    assert_eq!(
+                        GetObjectW(HGDIOBJ(bitmap.bitmap.0), bytes, Some((&raw mut dib).cast())),
+                        bytes
+                    );
+                }
+                let pixels = unsafe {
+                    std::slice::from_raw_parts(
+                        dib.dsBm.bmBits.cast::<u32>(),
+                        (bitmap.size.cx * bitmap.size.cy) as usize,
+                    )
+                };
+                assert_eq!(pixels[0], 0);
+                assert!(pixels.contains(&if dark { 0xffffffff } else { 0xff000000 }));
             }
         }
     }
