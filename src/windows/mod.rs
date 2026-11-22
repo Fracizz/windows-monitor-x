@@ -4,6 +4,7 @@ mod sampler;
 mod startup;
 mod state;
 mod taskbar;
+mod updater;
 
 use std::{
     cell::RefCell,
@@ -20,8 +21,8 @@ use ::windows::{
         },
         Graphics::Gdi::{
             BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, GetMonitorInfoW, HDC, HGDIOBJ,
-            InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, PAINTSTRUCT,
-            SetWindowRgn, UpdateWindow,
+            InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+            MonitorFromWindow, PAINTSTRUCT, SetWindowRgn, UpdateWindow,
         },
         System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
         UI::{
@@ -39,7 +40,7 @@ use ::windows::{
 use crate::model::{Metric, Reading, Sample, readings};
 use panel::{Layout, Panel};
 use sampler::Sampler;
-use state::{DisplayOptions, Refresh, Settings, TaskbarSide, Theme};
+use state::{DisplayOptions, Refresh, Settings, TaskbarSide, TextSize, Theme};
 use taskbar::{Placement, Taskbar};
 
 const CLASS: PCWSTR = w!("WindowsMonitor.Panel");
@@ -48,6 +49,7 @@ const SAMPLE_READY: u32 = WM_APP + 1;
 const TRAY_EVENT: u32 = WM_APP + 2;
 const REVEAL_WINDOW: u32 = WM_APP + 3;
 const DOCK_READY: u32 = WM_APP + 4;
+const UPDATE_READY: u32 = WM_APP + 5;
 const TRAY_ID: u32 = 1;
 const ICON_ID: PCWSTR = PCWSTR(101usize as *const u16);
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
@@ -66,6 +68,7 @@ const AUTOSTART: usize = 113;
 const DOCK_LEFT: usize = 114;
 const DOCK_RIGHT: usize = 115;
 const EDIT_METRICS: usize = 116;
+const CHECK_UPDATE: usize = 117;
 const REFRESH_OPTIONS: [(usize, Refresh, PCWSTR); 4] = [
     (109, Refresh::One, w!("1 秒")),
     (110, Refresh::Two, w!("2 秒")),
@@ -114,6 +117,7 @@ struct App {
     last_save: Instant,
     save_pending: bool,
     paint_error: Option<Error>,
+    update: Option<mpsc::Receiver<updater::Event>>,
 }
 
 impl App {
@@ -160,15 +164,14 @@ impl App {
             last_save: Instant::now(),
             save_pending: false,
             paint_error: None,
+            update: None,
         }
     }
 
-    fn take_sample(&mut self) -> bool {
+    fn take_sample(&mut self) {
         if let Some(sample) = self.feed.lock().unwrap().sample.take() {
             self.sample = sample;
-            return std::mem::replace(&mut self.waiting_sample, false);
         }
-        false
     }
 
     fn layout(&self) -> Layout {
@@ -394,6 +397,12 @@ impl Drop for Window {
 }
 
 pub fn run() -> Result<()> {
+    if let Some(result) = updater::handle_startup_args() {
+        if let Err(error) = result {
+            show_update_error(None, &error);
+        }
+        return Ok(());
+    }
     let _instance = unsafe {
         let instance = Instance(CreateMutexW(
             None,
@@ -519,7 +528,9 @@ unsafe extern "system" fn window_proc(
         }
         WM_ERASEBKGND => return LRESULT(1),
         WM_NCHITTEST => {
-            let hit = if with_app(|app| app.layout()) == Some(Layout::Taskbar) {
+            let hit = if with_app(|app| app.waiting_sample || app.layout() == Layout::Taskbar)
+                == Some(true)
+            {
                 HTCLIENT
             } else {
                 HTCAPTION
@@ -533,12 +544,16 @@ unsafe extern "system" fn window_proc(
         WM_DPICHANGED => {
             let dpi = (wparam.0 & 0xffff) as u32;
             let suggested = unsafe { &*(lparam.0 as *const RECT) };
-            let (layout, display) = with_app(|app| {
+            let (layout, display, waiting_sample) = with_app(|app| {
                 app.dpi = dpi;
                 app.resize_panel(hwnd);
-                (app.layout(), app.display)
+                (app.layout(), app.display, app.waiting_sample)
             })
             .unwrap_or_default();
+            if waiting_sample {
+                center_starting_panel(hwnd, dpi, display.text_size);
+                return LRESULT(0);
+            }
             let (width, height) = layout.size(display);
             let _ = unsafe {
                 SetWindowPos(
@@ -588,17 +603,22 @@ unsafe extern "system" fn window_proc(
         },
         WM_COMMAND => command(hwnd, wparam.0 & 0xffff),
         SAMPLE_READY => {
-            let changed = with_app(|app| {
-                let first_sample = app.take_sample();
+            let Some((first_sample, changed)) = with_app(|app| {
+                app.take_sample();
+                let first_sample = std::mem::replace(&mut app.waiting_sample, false);
                 if app.save_pending
                     || (app.last_save.elapsed() >= SAVE_INTERVAL
                         && app.total() != app.settings.traffic)
                 {
                     app.save();
                 }
-                app.update_display() || first_sample
-            });
-            if changed == Some(true) && unsafe { IsWindowVisible(hwnd).as_bool() } {
+                (first_sample, app.update_display())
+            }) else {
+                return LRESULT(0);
+            };
+            if first_sample {
+                apply_placement(hwnd);
+            } else if changed && unsafe { IsWindowVisible(hwnd).as_bool() } {
                 invalidate(hwnd);
             }
             editor::refresh_preview();
@@ -619,6 +639,7 @@ unsafe extern "system" fn window_proc(
                 apply_placement(hwnd);
             }
         }
+        UPDATE_READY => finish_update(hwnd),
         REVEAL_WINDOW => {
             with_app(|app| app.shown = true);
             apply_visibility(hwnd);
@@ -667,7 +688,7 @@ unsafe extern "system" fn window_proc(
 }
 
 fn apply_placement(hwnd: HWND) {
-    let Some((placement, position, topmost, layout, display)) = with_app(|app| {
+    let Some((placement, position, topmost, layout, display, waiting_sample)) = with_app(|app| {
         let layout = app.layout();
         app.display = app.settings.display;
         if let Some(panel) = &mut app.panel {
@@ -680,17 +701,22 @@ fn apply_placement(hwnd: HWND) {
             app.settings.topmost,
             layout,
             app.display,
+            app.waiting_sample,
         )
     }) else {
         return;
     };
     let shadow_changed = set_panel_shadow(hwnd, layout == Layout::Floating);
-    match placement {
-        Placement::Floating => {
+    match (waiting_sample, placement) {
+        (true, _) => {
+            center_starting_panel(hwnd, window_dpi(hwnd), display.text_size);
+            set_topmost(hwnd, topmost);
+        }
+        (false, Placement::Floating) => {
             place(hwnd, position, window_dpi(hwnd), display, false);
             set_topmost(hwnd, topmost);
         }
-        Placement::Docked(rect) => {
+        (false, Placement::Docked(rect)) => {
             let _ = unsafe {
                 SetWindowPos(
                     hwnd,
@@ -704,7 +730,7 @@ fn apply_placement(hwnd: HWND) {
             };
             round_window(hwnd, window_dpi(hwnd), layout.radius(display.text_size));
         }
-        Placement::Hidden => {}
+        (false, Placement::Hidden) => {}
     }
     if shadow_changed {
         let _ = unsafe {
@@ -764,6 +790,38 @@ fn window_dpi(hwnd: HWND) -> u32 {
 
 fn scale(dip: i32, dpi: u32) -> i32 {
     (dip * dpi as i32 + 48) / 96
+}
+
+fn center_starting_panel(hwnd: HWND, dpi: u32, text_size: TextSize) {
+    let mut monitor = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe {
+        GetMonitorInfoW(
+            MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+            &mut monitor,
+        )
+    }
+    .as_bool()
+    {
+        return;
+    }
+    let bounds = monitor.rcMonitor;
+    let width = scale(text_size.scale(184), dpi).min(bounds.right - bounds.left);
+    let height = scale(text_size.scale(68), dpi).min(bounds.bottom - bounds.top);
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            bounds.left + (bounds.right - bounds.left - width) / 2,
+            bounds.top + (bounds.bottom - bounds.top - height) / 2,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        );
+    }
+    round_window(hwnd, dpi, Layout::Floating.radius(text_size));
 }
 
 fn place(
@@ -922,9 +980,15 @@ impl Drop for Menu {
 }
 
 fn open_menu(hwnd: HWND, at: POINT) {
-    let Some((settings, tray_ready, shown, placement)) =
-        with_app(|app| (app.settings, app.tray_ready, app.shown, app.placement))
-    else {
+    let Some((settings, tray_ready, shown, placement, update_busy)) = with_app(|app| {
+        (
+            app.settings,
+            app.tray_ready,
+            app.shown,
+            app.placement,
+            app.update.is_some(),
+        )
+    }) else {
         return;
     };
     if let Ok(menu) = make_menu(
@@ -933,6 +997,7 @@ fn open_menu(hwnd: HWND, at: POINT) {
         shown,
         placement,
         startup::status().ok(),
+        update_busy,
     ) {
         let selection = unsafe {
             let _ = SetForegroundWindow(hwnd);
@@ -958,6 +1023,7 @@ fn make_menu(
     shown: bool,
     placement: Placement,
     startup: Option<startup::Status>,
+    update_busy: bool,
 ) -> Result<Menu> {
     let menu = Menu::new()?;
     let visibility = if shown {
@@ -969,7 +1035,7 @@ fn make_menu(
     menu.item(TOGGLE, visibility, available)?;
     menu.submenu(
         w!("设置"),
-        make_settings_menu(settings, placement, startup)?,
+        make_settings_menu(settings, placement, startup, update_busy)?,
     )?;
     menu.separator()?;
     menu.item(RESET_TRAFFIC, w!("清零总流量"), MF_ENABLED)?;
@@ -981,6 +1047,7 @@ fn make_settings_menu(
     settings: Settings,
     placement: Placement,
     startup: Option<startup::Status>,
+    update_busy: bool,
 ) -> Result<Menu> {
     let menu = Menu::new()?;
     let checked = |condition| if condition { MF_CHECKED } else { MF_UNCHECKED };
@@ -1038,6 +1105,12 @@ fn make_settings_menu(
     )?;
     menu.submenu(w!("任务栏位置"), taskbar_position)?;
     menu.item(EDIT_METRICS, w!("编辑监控项…"), MF_ENABLED)?;
+    let (update_label, update_flags) = if update_busy {
+        (w!("正在处理更新…"), MF_GRAYED)
+    } else {
+        (w!("检查更新…"), MF_ENABLED)
+    };
+    menu.item(CHECK_UPDATE, update_label, update_flags)?;
     Ok(menu)
 }
 
@@ -1079,8 +1152,72 @@ fn set_display(hwnd: HWND, display: DisplayOptions) {
     }
 }
 
+fn start_update(hwnd: HWND, action: updater::Action) {
+    let result = with_app(|app| {
+        if app.update.is_none() {
+            app.update = Some(updater::start(hwnd, action)?);
+        }
+        Ok::<_, std::io::Error>(())
+    });
+    if let Some(Err(error)) = result {
+        show_update_error(Some(hwnd), &error);
+    }
+}
+
+fn finish_update(hwnd: HWND) {
+    let event = with_app(|app| {
+        let event = app.update.as_ref()?.try_recv().ok()?;
+        app.update = None;
+        Some(event)
+    })
+    .flatten();
+    match event {
+        Some(updater::Event::Checked(Ok(Some(release)))) => {
+            let text = HSTRING::from(format!(
+                "GitHub 上有新版本 v{}。是否下载并重启应用？",
+                release.version
+            ));
+            let answer = unsafe {
+                MessageBoxW(
+                    Some(hwnd),
+                    &text,
+                    app_title(),
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+                )
+            };
+            if answer == IDYES {
+                start_update(hwnd, updater::Action::Download(release));
+            }
+        }
+        Some(updater::Event::Checked(Ok(None))) => {
+            let text = HSTRING::from(concat!(
+                "当前已是最新版本 v",
+                env!("CARGO_PKG_VERSION"),
+                "。"
+            ));
+            unsafe { MessageBoxW(Some(hwnd), &text, app_title(), MB_OK | MB_ICONINFORMATION) };
+        }
+        Some(updater::Event::Downloaded(Ok(update))) => match update.launch() {
+            Ok(()) => {
+                let _ = unsafe { DestroyWindow(hwnd) };
+            }
+            Err(error) => show_update_error(Some(hwnd), &error),
+        },
+        Some(updater::Event::Checked(Err(error)) | updater::Event::Downloaded(Err(error))) => {
+            show_update_error(Some(hwnd), &error);
+        }
+        None => {}
+    }
+}
+
+fn show_update_error(hwnd: Option<HWND>, error: &impl std::fmt::Display) {
+    let text = HSTRING::from(format!("无法完成在线更新。\n\n{error}"));
+    unsafe { MessageBoxW(hwnd, &text, app_title(), MB_OK | MB_ICONWARNING) };
+}
+
 fn command(hwnd: HWND, selection: usize) {
     match selection {
+        CHECK_UPDATE => start_update(hwnd, updater::Action::Check),
         EDIT_METRICS => {
             if let Err(error) = editor::open(hwnd) {
                 let message = HSTRING::from(format!("无法打开监控项编辑器。\n\n{error}"));
@@ -1185,8 +1322,25 @@ mod tests {
 
     #[test]
     fn shows_feedback_before_sampling_with_saved_taskbar_mode() {
+        let mut monitor = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            GetMonitorInfoW(
+                MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTONEAREST),
+                &mut monitor,
+            )
+            .ok()
+            .unwrap();
+        }
+        let position = POINT {
+            x: monitor.rcWork.left + 24,
+            y: monitor.rcWork.top + 24,
+        };
         let settings = Settings {
             taskbar: true,
+            position: Some(position),
             ..Default::default()
         };
         let feed = Feed::default();
@@ -1204,6 +1358,8 @@ mod tests {
         let visible = unsafe { IsWindowVisible(window.0).as_bool() };
         let status_visible = with_app(|app| app.waiting_sample && app.panel.is_none());
         let elapsed = started.elapsed();
+        let mut starting_rect = RECT::default();
+        unsafe { GetWindowRect(window.0, &mut starting_rect).unwrap() };
 
         feed.lock().unwrap().sample = Some(Sample {
             memory: Some(crate::model::PhysicalMemory {
@@ -1218,12 +1374,18 @@ mod tests {
         }
         let metrics_visible =
             with_app(|app| !app.waiting_sample && app.panel.is_some() && app.paint_error.is_none());
+        let mut panel_rect = RECT::default();
+        unsafe { GetWindowRect(window.0, &mut panel_rect).unwrap() };
 
         // This test owns a separate window and leaves the user's settings file alone.
         APP.with(|state| state.borrow_mut().take());
         assert!(painted && visible);
         assert_eq!(status_visible, Some(true));
         assert_eq!(metrics_visible, Some(true));
+        let screen = monitor.rcMonitor;
+        assert!((starting_rect.left + starting_rect.right - screen.left - screen.right).abs() <= 1);
+        assert!((starting_rect.top + starting_rect.bottom - screen.top - screen.bottom).abs() <= 1);
+        assert_eq!((panel_rect.left, panel_rect.top), (position.x, position.y));
         eprintln!(
             "Initial window painted in {} ms before sampling",
             elapsed.as_millis()
@@ -1243,6 +1405,7 @@ mod tests {
             true,
             Placement::Floating,
             Some(startup::Status::Enabled),
+            false,
         )
         .unwrap();
         unsafe {
@@ -1254,6 +1417,7 @@ mod tests {
             let theme = GetSubMenu(settings, 5);
             let position = GetSubMenu(settings, 6);
             assert_eq!(GetMenuItemID(settings, 7), EDIT_METRICS as u32);
+            assert_eq!(GetMenuItemID(settings, 8), CHECK_UPDATE as u32);
             assert!(!refresh.is_invalid());
             assert!(!theme.is_invalid());
             assert!(!position.is_invalid());

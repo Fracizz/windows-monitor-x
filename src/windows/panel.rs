@@ -31,8 +31,8 @@ use ::windows::{
 };
 use windows_numerics::{Matrix3x2, Vector2};
 
-use super::state::{DisplayOptions, TextSize};
-use crate::model::{Metric, Metrics, Reading};
+use super::state::{Density, DisplayOptions, TextSize};
+use crate::model::{Metric, Reading};
 
 const ROW_HEIGHT: f32 = 24.0;
 const ROW_BASELINE: f32 = 17.0;
@@ -52,16 +52,16 @@ pub enum Layout {
 
 impl Layout {
     pub fn size(self, display: DisplayOptions) -> (i32, i32) {
-        let (width, height) = self.base_size(display.metrics);
+        let (width, height) = self.base_size(display);
         (
             display.text_size.scale(width),
             display.text_size.scale(height),
         )
     }
 
-    fn base_size(self, metrics: Metrics) -> (i32, i32) {
+    fn base_size(self, display: DisplayOptions) -> (i32, i32) {
         let width = self
-            .columns(metrics)
+            .columns(display)
             .last()
             .map(|column| column.left + column.width);
         match self {
@@ -81,10 +81,15 @@ impl Layout {
         }
     }
 
-    fn column_padding(self) -> i32 {
+    fn column_padding(self, density: Density) -> i32 {
+        let (floating, taskbar) = match density {
+            Density::Standard => (18, 13),
+            Density::Compact => (12, 8),
+            Density::Tight => (7, 4),
+        };
         match self {
-            Self::Floating => 18,
-            Self::Taskbar => 13,
+            Self::Floating => floating,
+            Self::Taskbar => taskbar,
         }
     }
 
@@ -104,10 +109,10 @@ impl Layout {
         }
     }
 
-    fn columns(self, metrics: Metrics) -> impl Iterator<Item = Column> {
-        let mut selected = metrics.iter();
+    fn columns(self, display: DisplayOptions) -> impl Iterator<Item = Column> {
+        let mut selected = display.metrics.iter();
         let mut left = 0;
-        let padding = self.column_padding();
+        let padding = self.column_padding(display.density);
         std::iter::from_fn(move || {
             let first = selected.next()?;
             let second = selected.next();
@@ -135,8 +140,8 @@ impl Layout {
         })
     }
 
-    fn slots(self, metrics: Metrics) -> impl Iterator<Item = (Metric, Slot)> {
-        self.columns(metrics).flat_map(move |column| {
+    fn slots(self, display: DisplayOptions) -> impl Iterator<Item = (Metric, Slot)> {
+        self.columns(display).flat_map(move |column| {
             let (top, bottom) = match self {
                 Self::Floating => (9.0, 35.0),
                 Self::Taskbar => (-3.0, 14.0),
@@ -155,12 +160,12 @@ impl Layout {
         })
     }
 
-    fn dividers(self, metrics: Metrics) -> impl Iterator<Item = (Vector2, Vector2)> {
+    fn dividers(self, display: DisplayOptions) -> impl Iterator<Item = (Vector2, Vector2)> {
         let (top, bottom) = match self {
             Self::Floating => (12.0, 56.0),
             Self::Taskbar => (5.0, 31.0),
         };
-        self.columns(metrics).skip(1).map(move |column| {
+        self.columns(display).skip(1).map(move |column| {
             let x = column.left as f32;
             (point(x, top), point(x, bottom))
         })
@@ -323,7 +328,10 @@ impl Panel {
     }
 
     pub fn set_layout(&mut self, mode: Layout, display: DisplayOptions) {
-        if self.mode != mode || self.display.metrics != display.metrics {
+        if self.mode != mode
+            || self.display.metrics != display.metrics
+            || self.display.density != display.density
+        {
             self.values = [const { None }; Metric::ALL.len()];
         }
         self.mode = mode;
@@ -355,7 +363,7 @@ impl Panel {
         }
         let target = self.target.as_ref().expect("render target initialized");
         let colors = if dark { DARK } else { LIGHT };
-        let (width, height) = self.mode.base_size(self.display.metrics);
+        let (width, height) = self.mode.base_size(self.display);
         let factor = self.display.text_size.factor();
         let result = unsafe {
             let window = &target.window;
@@ -383,7 +391,7 @@ impl Panel {
                 );
             }
             brush.SetColor(&color(colors.divider));
-            for (start, end) in self.mode.dividers(self.display.metrics) {
+            for (start, end) in self.mode.dividers(self.display) {
                 window.DrawLine(start, end, brush, 1.0, None);
             }
             if self.display.metrics.iter().next().is_none() {
@@ -397,7 +405,7 @@ impl Panel {
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
             }
-            for (metric, slot) in self.mode.slots(self.display.metrics) {
+            for (metric, slot) in self.mode.slots(self.display) {
                 let index = metric.index();
                 let text = self.values[index]
                     .as_ref()
@@ -443,7 +451,7 @@ impl Panel {
     }
 
     fn update_text(&mut self, readings: &[Reading; Metric::ALL.len()]) -> Result<()> {
-        for (metric, slot) in self.mode.slots(self.display.metrics) {
+        for (metric, slot) in self.mode.slots(self.display) {
             let cached = &mut self.values[metric.index()];
             let reading = &readings[metric.index()];
             if cached
@@ -655,7 +663,7 @@ fn color(rgb: u32) -> D2D1_COLOR_F {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{PhysicalMemory, Sample, readings};
+    use crate::model::{Metrics, PhysicalMemory, Sample, readings};
 
     #[test]
     fn text_fits_in_both_layouts() {
@@ -707,11 +715,11 @@ mod tests {
                     .unwrap();
                 assert_eq!(mode.size(display).0, expected_width);
                 assert!(
-                    mode.slots(metrics)
+                    mode.slots(display)
                         .map(|(metric, _)| metric)
                         .eq(metrics.iter())
                 );
-                for (metric, slot) in mode.slots(metrics) {
+                for (metric, slot) in mode.slots(display) {
                     let text = panel.values[metric.index()].as_ref().unwrap();
                     let gap = if text.displayed.unit == "%" {
                         PERCENT_GAP
@@ -750,11 +758,40 @@ mod tests {
     }
 
     #[test]
+    fn density_narrows_columns_and_repositions_unchanged_readings() {
+        let mut panel = Panel::new().unwrap();
+        let values = readings(Sample::default(), 16_000_000);
+        for (mode, widths) in [
+            (Layout::Floating, [381, 351, 326]),
+            (Layout::Taskbar, [326, 301, 281]),
+        ] {
+            let height = mode.size(DisplayOptions::default()).1;
+            for (density, width) in [Density::Standard, Density::Compact, Density::Tight]
+                .into_iter()
+                .zip(widths)
+            {
+                let display = DisplayOptions {
+                    density,
+                    ..Default::default()
+                };
+                assert_eq!(mode.size(display), (width, height));
+                panel.set_layout(mode, display);
+                panel.update_text(&values).unwrap();
+                for (metric, slot) in mode.slots(display) {
+                    let reading = panel.values[metric.index()].as_ref().unwrap();
+                    let right = reading.unit_x + text_width(&reading.unit).unwrap();
+                    assert!((right - slot.number_end).abs() < 0.01);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn taskbar_traffic_gap_is_close_to_the_middle_column() {
         let mode = Layout::Taskbar;
-        let metrics = Metrics::default();
+        let display = DisplayOptions::default();
         let mut panel = Panel::new().unwrap();
-        panel.set_layout(mode, DisplayOptions::default());
+        panel.set_layout(mode, display);
         let sample = Sample {
             cpu: Some(9.0),
             memory: Some(PhysicalMemory {
@@ -768,7 +805,7 @@ mod tests {
 
         let label_gap = |metric: Metric| {
             let (_, slot) = mode
-                .slots(metrics)
+                .slots(display)
                 .find(|(item, _)| *item == metric)
                 .unwrap();
             let label = panel.labels[metric.index()].as_ref().unwrap();
@@ -831,6 +868,7 @@ mod tests {
                 "cpu_frequency,upload,battery,uptime,used_memory,available_memory,available_memory_percent",
             ),
             text_size: TextSize::new(TextSize::MAX).unwrap(),
+            density: Density::Tight,
         };
         let compact = DisplayOptions {
             text_size: TextSize::new(TextSize::MIN).unwrap(),

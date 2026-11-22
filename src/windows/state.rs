@@ -155,6 +155,7 @@ impl Settings {
                         "taskbar_side" => settings.taskbar_side = TaskbarSide::parse(value),
                         "refresh" => settings.refresh = Refresh::parse(value),
                         "metrics" => settings.display.metrics = Metrics::parse(value),
+                        "density" => settings.display.density = Density::parse(value),
                         "text_size" => {
                             settings.display.text_size = value
                                 .parse()
@@ -189,11 +190,12 @@ impl Settings {
             .unwrap_or_default();
         let metrics = self.display.metrics.to_config();
         let text_size = self.display.text_size.pixels();
+        let density = self.display.density.as_str();
         let temp = file.with_extension("tmp");
         fs::write(
             &temp,
             format!(
-                "traffic={}\ntheme={theme}\ntopmost={}\ntaskbar={}\ntaskbar_side={}\nrefresh={}\nposition={position}\nmetrics={metrics}\ntext_size={text_size}\n",
+                "traffic={}\ntheme={theme}\ntopmost={}\ntaskbar={}\ntaskbar_side={}\nrefresh={}\nposition={position}\nmetrics={metrics}\ntext_size={text_size}\ndensity={density}\n",
                 self.traffic,
                 self.topmost,
                 self.taskbar,
@@ -209,6 +211,33 @@ impl Settings {
 pub struct DisplayOptions {
     pub metrics: Metrics,
     pub text_size: TextSize,
+    pub density: Density,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Density {
+    #[default]
+    Standard,
+    Compact,
+    Tight,
+}
+
+impl Density {
+    fn parse(value: &str) -> Self {
+        match value {
+            "compact" => Self::Compact,
+            "tight" => Self::Tight,
+            _ => Self::Standard,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Compact => "compact",
+            Self::Tight => "tight",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

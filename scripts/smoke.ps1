@@ -54,6 +54,10 @@ namespace MonitorSmoke {
         [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
         public static extern IntPtr GetWindowLongPtr(IntPtr hwnd, int index);
         [DllImport("user32.dll")]
+        public static extern IntPtr GetDlgItem(IntPtr hwnd, int id);
+        [DllImport("user32.dll")]
+        public static extern IntPtr SendMessageW(IntPtr hwnd, uint message, UIntPtr wp, IntPtr lp);
+        [DllImport("user32.dll")]
         public static extern bool PostMessageW(IntPtr hwnd, uint message, UIntPtr wp, IntPtr lp);
     }
 }
@@ -117,6 +121,15 @@ function Get-Bounds([intptr]$Handle) {
     $rect
 }
 
+function Test-PanelSize([int]$Width, [int]$Height) {
+    $panel = Get-Bounds $window
+    $dpi = [MonitorSmoke.Native]::GetDpiForWindow($window)
+    return (
+        ($panel.Right - $panel.Left) -eq [math]::Floor(($Width * $dpi + 48) / 96) -and
+        ($panel.Bottom - $panel.Top) -eq [math]::Floor(($Height * $dpi + 48) / 96)
+    )
+}
+
 function Test-TaskbarPlacement {
     $panel = Get-Bounds $window
     $taskbar = [MonitorSmoke.Native]::FindWindow('Shell_TrayWnd', [intptr]::Zero)
@@ -125,7 +138,7 @@ function Test-TaskbarPlacement {
     $taskbarDpi = [MonitorSmoke.Native]::GetDpiForWindow($taskbar)
     return (
         [MonitorSmoke.Native]::IsWindowVisible($window) -and
-        ($panel.Right - $panel.Left) -eq [math]::Floor((326 * $taskbarDpi + 48) / 96) -and
+        ($panel.Right - $panel.Left) -eq [math]::Floor((281 * $taskbarDpi + 48) / 96) -and
         ($panel.Bottom - $panel.Top) -eq [math]::Floor((36 * $taskbarDpi + 48) / 96) -and
         $panel.Left -ge $bar.Left -and $panel.Right -le $bar.Right -and
         $panel.Top -ge $bar.Top -and $panel.Bottom -le $bar.Bottom
@@ -165,13 +178,10 @@ try {
     $guiThread = [MonitorSmoke.Native]::GetWindowThreadProcessId($window, [ref]$owner)
     Assert-True ($owner -eq $app.Id) 'The launched instance must own the window.'
     Wait-For { [MonitorSmoke.Native]::IsWindowVisible($window) } 'Panel was not visible.'
+    Wait-For { Test-PanelSize 381 68 } 'Incorrect DPI-scaled panel dimensions after startup.'
 
     $rect = Get-Bounds $window
     $dpi = [MonitorSmoke.Native]::GetDpiForWindow($window)
-    $width = $rect.Right - $rect.Left
-    $height = $rect.Bottom - $rect.Top
-    Assert-True ($width -eq [math]::Floor((381 * $dpi + 48) / 96)) 'Incorrect DPI-scaled panel width.'
-    Assert-True ($height -eq [math]::Floor((68 * $dpi + 48) / 96)) 'Incorrect DPI-scaled panel height.'
     $dpiContext = [MonitorSmoke.Native]::GetWindowDpiAwarenessContext($window)
     Assert-True ([MonitorSmoke.Native]::AreDpiAwarenessContextsEqual($dpiContext, [intptr](-4))) 'Per-monitor V2 DPI awareness must be enabled.'
 
@@ -204,6 +214,24 @@ try {
         Send-Panel 0x111 $option[0]
         Wait-For { Test-Setting "refresh=$($option[1])" } 'Refresh interval was not saved.'
     }
+
+    Send-Panel 0x111 116
+    $editorClass = 'WindowsMonitor.MetricsEditor'
+    Wait-For {
+        $handle = [MonitorSmoke.Native]::FindWindow($editorClass, [intptr]::Zero)
+        $handle -ne [intptr]::Zero -and [MonitorSmoke.Native]::IsWindowVisible($handle)
+    } 'The metric editor did not open.'
+    $editor = [MonitorSmoke.Native]::FindWindow($editorClass, [intptr]::Zero)
+    $density = [MonitorSmoke.Native]::GetDlgItem($editor, 15)
+    Assert-True ($density -ne [intptr]::Zero) 'The density dropdown was missing.'
+    $selected = [MonitorSmoke.Native]::SendMessageW($density, 0x14e, [uintptr]2, [intptr]::Zero)
+    Assert-True ($selected.ToInt64() -eq 2) 'The tight density could not be selected.'
+    Assert-True ([MonitorSmoke.Native]::PostMessageW($editor, 0x111, [uintptr]0x1000f, $density)) 'Changing density failed.'
+    Assert-True ([MonitorSmoke.Native]::PostMessageW($editor, 0x111, [uintptr]1, [intptr]::Zero)) 'Applying density failed.'
+    Wait-For { (Test-Setting 'density=tight') -and (Test-PanelSize 326 68) } 'Tight density was not saved and applied.'
+    $rect = Get-Bounds $window
+    $width = $rect.Right - $rect.Left
+    $height = $rect.Bottom - $rect.Top
 
     $dockedPixels = $null
     if ($RequireTaskbar -or $ExpectDockHidden) {
@@ -244,11 +272,11 @@ try {
     Assert-True ((Get-PanelWindow) -eq [intptr]::Zero) 'The window remained after exit.'
     Assert-True (Test-Setting 'theme=light') 'Settings were not preserved at exit.'
 
+    $app.Dispose()
+    $app = Start-Monitor
+    Wait-For { (Get-PanelWindow) -ne [intptr]::Zero } 'Panel did not reopen.'
+    $window = Get-PanelWindow
     if ($RequireTaskbar -or $ExpectDockHidden) {
-        $app.Dispose()
-        $app = Start-Monitor
-        Wait-For { (Get-PanelWindow) -ne [intptr]::Zero } 'Panel did not reopen.'
-        $window = Get-PanelWindow
         if ($RequireTaskbar) {
             Wait-For { Test-TaskbarPlacement } 'Dock preference was not restored after restart.'
         } else {
@@ -256,15 +284,11 @@ try {
             Wait-For { -not [MonitorSmoke.Native]::IsWindowVisible($window) } 'The restarted panel should become hidden.'
         }
         Send-Panel 0x111 108
-        Wait-For {
-            $floating = Get-Bounds $window
-            ($floating.Right - $floating.Left) -eq $width -and
-            ($floating.Bottom - $floating.Top) -eq $height -and
-            (Test-Setting 'taskbar=false')
-        } 'Disabling taskbar mode did not restore the floating panel.'
-        Send-Panel 0x111 107
-        Assert-True ($app.WaitForExit(5000) -and $app.ExitCode -eq 0) 'The relaunched instance failed to close.'
+        Wait-For { Test-Setting 'taskbar=false' } 'Taskbar mode did not turn off.'
     }
+    Wait-For { Test-PanelSize 326 68 } 'Tight floating dimensions were not restored after restart.'
+    Send-Panel 0x111 107
+    Assert-True ($app.WaitForExit(5000) -and $app.ExitCode -eq 0) 'The relaunched instance failed to close.'
 
     [pscustomobject]@{
         Passed                         = $true

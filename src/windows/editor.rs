@@ -6,14 +6,17 @@ use ::windows::{
             ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
         },
         Graphics::Gdi::{
-            BeginPaint, COLOR_BTNFACE, DEFAULT_GUI_FONT, EndPaint, GetMonitorInfoW, GetStockObject,
-            MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints, MonitorFromWindow, PAINTSTRUCT,
+            BeginPaint, COLOR_BTNFACE, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, DEFAULT_GUI_FONT, EndPaint,
+            FillRect, GetMonitorInfoW, GetStockObject, GetSysColorBrush, MONITOR_DEFAULTTONEAREST,
+            MONITORINFO, MapWindowPoints, MonitorFromWindow, PAINTSTRUCT,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Controls::*,
             HiDpi::AdjustWindowRectExForDpi,
-            Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus},
+            Input::KeyboardAndMouse::{
+                GetCapture, ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE,
+            },
             WindowsAndMessaging::*,
         },
     },
@@ -21,7 +24,7 @@ use ::windows::{
 };
 
 use super::panel::{Layout, Panel};
-use super::state::{DisplayOptions, TextSize};
+use super::state::{Density, DisplayOptions, TextSize};
 use super::{Window, invalidate, metric_name, scale, set_display, window_dpi, with_app};
 use crate::model::Metric;
 
@@ -34,6 +37,14 @@ const UP: usize = 11;
 const DOWN: usize = 12;
 const PREVIEW_MODE: usize = 13;
 const TEXT_SIZE: usize = 14;
+const DENSITY: usize = 15;
+const GRIP_COLUMN: usize = 1;
+const GRIP_WIDTH: i32 = 24;
+const DENSITY_OPTIONS: [(Density, PCWSTR); 3] = [
+    (Density::Standard, w!("标准")),
+    (Density::Compact, w!("紧凑")),
+    (Density::Tight, w!("更紧凑")),
+];
 
 thread_local! {
     static EDITOR: RefCell<Option<Editor>> = const { RefCell::new(None) };
@@ -49,6 +60,8 @@ struct Editor {
     mode: HWND,
     size_label: HWND,
     size: HWND,
+    density_label: HWND,
+    density: HWND,
     preview: HWND,
     apply: HWND,
     cancel: HWND,
@@ -56,7 +69,19 @@ struct Editor {
     display: DisplayOptions,
     layout: Layout,
     preview_dpi: u32,
-    drag: Option<usize>,
+    drag: Option<Drag>,
+}
+
+struct Drag {
+    from: usize,
+    // Index of the gap between rows in the original list.
+    slot: Option<usize>,
+}
+
+impl Drag {
+    fn destination(&self) -> Option<usize> {
+        self.slot.map(|slot| slot - usize::from(slot > self.from))
+    }
 }
 
 pub fn open(owner: HWND) -> Result<()> {
@@ -108,7 +133,7 @@ pub fn open(owner: HWND) -> Result<()> {
     let work = area.rcWork;
     let mut bounds = RECT {
         right: scale(818, dpi),
-        bottom: scale(352, dpi),
+        bottom: scale(368, dpi),
         ..Default::default()
     };
     unsafe {
@@ -177,7 +202,13 @@ fn register_class(
 
 impl Editor {
     fn new(hwnd: HWND, owner: HWND, display: DisplayOptions, layout: Layout) -> Result<Self> {
-        let hint = control(hwnd, WC_STATICW, w!("勾选显示项，拖动调整顺序。"), 0, 0)?;
+        let hint = control(
+            hwnd,
+            WC_STATICW,
+            w!("勾选要显示的项目\r\n按住行首把手，上下拖动排序"),
+            0,
+            0,
+        )?;
         let list = control(
             hwnd,
             WC_LISTVIEWW,
@@ -219,6 +250,14 @@ impl Editor {
             WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
             TEXT_SIZE,
         )?;
+        let density_label = control(hwnd, WC_STATICW, w!("紧凑度"), 0, 0)?;
+        let density = control(
+            hwnd,
+            WC_COMBOBOXW,
+            PCWSTR::null(),
+            WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32,
+            DENSITY,
+        )?;
         let preview = control(hwnd, PREVIEW_CLASS, PCWSTR::null(), 0, 0)?;
         let apply = control(
             hwnd,
@@ -246,6 +285,20 @@ impl Editor {
             ..Default::default()
         };
         send(list, LVM_INSERTCOLUMNW, 0, &column as *const _ as isize);
+        send(
+            list,
+            LVM_INSERTCOLUMNW,
+            GRIP_COLUMN,
+            &column as *const _ as isize,
+        );
+        // The first logical column owns the native checkbox and metric name.
+        let columns = [GRIP_COLUMN as i32, 0];
+        send(
+            list,
+            LVM_SETCOLUMNORDERARRAY,
+            columns.len(),
+            columns.as_ptr() as isize,
+        );
         send(mode, CB_ADDSTRING, 0, w!("浮窗预览").as_ptr() as isize);
         send(mode, CB_ADDSTRING, 0, w!("任务栏预览").as_ptr() as isize);
         send(
@@ -264,6 +317,12 @@ impl Editor {
             (display.text_size.pixels() - TextSize::MIN) as usize,
             0,
         );
+        for (index, (choice, label)) in DENSITY_OPTIONS.into_iter().enumerate() {
+            send(density, CB_ADDSTRING, 0, label.as_ptr() as isize);
+            if choice == display.density {
+                send(density, CB_SETCURSEL, index, 0);
+            }
+        }
         let editor = Self {
             hwnd,
             owner,
@@ -274,6 +333,8 @@ impl Editor {
             mode,
             size_label,
             size,
+            density_label,
+            density,
             preview,
             apply,
             cancel,
@@ -301,7 +362,7 @@ impl Editor {
         let button = scale(78, dpi);
         let button_height = scale(27, dpi);
         let list_width = scale(214, dpi).min(bounds.right / 2);
-        let list_top = scale(40, dpi);
+        let list_top = scale(56, dpi);
         let buttons_top = bounds.bottom - margin - button_height;
         let preview_left = 2 * margin + list_width;
         let default_font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
@@ -311,7 +372,7 @@ impl Editor {
                 margin,
                 margin,
                 list_width + margin,
-                scale(20, dpi),
+                scale(36, dpi),
             ),
             (
                 self.list,
@@ -350,6 +411,20 @@ impl Editor {
                 scale(240, dpi),
             ),
             (
+                self.density_label,
+                preview_left,
+                scale(86, dpi),
+                scale(64, dpi),
+                scale(20, dpi),
+            ),
+            (
+                self.density,
+                preview_left + scale(68, dpi),
+                scale(81, dpi),
+                scale(86, dpi),
+                scale(124, dpi),
+            ),
+            (
                 self.apply,
                 bounds.right - margin - 2 * button - gap,
                 buttons_top,
@@ -367,7 +442,17 @@ impl Editor {
             send(hwnd, WM_SETFONT, default_font.0 as usize, 1);
             position(hwnd, x, y, width.max(1), height.max(1));
         }
-        send(self.list, LVM_SETCOLUMNWIDTH, 0, -2);
+        let mut list_bounds = RECT::default();
+        if unsafe { GetClientRect(self.list, &mut list_bounds) }.is_ok() {
+            let grip = scale(GRIP_WIDTH, dpi);
+            send(self.list, LVM_SETCOLUMNWIDTH, GRIP_COLUMN, grip as isize);
+            send(
+                self.list,
+                LVM_SETCOLUMNWIDTH,
+                0,
+                (list_bounds.right - grip).max(0) as isize,
+            );
+        }
         self.arrange_preview();
     }
 
@@ -380,7 +465,8 @@ impl Editor {
         let margin = scale(16, dpi);
         let left = scale(214, dpi).min(bounds.right / 2) + 2 * margin;
         let available = (bounds.right - left - margin).max(1);
-        let (width, height) = self.layout.size(self.display);
+        let display = self.preview_display();
+        let (width, height) = self.layout.size(display);
         self.preview_dpi = dpi.min(((i64::from(available) * 96) / i64::from(width)).max(1) as u32);
         let (width, height) = (
             scale(width, self.preview_dpi).max(1),
@@ -393,7 +479,7 @@ impl Editor {
             width,
             height,
         );
-        self.panel.set_layout(self.layout, self.display);
+        self.panel.set_layout(self.layout, display);
         self.panel.resize(self.preview, self.preview_dpi);
         super::round_window(
             self.preview,
@@ -401,6 +487,16 @@ impl Editor {
             self.layout.radius(self.display.text_size),
         );
         invalidate(self.preview);
+    }
+
+    fn preview_display(&self) -> DisplayOptions {
+        let mut display = self.display;
+        if let Some(drag) = &self.drag
+            && let Some(to) = drag.destination()
+        {
+            display.metrics.move_to(drag.from, to);
+        }
+        display
     }
 
     fn write_item(&self, index: usize, metric: Metric, message: u32) {
@@ -482,30 +578,144 @@ impl Editor {
     }
 
     fn drag_over(&mut self, point: POINT) {
-        let Some(from) = self.drag else {
-            return;
-        };
-        let mut points = [point];
-        unsafe {
-            MapWindowPoints(Some(self.hwnd), Some(self.list), &mut points);
+        let slot = self.insertion_slot(point, true);
+        if let Some(drag) = &mut self.drag
+            && drag.slot != slot
+        {
+            drag.slot = slot;
+            self.arrange_preview();
+            invalidate(self.list);
         }
-        let mut hit = LVHITTESTINFO {
-            pt: POINT {
-                x: 9,
-                y: points[0].y,
-            },
-            ..Default::default()
+    }
+
+    fn insertion_slot(&self, point: POINT, scroll: bool) -> Option<usize> {
+        let from = self.drag.as_ref()?.from;
+        let mut point = [point];
+        let mut bounds = RECT::default();
+        unsafe {
+            MapWindowPoints(Some(self.hwnd), Some(self.list), &mut point);
+            GetClientRect(self.list, &mut bounds).ok()?;
+        }
+        let [point] = point;
+        if point.x < 0 || point.x >= bounds.right || point.y < 0 || point.y >= bounds.bottom {
+            return None;
+        }
+        if scroll && let Some(row) = row_bounds(self.list, 0) {
+            let height = row.bottom - row.top;
+            if point.y < height / 2 {
+                send(self.list, LVM_SCROLL, 0, -height as isize);
+            } else if point.y >= bounds.bottom - height / 2 {
+                send(self.list, LVM_SCROLL, 0, height as isize);
+            }
+        }
+        let slot = (0..Metric::ALL.len())
+            .find(|&index| {
+                row_bounds(self.list, index).is_some_and(|row| point.y < (row.top + row.bottom) / 2)
+            })
+            .unwrap_or(Metric::ALL.len());
+        (slot != from && slot != from + 1).then_some(slot)
+    }
+
+    fn finish_drag(&mut self, point: Option<POINT>) -> bool {
+        let slot = point.and_then(|point| self.insertion_slot(point, false));
+        let Some(mut drag) = self.drag.take() else {
+            return false;
         };
-        let index = send(self.list, LVM_HITTEST, 0, &mut hit as *mut _ as isize);
-        let to = if index >= 0 {
-            index as usize
-        } else if hit.pt.y < 0 {
-            0
-        } else {
-            Metric::ALL.len() - 1
-        };
-        self.move_row(from, to);
-        self.drag = Some(to);
+        let had_preview = drag.slot.is_some();
+        drag.slot = slot;
+        if let Some(to) = drag.destination() {
+            self.move_row(drag.from, to);
+        } else if had_preview {
+            self.arrange_preview();
+        }
+        invalidate(self.list);
+        true
+    }
+
+    fn draw_list(&self, draw: &NMCUSTOMDRAW) -> u32 {
+        match draw.dwDrawStage {
+            CDDS_PREPAINT => return CDRF_NOTIFYPOSTPAINT,
+            CDDS_POSTPAINT => {}
+            _ => return CDRF_DODEFAULT,
+        }
+        let dpi = window_dpi(self.list);
+        let width = scale(GRIP_WIDTH, dpi);
+        let dot = scale(2, dpi);
+        let step = scale(4, dpi);
+        let left = (width - step - dot) / 2;
+        let grip_brush = unsafe { GetSysColorBrush(COLOR_GRAYTEXT) };
+        for index in 0..Metric::ALL.len() {
+            if let Some(row) = row_bounds(self.list, index) {
+                let top = (row.top + row.bottom - 2 * step - dot) / 2;
+                for y in [top, top + step, top + 2 * step] {
+                    for x in [left, left + step] {
+                        let rect = RECT {
+                            left: x,
+                            top: y,
+                            right: x + dot,
+                            bottom: y + dot,
+                        };
+                        unsafe { FillRect(draw.hdc, &rect, grip_brush) };
+                    }
+                }
+            }
+        }
+        if let Some(slot) = self.drag.as_ref().and_then(|drag| drag.slot) {
+            let mut bounds = RECT::default();
+            if unsafe { GetClientRect(self.list, &mut bounds) }.is_ok()
+                && let Some(row) = row_bounds(self.list, slot.min(Metric::ALL.len() - 1))
+            {
+                let thickness = scale(2, dpi);
+                let edge = if slot == Metric::ALL.len() {
+                    row.bottom
+                } else {
+                    row.top
+                };
+                let top = (edge - thickness / 2).clamp(0, (bounds.bottom - thickness).max(0));
+                let line = RECT {
+                    left: scale(4, dpi),
+                    top,
+                    right: bounds.right - scale(4, dpi),
+                    bottom: top + thickness,
+                };
+                unsafe { FillRect(draw.hdc, &line, GetSysColorBrush(COLOR_HIGHLIGHT)) };
+            }
+        }
+        CDRF_DODEFAULT
+    }
+
+    fn show_drag_cursor(&self, target: HWND) -> bool {
+        if self.drag.is_none() {
+            if target != self.list {
+                return false;
+            }
+            let mut point = [POINT::default()];
+            if unsafe { GetCursorPos(&mut point[0]) }.is_err() {
+                return false;
+            }
+            unsafe { MapWindowPoints(None, Some(self.list), &mut point) };
+            if point[0].x < 0 || point[0].x >= scale(GRIP_WIDTH, window_dpi(self.list)) {
+                return false;
+            }
+            let mut hit = LVHITTESTINFO {
+                pt: point[0],
+                ..Default::default()
+            };
+            if send(
+                self.list,
+                LVM_SUBITEMHITTEST,
+                0,
+                &mut hit as *mut _ as isize,
+            ) < 0
+            {
+                return false;
+            }
+        }
+        if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_SIZENS) } {
+            unsafe { SetCursor(Some(cursor)) };
+            return true;
+        }
+        false
     }
 
     fn list_notification(&mut self, info: &NMLISTVIEW) {
@@ -523,9 +733,14 @@ impl Editor {
         };
         match info.hdr.code {
             LVN_BEGINDRAG => {
-                self.drag = Some(info.iItem as usize);
                 unsafe {
                     SetCapture(self.hwnd);
+                }
+                if unsafe { GetCapture() } == self.hwnd {
+                    let from = info.iItem as usize;
+                    self.select(from);
+                    self.drag = Some(Drag { from, slot: None });
+                    self.show_drag_cursor(self.list);
                 }
             }
             LVN_ITEMCHANGED if info.uChanged.0 & LVIF_STATE.0 != 0 => {
@@ -538,6 +753,14 @@ impl Editor {
             _ => {}
         }
     }
+}
+
+fn row_bounds(list: HWND, index: usize) -> Option<RECT> {
+    let mut row = RECT {
+        left: LVIR_BOUNDS as i32,
+        ..Default::default()
+    };
+    (send(list, LVM_GETITEMRECT, index, &mut row as *mut _ as isize) != 0).then_some(row)
 }
 
 fn control(parent: HWND, class: PCWSTR, label: PCWSTR, style: u32, id: usize) -> Result<HWND> {
@@ -584,8 +807,17 @@ fn with_editor<T>(run: impl FnOnce(&mut Editor) -> T) -> Option<T> {
 pub fn handle_dialog_message(message: &MSG) -> bool {
     let hwnd = with_editor(|editor| editor.hwnd);
     hwnd.is_some_and(|hwnd| unsafe {
-        (message.hwnd == hwnd || IsChild(hwnd, message.hwnd).as_bool())
-            && IsDialogMessageW(hwnd, message).as_bool()
+        if message.hwnd != hwnd && !IsChild(hwnd, message.hwnd).as_bool() {
+            return false;
+        }
+        if message.message == WM_KEYDOWN
+            && message.wParam.0 == VK_ESCAPE.0 as usize
+            && with_editor(|editor| editor.finish_drag(None)) == Some(true)
+        {
+            let _ = ReleaseCapture();
+            return true;
+        }
+        IsDialogMessageW(hwnd, message).as_bool()
     })
 }
 
@@ -641,6 +873,15 @@ unsafe extern "system" fn editor_proc(
                     }
                 });
             }
+            DENSITY if wparam.0 >> 16 == CBN_SELCHANGE as usize => {
+                with_editor(|editor| {
+                    let index = send(editor.density, CB_GETCURSEL, 0, 0);
+                    if let Some(&(density, _)) = DENSITY_OPTIONS.get(index as usize) {
+                        editor.display.density = density;
+                        editor.arrange_preview();
+                    }
+                });
+            }
             _ => {}
         },
         WM_NOTIFY => {
@@ -649,21 +890,35 @@ unsafe extern "system" fn editor_proc(
                 if matches!(header.code, LVN_BEGINDRAG | LVN_ITEMCHANGED) {
                     let info = unsafe { &*(lparam.0 as *const NMLISTVIEW) };
                     with_editor(|editor| editor.list_notification(info));
+                } else if header.code == NM_CUSTOMDRAW {
+                    let draw = unsafe { &*(lparam.0 as *const NMCUSTOMDRAW) };
+                    return LRESULT(
+                        with_editor(|editor| editor.draw_list(draw)).unwrap_or(0) as isize
+                    );
                 }
             }
+        }
+        WM_SETCURSOR if lparam.0 as u16 == HTCLIENT as u16 => {
+            let target = HWND(wparam.0 as *mut _);
+            if with_editor(|editor| editor.show_drag_cursor(target)) == Some(true) {
+                return LRESULT(1);
+            }
+            return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
         }
         WM_MOUSEMOVE => {
             with_editor(|editor| editor.drag_over(super::message_point(lparam)));
         }
         WM_LBUTTONUP => {
-            if with_editor(|editor| editor.drag.take().is_some()) == Some(true) {
+            if with_editor(|editor| editor.finish_drag(Some(super::message_point(lparam))))
+                == Some(true)
+            {
                 unsafe {
                     let _ = ReleaseCapture();
                 }
             }
         }
         WM_CAPTURECHANGED => {
-            with_editor(|editor| editor.drag = None);
+            with_editor(|editor| editor.finish_drag(None));
         }
         WM_SIZE => {
             with_editor(|editor| editor.arrange());
@@ -794,36 +1049,108 @@ mod tests {
                 || with_editor(|editor| editor.preview_dpi).unwrap() < initial_dpi
         );
 
-        let drag = NMLISTVIEW {
-            hdr: NMHDR {
-                hwndFrom: list,
-                idFrom: LIST,
-                code: LVN_BEGINDRAG,
+        let grip = scale(GRIP_WIDTH, window_dpi(list)) / 2;
+        let memory_row = row_bounds(list, memory).unwrap();
+        let mut hit = LVHITTESTINFO {
+            pt: POINT {
+                x: grip,
+                y: (memory_row.top + memory_row.bottom) / 2,
             },
-            iItem: memory as i32,
             ..Default::default()
         };
-        send(hwnd, WM_NOTIFY, LIST, &drag as *const _ as isize);
-        let mut row = RECT::default();
-        assert_ne!(
-            send(list, LVM_GETITEMRECT, 0, &mut row as *mut _ as isize),
-            0
+        assert_eq!(
+            send(list, LVM_SUBITEMHITTEST, 0, &mut hit as *mut _ as isize),
+            memory as isize
         );
+        assert_eq!(hit.iSubItem as usize, GRIP_COLUMN);
+
+        let begin_drag = || {
+            const LEFT_BUTTON_DOWN: usize = 1;
+            let moved = POINT {
+                y: hit.pt.y - scale(24, window_dpi(list)),
+                ..hit.pt
+            };
+            // Feed the list view's native drag detection without moving the desktop cursor.
+            unsafe {
+                PostMessageW(
+                    Some(list),
+                    WM_MOUSEMOVE,
+                    WPARAM(LEFT_BUTTON_DOWN),
+                    mouse_param(moved),
+                )
+                .unwrap();
+                PostMessageW(Some(list), WM_LBUTTONUP, WPARAM(0), mouse_param(moved)).unwrap();
+                send(
+                    list,
+                    WM_LBUTTONDOWN,
+                    LEFT_BUTTON_DOWN,
+                    mouse_param(hit.pt).0,
+                );
+                let mut message = MSG::default();
+                let _ = PeekMessageW(
+                    &mut message,
+                    Some(list),
+                    WM_LBUTTONUP,
+                    WM_LBUTTONUP,
+                    PM_REMOVE,
+                );
+            }
+            assert_eq!(
+                with_editor(|editor| editor.drag.as_ref().map(|drag| drag.from)),
+                Some(Some(memory))
+            );
+        };
+        let row = row_bounds(list, 0).unwrap();
         let mut points = [POINT {
-            x: 9,
-            y: (row.top + row.bottom) / 2,
+            x: grip,
+            y: row.top + (row.bottom - row.top) / 4,
         }];
         unsafe {
             MapWindowPoints(Some(list), Some(hwnd), &mut points);
         }
-        let mouse = (points[0].x as u16 as isize) | ((points[0].y as u16 as isize) << 16);
+        let mouse = mouse_param(points[0]).0;
+        begin_drag();
         send(hwnd, WM_MOUSEMOVE, 0, mouse);
+        assert_eq!(
+            with_editor(|editor| editor.preview_display().metrics.iter().next()),
+            Some(Some(Metric::AvailableMemory))
+        );
+        assert_eq!(
+            with_editor(|editor| editor.display.metrics.iter().next()),
+            Some(Some(Metric::Upload))
+        );
+        assert!(handle_dialog_message(&MSG {
+            hwnd: list,
+            message: WM_KEYDOWN,
+            wParam: WPARAM(VK_ESCAPE.0 as usize),
+            ..Default::default()
+        }));
+        assert_eq!(
+            with_editor(|editor| editor.preview_display().metrics.iter().next()),
+            Some(Some(Metric::Upload))
+        );
+
+        begin_drag();
+        send(hwnd, WM_MOUSEMOVE, 0, mouse);
+        let outside = POINT { x: 0, ..points[0] };
+        send(hwnd, WM_LBUTTONUP, 0, mouse_param(outside).0);
+        assert_eq!(
+            with_editor(|editor| editor.preview_display().metrics.iter().next()),
+            Some(Some(Metric::Upload))
+        );
+
+        begin_drag();
+        send(hwnd, WM_MOUSEMOVE, 0, mouse);
+        send(hwnd, WM_LBUTTONUP, 0, mouse);
         assert_eq!(
             with_editor(|editor| editor.display.metrics.iter().next()),
             Some(Some(Metric::AvailableMemory))
         );
+        assert_eq!(
+            send(list, LVM_GETITEMSTATE, 0, LVIS_STATEIMAGEMASK.0 as isize),
+            0x2000
+        );
         assert_eq!(with_app(|app| app.settings.display), Some(settings.display));
-        send(hwnd, WM_LBUTTONUP, 0, mouse);
 
         let mode = with_editor(|editor| editor.mode).unwrap();
         send(mode, CB_SETCURSEL, 1, 0);
@@ -847,6 +1174,21 @@ mod tests {
             Some(TextSize::MIN)
         );
         assert!(client_bounds(preview).bottom < preview_height);
+        let (density, preview_width) =
+            with_editor(|editor| (editor.density, client_width(preview))).unwrap();
+        assert_eq!(send(density, CB_GETCURSEL, 0, 0), 0);
+        send(density, CB_SETCURSEL, 2, 0);
+        send(
+            hwnd,
+            WM_COMMAND,
+            DENSITY | ((CBN_SELCHANGE as usize) << 16),
+            density.0 as isize,
+        );
+        assert_eq!(
+            with_editor(|editor| editor.display.density),
+            Some(Density::Tight)
+        );
+        assert!(client_width(preview) < preview_width);
         assert_eq!(with_app(|app| app.settings.display), Some(settings.display));
         send(hwnd, WM_COMMAND, IDCANCEL.0 as usize, 0);
         assert_eq!(with_editor(|editor| editor.hwnd), None);
@@ -856,6 +1198,10 @@ mod tests {
 
     fn client_width(hwnd: HWND) -> i32 {
         client_bounds(hwnd).right
+    }
+
+    fn mouse_param(point: POINT) -> LPARAM {
+        LPARAM((point.x as u16 as isize) | ((point.y as u16 as isize) << 16))
     }
 
     fn client_bounds(hwnd: HWND) -> RECT {
