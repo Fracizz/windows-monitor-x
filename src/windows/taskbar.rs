@@ -181,7 +181,6 @@ impl Taskbar {
             return None;
         }
         self.occupied.clear();
-        self.occupied.push((tray.left, bounds.right));
 
         let mut has_app_buttons = false;
         unsafe {
@@ -227,7 +226,7 @@ impl Taskbar {
         }
         let Some(x) = taskbar_gap(
             bounds.left,
-            bounds.right,
+            tray.left,
             &mut self.occupied,
             width,
             padding,
@@ -395,33 +394,42 @@ fn fullscreen_on_bar(bar: HWND, own_window: HWND) -> bool {
 
 fn taskbar_gap(
     left: i32,
-    right: i32,
+    tray_left: i32,
     occupied: &mut [(i32, i32)],
     width: i32,
     padding: i32,
     side: TaskbarSide,
     preferred_x: Option<i32>,
 ) -> Option<i32> {
+    let left = if side == TaskbarSide::Right {
+        // The right slot starts after the last visible taskbar control.
+        occupied.iter().fold(left, |edge, &(_, end)| edge.max(end))
+    } else {
+        left
+    };
     if let Some(x) = preferred_x {
         let (start, end) = (x - padding, x + width + padding);
-        if start >= left && end <= right && occupied.iter().all(|&(a, b)| b <= start || a >= end) {
+        if start >= left
+            && end <= tray_left
+            && occupied.iter().all(|&(a, b)| b <= start || a >= end)
+        {
             return Some(x);
         }
     }
-    occupied.sort_unstable();
-    let mut found = None;
-    let mut next = left;
-    for (start, end) in occupied.iter().copied().chain([(right, right)]) {
-        let start = start.clamp(left, right);
-        if start - next >= width + 2 * padding {
-            if side == TaskbarSide::Left {
-                return Some(next + padding);
-            }
-            found = Some(start - padding - width);
-        }
-        next = next.max(end.clamp(left, right));
+    if side == TaskbarSide::Right {
+        return (tray_left - left >= width + 2 * padding).then_some(tray_left - padding - width);
     }
-    found
+
+    occupied.sort_unstable();
+    let mut next = left;
+    for (start, end) in occupied.iter().copied().chain([(tray_left, tray_left)]) {
+        let start = start.clamp(left, tray_left);
+        if start - next >= width + 2 * padding {
+            return Some(next + padding);
+        }
+        next = next.max(end.clamp(left, tray_left));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -430,38 +438,64 @@ mod tests {
 
     #[test]
     fn docking_prefers_the_selected_edge_and_keeps_clear_of_controls() {
-        let mut occupied = [(850, 1000), (15, 65), (300, 440), (390, 500)];
+        let mut occupied = [(15, 65), (390, 500), (300, 440)];
         assert_eq!(
-            taskbar_gap(0, 1000, &mut occupied, 150, 6, TaskbarSide::Left, None),
+            taskbar_gap(0, 850, &mut occupied, 150, 6, TaskbarSide::Left, None),
             Some(71)
         );
         assert_eq!(
-            taskbar_gap(0, 1000, &mut occupied, 150, 6, TaskbarSide::Right, None),
+            taskbar_gap(0, 850, &mut occupied, 150, 6, TaskbarSide::Right, None),
             Some(694)
         );
         for side in [TaskbarSide::Left, TaskbarSide::Right] {
+            assert_eq!(taskbar_gap(0, 850, &mut occupied, 350, 6, side, None), None);
+        }
+    }
+
+    #[test]
+    fn right_docking_waits_for_room_next_to_the_tray() {
+        let mut occupied = [(310, 650)];
+        let prior_slot = taskbar_gap(0, 740, &mut occupied, 240, 6, TaskbarSide::Left, None);
+        assert_eq!(prior_slot, Some(6));
+        for preferred_x in [None, prior_slot] {
             assert_eq!(
-                taskbar_gap(0, 1000, &mut occupied, 350, 6, side, None),
+                taskbar_gap(
+                    0,
+                    740,
+                    &mut occupied,
+                    240,
+                    6,
+                    TaskbarSide::Right,
+                    preferred_x
+                ),
                 None
             );
         }
-        let mut occupied = [(310, 650), (740, 999)];
+        occupied[0].1 = 488;
         assert_eq!(
-            taskbar_gap(0, 1000, &mut occupied, 240, 6, TaskbarSide::Right, None),
-            Some(64)
+            taskbar_gap(
+                0,
+                740,
+                &mut occupied,
+                240,
+                6,
+                TaskbarSide::Right,
+                prior_slot
+            ),
+            Some(494)
         );
     }
 
     #[test]
     fn reuses_the_docked_slot_until_a_control_encroaches() {
-        let mut occupied = [(0, 60), (400, 480), (820, 1000)];
+        let mut occupied = [(0, 60), (400, 480)];
         assert_eq!(
-            taskbar_gap(0, 1000, &mut occupied, 150, 6, TaskbarSide::Left, Some(200)),
+            taskbar_gap(0, 820, &mut occupied, 150, 6, TaskbarSide::Left, Some(200)),
             Some(200)
         );
         occupied[1] = (355, 480);
         assert_eq!(
-            taskbar_gap(0, 1000, &mut occupied, 150, 6, TaskbarSide::Left, Some(200)),
+            taskbar_gap(0, 820, &mut occupied, 150, 6, TaskbarSide::Left, Some(200)),
             Some(66)
         );
     }

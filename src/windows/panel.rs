@@ -114,7 +114,6 @@ impl Layout {
             }
             Metric::AvailableMemory | Metric::UsedMemory => (139, 135),
             Metric::AvailableMemoryPercent => (112, 106),
-            Metric::CpuFrequency if language == Language::English => (132, 126),
             Metric::CpuFrequency => (126, 120),
             Metric::Uptime => (142, 136),
         };
@@ -825,14 +824,13 @@ fn metric_labels(
         .filter(|&metric| !is_network_rate(metric))
     {
         let label = match metric {
-            Metric::Cpu => "CPU",
+            Metric::Cpu | Metric::CpuFrequency => "CPU",
             Metric::Memory => language.choose("内存", "RAM"),
             Metric::AvailableMemory | Metric::AvailableMemoryPercent => {
                 language.choose("可用内存", "Free RAM")
             }
             Metric::UsedMemory => language.choose("已用内存", "Used RAM"),
             Metric::Disk => language.choose("磁盘", "Disk"),
-            Metric::CpuFrequency => language.choose("CPU 频率", "CPU Clock"),
             Metric::Battery => language.choose("电量", "Battery"),
             Metric::Traffic => language.choose("累计流量", "Traffic"),
             _ => super::metric_name(metric, language),
