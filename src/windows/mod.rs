@@ -87,7 +87,7 @@ use state::{
 };
 use taskbar::{
     DockPlacement, Observation, Placement, Taskbar, covered_by_taskbar, is_taskbar_window,
-    is_tray_overflow, primary_taskbar, taskbar_has_focus, taskbar_menu_open,
+    is_tray_overflow, primary_taskbar, taskbar_has_focus, taskbar_menu_open, taskbar_topmost,
 };
 use ui::{Window, control, position, register_class, scale, send, window_dpi};
 use worker::{Feed, SamplerWorker, WorkerCommand, notify};
@@ -112,6 +112,8 @@ const PAINT_RETRY_TIMER: usize = 2;
 /// 绘制失败（如显示设备暂时不可用）后等待多久重绘；渲染目标已在失败时丢弃，重绘会重新创建。
 const PAINT_RETRY: u32 = 1_000;
 const DOCK_Z_ORDER_SETTLE: Duration = Duration::from_millis(120);
+/// 前台切换时任务栏未置顶：等待 Explorer 恢复任务栏置顶期间持续盯住 z 序的时长。
+const DOCK_TOPMOST_SETTLE: Duration = Duration::from_millis(800);
 const SAVE_INTERVAL: Duration = Duration::from_secs(60);
 
 const TOGGLE: usize = 101;
@@ -267,6 +269,18 @@ impl App {
         match self.placement {
             Some(Placement::Docked(rect)) if self.shown => Some(rect),
             _ => None,
+        }
+    }
+
+    /// 在 `settle` 时间内反复检查面板是否被任务栏盖住；已在检查中则只延长截止时间。
+    fn settle_dock_z_order(&mut self, hwnd: HWND, settle: Duration) {
+        let until = Instant::now() + settle;
+        match self.dock_z_order_until {
+            Some(current) => self.dock_z_order_until = Some(current.max(until)),
+            None => {
+                self.dock_z_order_until = Some(until);
+                self.schedule_dock_z_order_check(hwnd);
+            }
         }
     }
 
@@ -510,6 +524,21 @@ unsafe extern "system" fn taskbar_event(
     let Some(bar) = primary_taskbar() else {
         return;
     };
+    if event == EVENT_SYSTEM_FOREGROUND {
+        // 截图覆盖层、全屏应用盖住任务栏时 Explorer 会撤掉任务栏的置顶，前台切走后约几十毫秒
+        // 再把任务栏提到最上层，盖住面板；轮询要最长 1 秒才发现，看起来像面板消失了一下。
+        let restoring = !taskbar_topmost(bar);
+        with_app(|app| {
+            // 全屏应用退出或切走后立即重新探测，不必等下一次轮询才恢复面板。
+            if app.placement == Some(Placement::Hidden) {
+                let _ = app.worker.send(WorkerCommand::RecheckDock);
+            }
+            if restoring && app.visible_dock_rect().is_some() {
+                let panel = app.tray.hWnd;
+                app.settle_dock_z_order(panel, DOCK_TOPMOST_SETTLE);
+            }
+        });
+    }
     let is_interaction = if visibility_event {
         is_tray_overflow(bar, window)
     } else {
@@ -529,13 +558,7 @@ unsafe extern "system" fn taskbar_event(
         let rect = app.visible_dock_rect()?;
         let panel = app.tray.hWnd;
         // Explorer can raise the taskbar just after sending the foreground event.
-        if app
-            .dock_z_order_until
-            .replace(Instant::now() + DOCK_Z_ORDER_SETTLE)
-            .is_none()
-        {
-            app.schedule_dock_z_order_check(panel);
-        }
+        app.settle_dock_z_order(panel, DOCK_Z_ORDER_SETTLE);
         Some((panel, rect))
     })
     .flatten() else {

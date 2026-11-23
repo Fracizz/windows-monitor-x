@@ -160,7 +160,8 @@ impl Taskbar {
         side: TaskbarSide,
         size: LayoutSize,
     ) -> Option<Observation> {
-        if overlay_on_bar(bar, own_window) {
+        let cover = foreground_cover(bar, own_window);
+        if cover == Cover::Overlay {
             return Some(Observation::Overlay);
         }
         let mut info = APPBARDATA {
@@ -174,7 +175,7 @@ impl Taskbar {
         if bounds.right - bounds.left <= bounds.bottom - bounds.top {
             return Some(Observation::Placement(Placement::Floating));
         }
-        if !unsafe { IsWindowVisible(bar).as_bool() } || fullscreen_on_bar(bar, own_window) {
+        if !unsafe { IsWindowVisible(bar).as_bool() } || cover == Cover::Fullscreen {
             return Some(Observation::Placement(Placement::Hidden));
         }
         let dpi = window_dpi(bar);
@@ -256,6 +257,11 @@ impl Taskbar {
 
 pub fn primary_taskbar() -> Option<HWND> {
     unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) }.ok()
+}
+
+pub fn taskbar_topmost(bar: HWND) -> bool {
+    let style = unsafe { GetWindowLongPtrW(bar, GWL_EXSTYLE) };
+    style & WS_EX_TOPMOST.0 as isize != 0
 }
 
 pub fn taskbar_has_focus(bar: HWND) -> bool {
@@ -362,20 +368,46 @@ fn is_button(kind: UIA_CONTROLTYPE_ID) -> bool {
     .contains(&kind)
 }
 
-fn fullscreen_on_bar(bar: HWND, own_window: HWND) -> bool {
-    let foreground = unsafe { GetForegroundWindow() };
-    foreground_candidate(bar, own_window, foreground)
-        && !screen_overlay(foreground)
-        && covers_bar_monitor(bar, foreground)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cover {
+    Clear,
+    /// 盖住任务栏所在显示器、且已压在面板之上的前台窗口（截图覆盖层等）。
+    Overlay,
+    /// 盖住任务栏所在显示器、但在面板之下的全屏应用：面板会浮在它上面，需要隐藏。
+    Fullscreen,
 }
 
-/// 前台是否为盖住任务栏所在显示器的截图覆盖层。截图期间（以及刚结束时）任务栏的
-/// 可见性和布局读数都不可信，此时保持面板原状，不隐藏、不换槽、不转浮窗。
-fn overlay_on_bar(bar: HWND, own_window: HWND) -> bool {
+/// 判断前台窗口是否盖住任务栏所在显示器，以及它与面板的上下关系。
+///
+/// 微信截图的覆盖层只有 `WS_EX_TOPMOST`（不是工具窗口、也无所有者），样式上与全屏游戏无异，
+/// 而且 Explorer 同样会因它撤掉任务栏的置顶。真正需要隐藏面板的只有面板会浮在其上的全屏应用；
+/// 已经压在置顶面板之上的窗口本就挡住了面板，隐藏只会让面板在截图结束后晚一拍才出现（看起来闪一下）。
+/// 此时保持原状：不隐藏、不换槽、不转浮窗。
+fn foreground_cover(bar: HWND, own_window: HWND) -> Cover {
     let foreground = unsafe { GetForegroundWindow() };
-    foreground_candidate(bar, own_window, foreground)
-        && screen_overlay(foreground)
-        && covers_bar_monitor(bar, foreground)
+    if !foreground_candidate(bar, own_window, foreground) || !covers_bar_monitor(bar, foreground) {
+        Cover::Clear
+    } else if screen_overlay(foreground) || is_above(foreground, own_window) {
+        Cover::Overlay
+    } else {
+        Cover::Fullscreen
+    }
+}
+
+/// `window` 在 z 序上是否位于 `other` 之上。隐藏的窗口仍保留 z 序位置，面板隐藏时也能判断。
+fn is_above(window: HWND, other: HWND) -> bool {
+    let mut visited = HashSet::new();
+    let mut current = other;
+    while let Ok(above) = unsafe { GetWindow(current, GW_HWNDPREV) } {
+        if above == window {
+            return true;
+        }
+        if !visited.insert(above.0) {
+            break;
+        }
+        current = above;
+    }
+    false
 }
 
 fn foreground_candidate(bar: HWND, own_window: HWND, foreground: HWND) -> bool {
@@ -416,9 +448,9 @@ fn covers_bar_monitor(bar: HWND, window: HWND) -> bool {
         && frame.bottom >= display.bottom
 }
 
-/// 截图工具（PixPin、Snipaste、微信/QQ 截图等）打开时会盖一层全屏置顶、不在任务栏显示按钮的窗口，
+/// 截图工具（PixPin、Snipaste 等）打开时会盖一层全屏置顶、不在任务栏显示按钮的窗口，
 /// 它不是全屏应用，不能据此隐藏面板，否则面板会在截图开始时消失、结束时又出现，看起来像闪烁。
-/// 全屏游戏、视频等通常有任务栏按钮（非工具窗口、无所有者），仍按全屏处理。
+/// 样式认不出的覆盖层（如微信截图）由 [`foreground_cover`] 按 z 序兜底。
 fn screen_overlay(window: HWND) -> bool {
     let style = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) };
     if style & WS_EX_TOPMOST.0 as isize == 0 || style & WS_EX_APPWINDOW.0 as isize != 0 {
@@ -678,6 +710,42 @@ mod tests {
         ] {
             let window = create(style);
             assert_eq!(screen_overlay(window), expected);
+            let _ = unsafe { DestroyWindow(window) };
+        }
+    }
+
+    #[test]
+    fn z_order_tells_which_window_is_above() {
+        use ::windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SetWindowPos, WS_POPUP,
+        };
+        let create = || unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                w!("Static"),
+                PCWSTR::null(),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let (upper, lower) = (create(), create());
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+        unsafe {
+            SetWindowPos(upper, Some(HWND_TOP), 0, 0, 0, 0, flags).unwrap();
+            SetWindowPos(lower, Some(upper), 0, 0, 0, 0, flags).unwrap();
+        }
+        assert!(is_above(upper, lower));
+        assert!(!is_above(lower, upper));
+        for window in [upper, lower] {
             let _ = unsafe { DestroyWindow(window) };
         }
     }
