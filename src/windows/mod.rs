@@ -11,6 +11,7 @@ mod sampler;
 mod startup;
 mod state;
 mod taskbar;
+mod taskbar_host;
 mod ui;
 mod updater;
 mod worker;
@@ -89,6 +90,7 @@ use taskbar::{
     DockPlacement, Observation, Placement, Taskbar, covered_by_taskbar, is_taskbar_window,
     is_tray_overflow, primary_taskbar, taskbar_has_focus, taskbar_menu_open, taskbar_topmost,
 };
+use taskbar_host::TaskbarHost;
 use ui::{Window, control, position, register_class, scale, send, window_dpi};
 use worker::{Feed, SamplerWorker, WorkerCommand, notify};
 
@@ -158,6 +160,8 @@ thread_local! {
 struct App {
     panel: Option<Panel>,
     panel_input: PanelInput,
+    /// 任务栏嵌入时承载面板画面的任务栏子窗口。
+    taskbar_host: TaskbarHost,
     settings: Settings,
     dark: bool,
     dpi: u32,
@@ -215,6 +219,7 @@ impl App {
         Self {
             panel: None,
             panel_input: PanelInput::default(),
+            taskbar_host: TaskbarHost::default(),
             settings,
             dark: settings.theme.is_dark(false),
             dpi: 96,
@@ -379,7 +384,7 @@ impl App {
             self.paint_error = result.err();
         } else if result.is_err() {
             // 本次绘制区域已被 EndPaint 视为有效，读数不变时不会再重绘，因此稍后主动重试。
-            unsafe { SetTimer(Some(hwnd), PAINT_RETRY_TIMER, PAINT_RETRY, None) };
+            unsafe { SetTimer(Some(self.tray.hWnd), PAINT_RETRY_TIMER, PAINT_RETRY, None) };
         }
     }
 
@@ -596,6 +601,7 @@ fn check_dock_z_order(hwnd: HWND) {
 }
 
 fn keep_dock_above_taskbar(bar: HWND, hwnd: HWND, rect: RECT) {
+    with_app(|app| app.taskbar_host.raise());
     if covered_by_taskbar(bar, hwnd, rect) {
         set_topmost(hwnd, true);
     }
@@ -910,7 +916,7 @@ unsafe extern "system" fn window_proc(
             };
             if first_sample {
                 apply_placement(hwnd);
-            } else if changed && unsafe { IsWindowVisible(hwnd).as_bool() } {
+            } else if changed {
                 invalidate(hwnd);
             }
             editor::refresh_preview();
@@ -975,7 +981,8 @@ unsafe extern "system" fn window_proc(
                 });
                 if ready.is_some() {
                     recheck_placement(hwnd);
-                    apply_visibility(hwnd);
+                    // 新任务栏没有面板子窗口；槽位不变时 DOCK_READY 不会再来，这里直接重新嵌入。
+                    apply_placement(hwnd);
                     manager::refresh_settings();
                 }
             } else {
@@ -1028,6 +1035,7 @@ fn apply_placement(hwnd: HWND) {
         }
         (false, Placement::Docked(rect)) => {
             edge::undock(hwnd);
+            // 主窗口保持在槽位上（隐藏），供尺寸、DPI 和全屏判断使用；画面由任务栏子窗口显示。
             let _ = unsafe {
                 SetWindowPos(
                     hwnd,
@@ -1039,9 +1047,17 @@ fn apply_placement(hwnd: HWND) {
                     SWP_NOACTIVATE,
                 )
             };
-            shape_panel(hwnd, window_dpi(hwnd), layout.radius(display.text_size));
+            let hosted = primary_taskbar().is_some_and(|bar| {
+                with_app(|app| app.taskbar_host.attach(hwnd, bar, rect)) == Some(true)
+            });
+            if !hosted {
+                shape_panel(hwnd, window_dpi(hwnd), layout.radius(display.text_size));
+            }
         }
         (false, Placement::Hidden) => edge::undock(hwnd),
+    }
+    if !matches!((waiting_sample, placement), (false, Placement::Docked(_))) {
+        with_app(|app| app.taskbar_host.detach());
     }
     apply_visibility(hwnd);
 }
@@ -1089,10 +1105,27 @@ fn set_panel_frame(hwnd: HWND, enabled: bool) {
 }
 
 fn apply_visibility(hwnd: HWND) {
-    let shown = with_app(|app| app.shown && app.placement != Some(Placement::Hidden)) == Some(true);
-    if shown != unsafe { IsWindowVisible(hwnd).as_bool() } {
-        let _ = unsafe { ShowWindow(hwnd, if shown { SW_SHOWNOACTIVATE } else { SW_HIDE }) };
+    let (shown, hosted) = with_app(|app| {
+        (
+            app.shown && app.placement != Some(Placement::Hidden),
+            app.taskbar_host.active().is_some(),
+        )
+    })
+    .unwrap_or_default();
+    let window_shown = shown && !hosted;
+    if window_shown != unsafe { IsWindowVisible(hwnd).as_bool() } {
+        let _ = unsafe {
+            ShowWindow(
+                hwnd,
+                if window_shown {
+                    SW_SHOWNOACTIVATE
+                } else {
+                    SW_HIDE
+                },
+            )
+        };
     }
+    with_app(|app| app.taskbar_host.set_visible(shown));
     sync_panel_input(hwnd);
     if shown {
         invalidate(hwnd);
@@ -1267,7 +1300,11 @@ fn set_topmost(hwnd: HWND, topmost: bool) {
 }
 
 fn invalidate(hwnd: HWND) {
-    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    // 嵌入任务栏时主窗口隐藏，画面在任务栏子窗口里。
+    let target = with_app(|app| app.taskbar_host.active())
+        .flatten()
+        .unwrap_or(hwnd);
+    let _ = unsafe { InvalidateRect(Some(target), None, false) };
 }
 
 fn message_point(value: LPARAM) -> POINT {

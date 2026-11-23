@@ -623,7 +623,12 @@ impl Panel {
         };
         // 圆角之外的像素：分层窗口留全透明；子窗口预览填父窗口底色。
         let backdrop = if layered {
-            D2D1_COLOR_F::default()
+            // 分层窗口在 alpha 为 0 的像素上不接收鼠标；留 1/255 的不可见底色，
+            // 透明主题嵌入任务栏时文字间的空白处也能右键、双击。
+            D2D1_COLOR_F {
+                a: 1.0 / 255.0,
+                ..Default::default()
+            }
         } else {
             {
                 // GetSysColor 返回 0x00BBGGRR，转成 0xRRGGBB。
@@ -1566,7 +1571,8 @@ mod tests {
             }
             super::super::set_panel_layered(hwnd, true);
             for dark in [false, true] {
-                // 实色主题同样走分层窗口：圆角外全透明、圆角边缘半透明（抗锯齿）、内部不透明。
+                // 实色主题同样走分层窗口：圆角外只留 1/255 的不可见底色（接收鼠标）、
+                // 圆角边缘半透明（抗锯齿）、内部不透明。
                 panel
                     .paint(hwnd, dpi, Appearance::Solid { dark }, &readings)
                     .unwrap();
@@ -1589,13 +1595,13 @@ mod tests {
                 let (cx, cy) = (bitmap.size.cx as usize, bitmap.size.cy as usize);
                 let pixels =
                     unsafe { std::slice::from_raw_parts(dib.dsBm.bmBits.cast::<u32>(), cx * cy) };
-                assert_eq!(pixels[0], 0);
-                assert_eq!(pixels[cx * cy - 1], 0);
+                assert_eq!(pixels[0], 0x0100_0000);
+                assert_eq!(pixels[cx * cy - 1], 0x0100_0000);
                 assert_eq!(pixels[cy / 2 * cx + cx / 2] >> 24, 0xff);
                 assert!(
                     pixels
                         .iter()
-                        .any(|pixel| (1..0xff).contains(&(pixel >> 24)))
+                        .any(|pixel| (2..0xff).contains(&(pixel >> 24)))
                 );
             }
             for dark in [false, true] {
@@ -1624,10 +1630,12 @@ mod tests {
                         (bitmap.size.cx * bitmap.size.cy) as usize,
                     )
                 };
-                assert_eq!(pixels[0], 0);
-                assert_eq!(pixels[bitmap.size.cx as usize - 1], 0);
-                assert_eq!(pixels[pixels.len() - bitmap.size.cx as usize], 0);
-                assert_eq!(pixels[pixels.len() - 1], 0);
+                // 透明主题的空白处只有 1/255 的不可见底色，用来接收鼠标。
+                let backdrop = 0x0100_0000;
+                assert_eq!(pixels[0], backdrop);
+                assert_eq!(pixels[bitmap.size.cx as usize - 1], backdrop);
+                assert_eq!(pixels[pixels.len() - bitmap.size.cx as usize], backdrop);
+                assert_eq!(pixels[pixels.len() - 1], backdrop);
                 assert!(pixels.contains(&if dark { 0xffffffff } else { 0xff000000 }));
                 let pixel_scale = pixel_scale(display.text_size, dpi);
                 let (start, end) = mode.dividers(display, pixel_scale).next().unwrap();

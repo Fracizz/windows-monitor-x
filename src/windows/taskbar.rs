@@ -29,7 +29,7 @@ use ::windows::{
     core::{Interface, PCWSTR, Result, w},
 };
 
-use super::{panel::LayoutSize, scale, state::TaskbarSide, window_dpi};
+use super::{panel::LayoutSize, scale, state::TaskbarSide, taskbar_host, window_dpi};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Placement {
@@ -210,6 +210,13 @@ impl Taskbar {
                     return Some(Observation::MenuOpen);
                 }
                 if !valid_on_bar(rect, bounds) || rect.left >= tray.left {
+                    continue;
+                }
+                // 面板自己嵌在任务栏里的子窗口不算占用。
+                if child
+                    .CachedClassName()
+                    .is_ok_and(|class| class == taskbar_host::CLASS_NAME)
+                {
                     continue;
                 }
                 if is_button(kind) {
