@@ -481,12 +481,8 @@ impl Editor {
             height,
         );
         self.panel.set_layout(self.layout, display);
+        // 圆角由 Panel 抗锯齿绘制，预览窗口不再设置硬裁剪区域。
         self.panel.resize(self.preview, self.preview_dpi);
-        super::round_window(
-            self.preview,
-            self.preview_dpi,
-            self.layout.radius(self.display.text_size),
-        );
         invalidate(self.preview);
     }
 

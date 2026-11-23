@@ -640,20 +640,20 @@ impl Manager {
             CHECK_HEIGHT,
         );
         let app_bottom = rows.end() + GROUP_PADDING_BOTTOM;
-        set(self.app_group, left, app_top, panel_width, app_bottom - app_top);
+        set(
+            self.app_group,
+            left,
+            app_top,
+            panel_width,
+            app_bottom - app_top,
+        );
         // 版本号放在常规设置下方、底部按钮之上的空白处。
         let version_y = (footer - FOOTER_SPACING - 22).max(app_bottom + 4);
         set(self.version, left + 2, version_y, panel_width, 22);
 
         let live_width = (right - live_x).max(1);
         set(self.live_heading, live_x, 15, live_width, 24);
-        set(
-            self.live_list,
-            live_x,
-            40,
-            live_width,
-            (footer - 52).max(1),
-        );
+        set(self.live_list, live_x, 40, live_width, (footer - 52).max(1));
         let readings_width = (live_width / 3).max(94);
         // Account for the border and a potential vertical scrollbar.
         let metric_width = (live_width - readings_width - 22).max(148);

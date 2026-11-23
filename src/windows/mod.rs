@@ -1,5 +1,6 @@
 mod about;
 mod commands;
+mod edge;
 mod editor;
 mod history_export;
 mod manager;
@@ -37,8 +38,9 @@ use ::windows::{
             },
             Gdi::{
                 BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, GetMonitorInfoW, HDC,
-                HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
-                MonitorFromWindow, PAINTSTRUCT, SetWindowRgn, UpdateWindow,
+                HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
+                MONITORINFO, MonitorFromPoint, MonitorFromWindow, PAINTSTRUCT, SetWindowRgn,
+                UpdateWindow,
             },
         },
         System::{
@@ -180,6 +182,10 @@ struct App {
     history_exporting: bool,
     /// 进入系统移动循环时的窗口矩形；单击或双击浮窗也会进入该循环，用它判断是否真的移动过。
     move_origin: Option<RECT>,
+    /// 浮窗贴边收起状态。
+    edge_dock: Option<edge::EdgeDock>,
+    /// 右键菜单打开期间不收起贴边浮窗。
+    menu_open: bool,
 }
 
 impl App {
@@ -232,6 +238,8 @@ impl App {
             update: None,
             history_exporting: false,
             move_origin: None,
+            edge_dock: None,
+            menu_open: false,
         }
     }
 
@@ -250,7 +258,9 @@ impl App {
     }
 
     fn panel_topmost(&self) -> bool {
-        self.settings.topmost || self.placement != Some(Placement::Floating)
+        self.settings.topmost
+            || self.placement != Some(Placement::Floating)
+            || self.edge_dock.is_some()
     }
 
     fn visible_dock_rect(&self) -> Option<RECT> {
@@ -372,12 +382,24 @@ impl App {
         }
         let panel = self.panel.as_mut().expect("panel initialized");
         panel.set_label_style(self.display.language, self.settings.label_bold)?;
-        let mut painted = panel.paint(hwnd, self.dpi, appearance, &self.displayed);
+        let capsule = self
+            .edge_dock
+            .filter(|dock| dock.hidden())
+            .map(|dock| dock.vertical());
+        let cpu = &self.displayed[Metric::Cpu.index()];
+        let paint = |panel: &mut Panel| {
+            if let Some(vertical) = capsule {
+                panel.paint_capsule(hwnd, self.dpi, self.dark, vertical, cpu)
+            } else {
+                panel.paint(hwnd, self.dpi, appearance, &self.displayed)
+            }
+        };
+        let mut painted = paint(panel);
         if painted
             .as_ref()
             .is_err_and(|error| error.code() == D2DERR_RECREATE_TARGET)
         {
-            painted = panel.paint(hwnd, self.dpi, appearance, &self.displayed);
+            painted = paint(panel);
         }
         painted
     }
@@ -751,6 +773,21 @@ unsafe extern "system" fn window_proc(
                 center_starting_panel(hwnd, dpi, display.text_size);
                 return LRESULT(0);
             }
+            // 收起成胶囊时直接采用系统建议的矩形，保持胶囊尺寸。
+            if with_app(|app| app.edge_dock.is_some_and(|dock| dock.hidden())) == Some(true) {
+                let _ = unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        None,
+                        suggested.left,
+                        suggested.top,
+                        suggested.right - suggested.left,
+                        suggested.bottom - suggested.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                };
+                return LRESULT(0);
+            }
             let (width, height) = layout.size(display).pixels(dpi);
             let _ = unsafe {
                 SetWindowPos(
@@ -792,6 +829,19 @@ unsafe extern "system" fn window_proc(
             let mut rect = RECT::default();
             // 只是单击或双击而没有拖动时，不重新吸附也不写设置文件。
             if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() && origin != Some(rect) {
+                // 拖到可收起的屏幕边缘附近（原吸附范围内）时贴边收起，否则按普通浮窗吸附。
+                let threshold = scale(24, window_dpi(hwnd));
+                if let Some(position) =
+                    edge::dragged_edge(rect, threshold).and_then(|edge| edge::dock(hwnd, edge))
+                {
+                    with_app(|app| {
+                        app.settings.position = Some(position);
+                        app.save();
+                    });
+                    return LRESULT(0);
+                }
+                edge::undock(hwnd);
+                set_topmost(hwnd, with_app(|app| app.panel_topmost()).unwrap_or(false));
                 let position = POINT {
                     x: rect.left,
                     y: rect.top,
@@ -810,6 +860,7 @@ unsafe extern "system" fn window_proc(
         WM_NCLBUTTONDBLCLK | WM_LBUTTONDBLCLK => double_click(hwnd),
         DOCK_Z_ORDER_CHECK => check_dock_z_order(hwnd),
         WM_TIMER if wparam.0 == DOCK_Z_ORDER_TIMER => check_dock_z_order(hwnd),
+        WM_TIMER if wparam.0 == edge::EDGE_TIMER => edge::tick(hwnd),
         WM_TIMER if wparam.0 == PAINT_RETRY_TIMER => {
             let _ = unsafe { KillTimer(Some(hwnd), PAINT_RETRY_TIMER) };
             invalidate(hwnd);
@@ -913,42 +964,47 @@ unsafe extern "system" fn window_proc(
 }
 
 fn apply_placement(hwnd: HWND) {
-    let Some((placement, position, topmost, layout, display, waiting_sample, transparent)) =
-        with_app(|app| {
-            let layout = app.layout();
-            let language_changed = app.display.language != app.settings.display.language;
-            app.display = app.settings.display;
-            if language_changed {
-                app.update_display();
-            }
-            if let Some(panel) = &mut app.panel {
-                panel.set_layout(layout, app.display);
-            }
-            app.refresh_theme();
-            (
-                app.placement.unwrap_or_default(),
-                app.settings.position,
-                app.panel_topmost(),
-                layout,
-                app.display,
-                app.waiting_sample,
-                !app.waiting_sample && app.settings.theme == Theme::Transparent,
-            )
-        })
-    else {
+    let Some((placement, position, topmost, layout, display, waiting_sample)) = with_app(|app| {
+        let layout = app.layout();
+        let language_changed = app.display.language != app.settings.display.language;
+        app.display = app.settings.display;
+        if language_changed {
+            app.update_display();
+        }
+        if let Some(panel) = &mut app.panel {
+            panel.set_layout(layout, app.display);
+        }
+        app.refresh_theme();
+        (
+            app.placement.unwrap_or_default(),
+            app.settings.position,
+            app.panel_topmost(),
+            layout,
+            app.display,
+            app.waiting_sample,
+        )
+    }) else {
         return;
     };
-    set_panel_layered(hwnd, transparent);
+    // 读数就绪后始终用分层窗口按像素 alpha 呈现：实色主题的圆角也能抗锯齿，
+    // 不再依赖 SetWindowRgn 的硬裁剪（会产生边缘毛刺）。启动阶段仍由 GDI 绘制，保留窗口区域。
+    set_panel_layered(hwnd, !waiting_sample);
     match (waiting_sample, placement) {
         (true, _) => {
+            edge::undock(hwnd);
             center_starting_panel(hwnd, window_dpi(hwnd), display.text_size);
             set_topmost(hwnd, topmost);
         }
         (false, Placement::Floating) => {
             place(hwnd, position, window_dpi(hwnd), display, false);
-            set_topmost(hwnd, topmost);
+            edge::restore(hwnd);
+            set_topmost(
+                hwnd,
+                topmost || with_app(|app| app.edge_dock.is_some()) == Some(true),
+            );
         }
         (false, Placement::Docked(rect)) => {
+            edge::undock(hwnd);
             let _ = unsafe {
                 SetWindowPos(
                     hwnd,
@@ -962,7 +1018,7 @@ fn apply_placement(hwnd: HWND) {
             };
             shape_panel(hwnd, window_dpi(hwnd), layout.radius(display.text_size));
         }
-        (false, Placement::Hidden) => {}
+        (false, Placement::Hidden) => edge::undock(hwnd),
     }
     apply_visibility(hwnd);
 }
@@ -1058,7 +1114,7 @@ fn center_starting_panel(hwnd: HWND, dpi: u32, text_size: TextSize) {
     }
     let bounds = monitor.rcMonitor;
     let width = scale(text_size.scale(184), dpi).min(bounds.right - bounds.left);
-    let height = scale(text_size.scale(68), dpi).min(bounds.bottom - bounds.top);
+    let height = scale(text_size.scale(62), dpi).min(bounds.bottom - bounds.top);
     unsafe {
         let _ = SetWindowPos(
             hwnd,

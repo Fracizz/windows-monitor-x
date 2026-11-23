@@ -56,6 +56,7 @@ pub(super) fn open_menu(hwnd: HWND, at: POINT) {
             .then(|| create_menu_host().ok())
             .flatten();
         let owner = menu_host.as_ref().map_or(hwnd, |window| window.0);
+        with_app(|app| app.menu_open = true);
         let selection = unsafe {
             let _ = SetForegroundWindow(owner);
             let result = TrackPopupMenu(
@@ -70,6 +71,7 @@ pub(super) fn open_menu(hwnd: HWND, at: POINT) {
             let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
             result.0 as usize
         };
+        with_app(|app| app.menu_open = false);
         if selection != 0 {
             command(hwnd, selection);
         }

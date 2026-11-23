@@ -26,13 +26,17 @@ use ::windows::{
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::{
                 AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-                CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, CreateSolidBrush,
-                DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-                DeleteDC, DeleteObject, DrawTextW, FillRect, HBITMAP, HDC, HGDIOBJ, LOGFONTW,
-                SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+                COLOR_BTNFACE, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW,
+                CreateSolidBrush, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX,
+                DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FillRect,
+                GetSysColor, HBITMAP, HDC, HGDIOBJ, LOGFONTW, SelectObject, SetBkMode,
+                SetTextColor, TRANSPARENT,
             },
         },
-        UI::WindowsAndMessaging::{GetClientRect, ULW_ALPHA, UpdateLayeredWindow},
+        UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, GetClientRect, GetWindowLongPtrW, ULW_ALPHA, UpdateLayeredWindow,
+            WS_EX_LAYERED,
+        },
     },
     core::{Error, Result, w},
 };
@@ -53,6 +57,11 @@ const ARROW_INSET: f32 = 2.5;
 /// 读数右对齐，在实测墨迹宽度之外多留的余量：吸收不同 Windows 版本字体度量的细微差异，
 /// 避免标签或读数稍宽时侵入两者之间的间距。
 const VALUE_MARGIN: i32 = 1;
+/// 贴边收起后小胶囊的长度与粗细（96 DPI 下的像素）。
+pub const CAPSULE_LENGTH: i32 = 46;
+pub const CAPSULE_THICKNESS: i32 = 24;
+/// 胶囊圆角半径。
+const CAPSULE_RADIUS: f32 = 7.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Layout {
@@ -91,7 +100,7 @@ fn pixel_scale(text_size: TextSize, dpi: u32) -> f32 {
 impl Layout {
     pub fn size(self, display: DisplayOptions) -> LayoutSize {
         let (empty_width, height) = match self {
-            Self::Floating => (132, 68),
+            Self::Floating => (132, 62),
             Self::Taskbar => (112, 36),
         };
         let (width, gap_px) = self
@@ -99,7 +108,7 @@ impl Layout {
             .last()
             .map_or((empty_width, 0), |column| {
                 (
-                    column.left + column.width,
+                    column.left + column.width + self.edge_padding(),
                     column.left_gap_px + column.gap_px,
                 )
             });
@@ -119,6 +128,14 @@ impl Layout {
         match self {
             Self::Floating => 12,
             Self::Taskbar => 6,
+        }
+    }
+
+    /// 面板左右外缘在列内边距之外额外留出的宽度；任务栏空间紧张，不加。
+    fn edge_padding(self) -> i32 {
+        match self {
+            Self::Floating => 6,
+            Self::Taskbar => 0,
         }
     }
 
@@ -175,7 +192,8 @@ impl Layout {
 
     fn columns(self, display: DisplayOptions) -> impl Iterator<Item = Column> {
         let mut selected = display.metrics.iter();
-        let mut left = 0;
+        let mut left = self.edge_padding();
+        let mut outer = true;
         let padding = self.column_padding(display.density);
         let gap_px = match display.density {
             Density::Standard => 8,
@@ -193,8 +211,7 @@ impl Layout {
             let label_width = first_label.max(second_label);
             let value_width = first_value.max(second_value);
             // At the outer edge, the network reading already leaves room for its arrow.
-            let inset = if left == 0 && is_network_rate(first) && second.is_none_or(is_network_rate)
-            {
+            let inset = if outer && is_network_rate(first) && second.is_none_or(is_network_rate) {
                 0
             } else {
                 padding
@@ -213,6 +230,7 @@ impl Layout {
             };
             left += width;
             left_gap_px += gap_px;
+            outer = false;
             Some(column)
         })
     }
@@ -220,7 +238,7 @@ impl Layout {
     fn slots(self, display: DisplayOptions, scale: f32) -> impl Iterator<Item = (Metric, Slot)> {
         self.columns(display).flat_map(move |column| {
             let (top, bottom) = match self {
-                Self::Floating => (9.0, 35.0),
+                Self::Floating => (6.0, 32.0),
                 Self::Taskbar => (-3.0, 14.0),
             };
             let first_row = if column.second.is_some() {
@@ -245,7 +263,7 @@ impl Layout {
         scale: f32,
     ) -> impl Iterator<Item = (Vector2, Vector2)> {
         let (top, bottom) = match self {
-            Self::Floating => (12.0, 56.0),
+            Self::Floating => (9.0, 53.0),
             Self::Taskbar => (5.0, 31.0),
         };
         self.columns(display).skip(1).map(move |column| {
@@ -473,6 +491,7 @@ pub struct Panel {
     compact_format: IDWriteTextFormat,
     percent_format: IDWriteTextFormat,
     unit_format: IDWriteTextFormat,
+    capsule_format: IDWriteTextFormat,
     tabular: IDWriteTypography,
     mode: Layout,
     display: DisplayOptions,
@@ -498,6 +517,7 @@ impl Panel {
         let compact_format = text_format(&fonts, 15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, language)?;
         let percent_format = text_format(&fonts, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, language)?;
         let unit_format = text_format(&fonts, 11.5, DWRITE_FONT_WEIGHT_NORMAL, language)?;
+        let capsule_format = text_format(&fonts, 12.5, DWRITE_FONT_WEIGHT_SEMI_BOLD, language)?;
         let tabular = unsafe {
             let typography = fonts.CreateTypography()?;
             typography.AddFontFeature(DWRITE_FONT_FEATURE {
@@ -514,6 +534,7 @@ impl Panel {
             compact_format,
             percent_format,
             unit_format,
+            capsule_format,
             tabular,
             mode: Layout::Floating,
             display: DisplayOptions::default(),
@@ -582,7 +603,8 @@ impl Panel {
     ) -> Result<()> {
         let pixel_scale = pixel_scale(self.display.text_size, dpi);
         self.update_text(readings, pixel_scale)?;
-        let layered = matches!(appearance, Appearance::Transparent { .. });
+        let layered =
+            unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } & WS_EX_LAYERED.0 as isize != 0;
         if !self
             .target
             .as_ref()
@@ -599,11 +621,17 @@ impl Panel {
             Appearance::Transparent { dark: true }
             | Appearance::TransparentPreview { dark: true } => TRANSPARENT_DARK,
         };
-        let background = if layered {
+        // 圆角之外的像素：分层窗口留全透明；子窗口预览填父窗口底色。
+        let backdrop = if layered {
             D2D1_COLOR_F::default()
         } else {
-            color(colors.surface)
+            {
+                // GetSysColor 返回 0x00BBGGRR，转成 0xRRGGBB。
+                let bgr = unsafe { GetSysColor(COLOR_BTNFACE) };
+                color((bgr & 0xff) << 16 | (bgr & 0xff00) | (bgr >> 16 & 0xff))
+            }
         };
+        let filled = !matches!(appearance, Appearance::Transparent { .. });
         let solid = matches!(appearance, Appearance::Solid { .. });
         let mut divider = color(colors.divider);
         if !solid {
@@ -616,8 +644,30 @@ impl Panel {
             let window = target.surface.render_target();
             let brush = &target.brush;
             window.BeginDraw();
-            window.Clear(Some(&background));
+            window.SetTextAntialiasMode(if filled {
+                D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE
+            } else {
+                D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+            });
+            window.Clear(Some(&backdrop));
             window.SetTransform(&Matrix3x2::scale(factor, factor));
+            if filled {
+                let radius = self.mode.base_radius() as f32;
+                brush.SetColor(&color(colors.surface));
+                window.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: 0.0,
+                            top: 0.0,
+                            right: width,
+                            bottom: size.height as f32,
+                        },
+                        radiusX: radius,
+                        radiusY: radius,
+                    },
+                    brush,
+                );
+            }
             if solid && self.mode == Layout::Floating {
                 let radius = self.mode.base_radius() as f32 - 0.5;
                 brush.SetColor(&color(colors.border));
@@ -685,6 +735,113 @@ impl Panel {
                 window.DrawTextLayout(
                     point(text.unit_x, slot.row_y),
                     &text.unit,
+                    brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+            window.EndDraw(None, None)
+        }
+        .and_then(|()| match &target.surface {
+            Surface::Window(_) => Ok(()),
+            Surface::Layered(_, bitmap) => bitmap.present(hwnd),
+        });
+        if result.is_err() {
+            self.target = None;
+        }
+        result
+    }
+
+    /// 贴边收起后的小胶囊：圆角药丸形状，显示 CPU 使用率。
+    /// 竖直胶囊把数字和单位分两行，水平胶囊排成一行。
+    pub fn paint_capsule(
+        &mut self,
+        hwnd: HWND,
+        dpi: u32,
+        dark: bool,
+        vertical: bool,
+        cpu: &Reading,
+    ) -> Result<()> {
+        let layered =
+            unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } & WS_EX_LAYERED.0 as isize != 0;
+        if !self
+            .target
+            .as_ref()
+            .is_some_and(|target| matches!(target.surface, Surface::Layered(..)) == layered)
+        {
+            self.target = Some(self.create_target(hwnd, dpi, layered)?);
+        }
+        let colors = if dark { DARK } else { LIGHT };
+        let (width, height) = if vertical {
+            (CAPSULE_THICKNESS as f32, CAPSULE_LENGTH as f32)
+        } else {
+            (CAPSULE_LENGTH as f32, CAPSULE_THICKNESS as f32)
+        };
+        // (文本布局, 墨迹左缘, 墨迹宽度, 行框顶部 y)
+        let mut lines = Vec::new();
+        let centered = |text: &IDWriteTextLayout| -> Result<(f32, f32)> {
+            let (left, right) = text_bounds(text)?;
+            Ok((left, right - left))
+        };
+        if vertical {
+            let number = layout(&self.fonts, &self.capsule_format, &cpu.number, height)?;
+            let (left, ink) = centered(&number)?;
+            // 行框内基线约在 ROW_BASELINE 处，数字墨迹中心约在基线上方 4.5px。
+            lines.push((number, left, ink, height / 2.0 - 5.5 - (ROW_BASELINE - 4.5)));
+            if !cpu.unit.is_empty() {
+                let unit = layout(&self.fonts, &self.unit_format, cpu.unit, height)?;
+                let (left, ink) = centered(&unit)?;
+                lines.push((unit, left, ink, height / 2.0 + 8.5 - (ROW_BASELINE - 4.0)));
+            }
+        } else {
+            let text = format!("{}{}", cpu.number, cpu.unit);
+            let label = layout(&self.fonts, &self.capsule_format, &text, width)?;
+            let (left, ink) = centered(&label)?;
+            lines.push((label, left, ink, (height - ROW_HEIGHT) / 2.0));
+        }
+        let target = self.target.as_ref().expect("render target initialized");
+        let result = unsafe {
+            let window = target.surface.render_target();
+            let brush = &target.brush;
+            window.BeginDraw();
+            window.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+            window.Clear(Some(&D2D1_COLOR_F::default()));
+            window.SetTransform(&Matrix3x2::identity());
+            let radius = CAPSULE_RADIUS;
+            brush.SetColor(&color(colors.surface));
+            window.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: 0.0,
+                        top: 0.0,
+                        right: width,
+                        bottom: height,
+                    },
+                    radiusX: radius,
+                    radiusY: radius,
+                },
+                brush,
+            );
+            brush.SetColor(&color(colors.border));
+            window.DrawRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: 0.5,
+                        top: 0.5,
+                        right: width - 0.5,
+                        bottom: height - 0.5,
+                    },
+                    radiusX: radius - 0.5,
+                    radiusY: radius - 0.5,
+                },
+                brush,
+                1.0,
+                None,
+            );
+            brush.SetColor(&color(colors.number));
+            for (text, left, ink, top) in &lines {
+                window.DrawTextLayout(
+                    point((width - ink) / 2.0 - left, *top),
+                    text,
                     brush,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
@@ -1098,24 +1255,24 @@ mod tests {
             ..Default::default()
         };
         let selections = [
-            (Metrics::default(), [343, 314]),
+            (Metrics::default(), [355, 314]),
             (
                 Metrics::parse("upload,download,cpu_frequency,memory,disk,traffic"),
-                [372, 341],
+                [384, 341],
             ),
             (
                 Metrics::parse(
                     "uptime,upload,available_memory,cpu_frequency,battery,download,traffic",
                 ),
-                [612, 564],
+                [624, 564],
             ),
             (
                 Metrics::parse("traffic,disk,upload,download,cpu_frequency,available_memory"),
-                [431, 393],
+                [443, 393],
             ),
             (
                 Metrics::parse("available_memory_percent,used_memory,available_memory"),
-                [350, 322],
+                [362, 322],
             ),
             (Metrics::parse(""), [132, 112]),
         ];
@@ -1161,7 +1318,7 @@ mod tests {
         let mut panel = Panel::new(Language::Chinese).unwrap();
         let values = readings(Sample::default(), 16_000_000, Language::Chinese);
         for (mode, widths) in [
-            (Layout::Floating, [343, 312, 286]),
+            (Layout::Floating, [355, 324, 298]),
             (Layout::Taskbar, [314, 293, 272]),
         ] {
             let height = mode.size(DisplayOptions::default()).pixels(96).1;
@@ -1408,6 +1565,39 @@ mod tests {
                     .unwrap();
             }
             super::super::set_panel_layered(hwnd, true);
+            for dark in [false, true] {
+                // 实色主题同样走分层窗口：圆角外全透明、圆角边缘半透明（抗锯齿）、内部不透明。
+                panel
+                    .paint(hwnd, dpi, Appearance::Solid { dark }, &readings)
+                    .unwrap();
+                let Some(Target {
+                    surface: Surface::Layered(_, bitmap),
+                    ..
+                }) = &panel.target
+                else {
+                    panic!("solid theme requires a layered render target");
+                };
+                let mut dib = DIBSECTION::default();
+                let bytes = size_of::<DIBSECTION>() as i32;
+                unsafe {
+                    assert!(GdiFlush().as_bool());
+                    assert_eq!(
+                        GetObjectW(HGDIOBJ(bitmap.bitmap.0), bytes, Some((&raw mut dib).cast())),
+                        bytes
+                    );
+                }
+                let (cx, cy) = (bitmap.size.cx as usize, bitmap.size.cy as usize);
+                let pixels =
+                    unsafe { std::slice::from_raw_parts(dib.dsBm.bmBits.cast::<u32>(), cx * cy) };
+                assert_eq!(pixels[0], 0);
+                assert_eq!(pixels[cx * cy - 1], 0);
+                assert_eq!(pixels[cy / 2 * cx + cx / 2] >> 24, 0xff);
+                assert!(
+                    pixels
+                        .iter()
+                        .any(|pixel| (1..0xff).contains(&(pixel >> 24)))
+                );
+            }
             for dark in [false, true] {
                 panel
                     .paint(hwnd, dpi, Appearance::Transparent { dark }, &readings)
