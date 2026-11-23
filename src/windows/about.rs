@@ -1,23 +1,19 @@
 use ::windows::{
     Win32::{
         Foundation::{HWND, LPARAM, S_OK, WPARAM},
-        System::Com::{
-            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
-        },
         UI::{
             Controls::{
                 TASKDIALOG_NOTIFICATIONS, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TDCBF_CLOSE_BUTTON,
                 TDF_ALLOW_DIALOG_CANCELLATION, TDF_ENABLE_HYPERLINKS, TDF_USE_HICON_MAIN,
                 TDN_HYPERLINK_CLICKED, TaskDialogIndirect,
             },
-            Shell::{SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, ShellExecuteExW},
-            WindowsAndMessaging::{MB_ICONWARNING, MB_OK, MessageBoxW, SW_SHOWNORMAL},
+            WindowsAndMessaging::{MB_ICONWARNING, MB_OK, MessageBoxW},
         },
     },
     core::{HRESULT, HSTRING, PCWSTR, Result, w},
 };
 
-use super::{GITHUB_REPOSITORY, app_title, ui_language, with_app};
+use super::{GITHUB_REPOSITORY, app_title, shell_open, ui_language, with_app};
 
 pub fn open(owner: HWND) -> Result<()> {
     let icon = with_app(|app| app.tray.hIcon).unwrap_or_default();
@@ -53,7 +49,7 @@ unsafe extern "system" fn dialog_callback(
     if notification == TDN_HYPERLINK_CLICKED {
         // Win32 supplies a null-terminated URL that remains valid during the callback.
         let url = PCWSTR(link.0 as *const u16);
-        if let Err(error) = unsafe { open_in_browser(hwnd, url) } {
+        if let Err(error) = shell_open(hwnd, url) {
             let language = ui_language();
             let heading = language.choose("无法打开 GitHub。", "GitHub could not be opened.");
             let message = HSTRING::from(format!("{heading}\n\n{error}"));
@@ -62,22 +58,4 @@ unsafe extern "system" fn dialog_callback(
         }
     }
     S_OK
-}
-
-unsafe fn open_in_browser(hwnd: HWND, url: PCWSTR) -> Result<()> {
-    let mut execute = SHELLEXECUTEINFOW {
-        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_FLAG_NO_UI,
-        hwnd,
-        lpVerb: w!("open"),
-        lpFile: url,
-        nShow: SW_SHOWNORMAL.0,
-        ..Default::default()
-    };
-    unsafe {
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).ok()?;
-        let result = ShellExecuteExW(&mut execute);
-        CoUninitialize();
-        result
-    }
 }

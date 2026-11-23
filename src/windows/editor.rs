@@ -1,17 +1,15 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use ::windows::{
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::{
-            BeginPaint, COLOR_BTNFACE, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, DEFAULT_GUI_FONT, EndPaint,
-            FillRect, GetMonitorInfoW, GetStockObject, GetSysColorBrush, MONITOR_DEFAULTTONEAREST,
-            MONITORINFO, MapWindowPoints, MonitorFromWindow, PAINTSTRUCT,
+            BeginPaint, COLOR_BTNFACE, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, EndPaint, FillRect,
+            GetSysColorBrush, MapWindowPoints, PAINTSTRUCT,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Controls::*,
-            HiDpi::AdjustWindowRectExForDpi,
             Input::KeyboardAndMouse::{
                 GetCapture, ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE,
             },
@@ -25,6 +23,7 @@ use super::panel::{Appearance, Layout, Panel};
 use super::state::{Density, DisplayOptions, TextSize, Theme};
 use super::{
     Window, control, invalidate, metric_name, position, register_class, scale, send, set_display,
+    ui::{Fonts, centered_bounds, follow_dpi_change, init_common_controls},
     window_dpi, with_app,
 };
 use crate::{
@@ -43,7 +42,10 @@ const PREVIEW_MODE: usize = 13;
 const TEXT_SIZE: usize = 14;
 const DENSITY: usize = 15;
 const GRIP_COLUMN: usize = 1;
+const PREVIEW_RETRY_TIMER: usize = 1;
 const GRIP_WIDTH: i32 = 24;
+const WIDTH: i32 = 818;
+const HEIGHT: i32 = 368;
 const DENSITY_OPTIONS: [Density; 3] = [Density::Standard, Density::Compact, Density::Tight];
 
 thread_local! {
@@ -69,7 +71,13 @@ struct Editor {
     display: DisplayOptions,
     layout: Layout,
     preview_dpi: u32,
+    /// 预览区顶部（像素），由右侧下拉框的实际高度决定。
+    preview_top: i32,
     drag: Option<Drag>,
+    fonts: Option<Fonts>,
+    /// 程序写入列表项（插入、移动、切换语言）期间为 true。此时列表视图同步发出的
+    /// LVN_ITEMCHANGED 只是回显，不能反过来改写勾选状态。
+    syncing: Cell<bool>,
 }
 
 struct Drag {
@@ -102,55 +110,34 @@ pub fn open(owner: HWND, anchor: HWND) -> Result<()> {
         return Ok(());
     };
     let instance = unsafe { HINSTANCE(GetModuleHandleW(PCWSTR::null())?.0) };
-    unsafe {
-        InitCommonControlsEx(&INITCOMMONCONTROLSEX {
-            dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
-        })
-        .ok()?;
-    }
-    register_class(CLASS, instance, Some(editor_proc), icon, HBRUSH_BUTTON_FACE)?;
+    init_common_controls()?;
+    register_class(
+        CLASS,
+        instance,
+        WNDCLASS_STYLES::default(),
+        Some(editor_proc),
+        icon,
+        HBRUSH_BUTTON_FACE,
+    )?;
     register_class(
         PREVIEW_CLASS,
         instance,
+        WNDCLASS_STYLES::default(),
         Some(preview_proc),
         HICON::default(),
         0,
     )?;
-
-    let dpi = window_dpi(anchor);
-    let mut area = MONITORINFO {
-        cbSize: size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    unsafe {
-        GetMonitorInfoW(
-            MonitorFromWindow(anchor, MONITOR_DEFAULTTONEAREST),
-            &mut area,
-        )
-        .ok()?;
-    }
-    let work = area.rcWork;
-    let mut bounds = RECT {
-        right: scale(818, dpi),
-        bottom: scale(368, dpi),
-        ..Default::default()
-    };
-    unsafe {
-        AdjustWindowRectExForDpi(&mut bounds, EDITOR_STYLE, false, EX_STYLE, dpi)?;
-    }
-    let width = (bounds.right - bounds.left).min(work.right - work.left);
-    let height = (bounds.bottom - bounds.top).min(work.bottom - work.top);
+    let bounds = centered_bounds(anchor, WIDTH, HEIGHT, EDITOR_STYLE, EX_STYLE)?;
     let window = Window(unsafe {
         CreateWindowExW(
             EX_STYLE,
             CLASS,
             PCWSTR::null(),
             EDITOR_STYLE,
-            work.left + (work.right - work.left - width) / 2,
-            work.top + (work.bottom - work.top - height) / 2,
-            width,
-            height,
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
             Some(owner),
             None,
             Some(instance),
@@ -295,7 +282,10 @@ impl Editor {
             display,
             layout,
             preview_dpi: window_dpi(hwnd),
+            preview_top: scale(119, window_dpi(hwnd)),
             drag: None,
+            fonts: None,
+            syncing: Cell::new(false),
         };
         for (index, metric) in display.metrics.ordered().into_iter().enumerate() {
             editor.write_item(index, metric, LVM_INSERTITEMW);
@@ -367,23 +357,39 @@ impl Editor {
         if unsafe { GetClientRect(self.hwnd, &mut bounds) }.is_err() {
             return;
         }
+        if self.fonts.as_ref().is_none_or(|fonts| fonts.dpi != dpi) {
+            let fonts = Fonts::new(dpi);
+            fonts.apply_body(&[
+                self.hint,
+                self.list,
+                self.up,
+                self.down,
+                self.mode,
+                self.size_label,
+                self.size,
+                self.density_label,
+                self.density,
+                self.apply,
+                self.cancel,
+            ]);
+            self.fonts = Some(fonts);
+        }
+        let line_height = self
+            .fonts
+            .as_ref()
+            .map_or(scale(16, dpi), |fonts| fonts.line_height);
         let margin = scale(16, dpi);
         let gap = scale(8, dpi);
         let button = scale(78, dpi);
-        let button_height = scale(27, dpi);
+        let button_height = scale(27, dpi).max(line_height + scale(10, dpi));
         let list_width = scale(214, dpi).min(bounds.right / 2);
-        let list_top = scale(56, dpi);
+        // 两行提示文字的高度随系统字体（含“使文本更大”）变化。
+        let hint_height = scale(36, dpi).max(2 * line_height + scale(4, dpi));
+        let list_top = margin + hint_height + scale(4, dpi);
         let buttons_top = bounds.bottom - margin - button_height;
         let preview_left = 2 * margin + list_width;
-        let default_font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
         for (hwnd, x, y, width, height) in [
-            (
-                self.hint,
-                margin,
-                margin,
-                list_width + margin,
-                scale(36, dpi),
-            ),
+            (self.hint, margin, margin, list_width + margin, hint_height),
             (
                 self.list,
                 margin,
@@ -400,41 +406,6 @@ impl Editor {
                 button_height,
             ),
             (
-                self.mode,
-                preview_left,
-                margin,
-                scale(140, dpi),
-                scale(130, dpi),
-            ),
-            (
-                self.size_label,
-                preview_left,
-                scale(54, dpi),
-                scale(64, dpi),
-                scale(20, dpi),
-            ),
-            (
-                self.size,
-                preview_left + scale(68, dpi),
-                scale(49, dpi),
-                scale(86, dpi),
-                scale(240, dpi),
-            ),
-            (
-                self.density_label,
-                preview_left,
-                scale(86, dpi),
-                scale(64, dpi),
-                scale(20, dpi),
-            ),
-            (
-                self.density,
-                preview_left + scale(68, dpi),
-                scale(81, dpi),
-                scale(86, dpi),
-                scale(124, dpi),
-            ),
-            (
                 self.apply,
                 bounds.right - margin - 2 * button - gap,
                 buttons_top,
@@ -449,9 +420,31 @@ impl Editor {
                 button_height,
             ),
         ] {
-            send(hwnd, WM_SETFONT, default_font.0 as usize, 1);
             position(hwnd, x, y, width.max(1), height.max(1));
         }
+
+        // 右侧下拉框自上而下排布；收起时的高度由字体决定，标签与之垂直居中。
+        let field_left = preview_left + scale(68, dpi);
+        let mut y = margin;
+        position(self.mode, preview_left, y, scale(140, dpi), scale(130, dpi));
+        y += combo_height(self.mode, dpi) + scale(10, dpi);
+        for (label, field, dropdown, spacing) in [
+            (self.size_label, self.size, 240, 9),
+            (self.density_label, self.density, 124, 15),
+        ] {
+            position(field, field_left, y, scale(86, dpi), scale(dropdown, dpi));
+            let height = combo_height(field, dpi);
+            position(
+                label,
+                preview_left,
+                y + (height - line_height) / 2,
+                scale(64, dpi),
+                line_height,
+            );
+            y += height + scale(spacing, dpi);
+        }
+        self.preview_top = y;
+
         let mut list_bounds = RECT::default();
         if unsafe { GetClientRect(self.list, &mut list_bounds) }.is_ok() {
             let grip = scale(GRIP_WIDTH, dpi);
@@ -483,7 +476,7 @@ impl Editor {
         position(
             self.preview,
             left + (available - width) / 2,
-            scale(119, dpi),
+            self.preview_top,
             width,
             height,
         );
@@ -508,6 +501,7 @@ impl Editor {
     }
 
     fn write_item(&self, index: usize, metric: Metric, message: u32) {
+        let syncing = self.syncing.replace(true);
         let mut label: Vec<_> = metric_name(metric, self.display.language)
             .encode_utf16()
             .chain([0])
@@ -534,6 +528,7 @@ impl Editor {
             index,
             &check as *const _ as isize,
         );
+        self.syncing.set(syncing);
     }
 
     fn select(&self, index: usize) {
@@ -754,7 +749,7 @@ impl Editor {
                     self.show_drag_cursor(self.list);
                 }
             }
-            LVN_ITEMCHANGED if info.uChanged.0 & LVIF_STATE.0 != 0 => {
+            LVN_ITEMCHANGED if info.uChanged.0 & LVIF_STATE.0 != 0 && !self.syncing.get() => {
                 let state = info.uNewState & LVIS_STATEIMAGEMASK.0;
                 if state != info.uOldState & LVIS_STATEIMAGEMASK.0 && state != 0 {
                     self.display.metrics.set_visible(metric, state == 0x2000);
@@ -774,8 +769,28 @@ fn row_bounds(list: HWND, index: usize) -> Option<RECT> {
     (send(list, LVM_GETITEMRECT, index, &mut row as *mut _ as isize) != 0).then_some(row)
 }
 
+/// 访问编辑器状态。重入（例如列表视图在 `write_item` 中同步发通知）时借用失败，返回 `None`。
 fn with_editor<T>(run: impl FnOnce(&mut Editor) -> T) -> Option<T> {
-    EDITOR.with(|editor| editor.try_borrow_mut().ok()?.as_mut().map(run))
+    EDITOR.with(|slot| {
+        let mut slot = slot.try_borrow_mut().ok()?;
+        // 窗口在借用期间被销毁时 WM_NCDESTROY 无法清理，这里补做。
+        if slot
+            .as_ref()
+            .is_some_and(|editor| !unsafe { IsWindow(Some(editor.hwnd)) }.as_bool())
+        {
+            *slot = None;
+        }
+        slot.as_mut().map(run)
+    })
+}
+
+fn combo_height(combo: HWND, dpi: u32) -> i32 {
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(combo, &mut rect) }.is_ok() {
+        rect.bottom - rect.top
+    } else {
+        scale(23, dpi)
+    }
 }
 
 pub fn handle_dialog_message(message: &MSG) -> bool {
@@ -909,20 +924,15 @@ unsafe extern "system" fn editor_proc(
             with_editor(|editor| editor.arrange());
         }
         WM_DPICHANGED => {
-            let rect = unsafe { &*(lparam.0 as *const RECT) };
-            position(
-                hwnd,
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-            );
+            follow_dpi_change(hwnd, lparam);
             with_editor(|editor| editor.arrange());
         }
         WM_NCDESTROY => {
+            // 正在借用时无法立即清理；with_editor 下次调用时会发现窗口已销毁并释放状态。
             EDITOR.with(|slot| {
-                let mut state = slot.borrow_mut();
-                if state.as_ref().is_some_and(|editor| editor.hwnd == hwnd) {
+                if let Ok(mut state) = slot.try_borrow_mut()
+                    && state.as_ref().is_some_and(|editor| editor.hwnd == hwnd)
+                {
                     state.take();
                 }
             });
@@ -941,6 +951,10 @@ unsafe extern "system" fn preview_proc(
 ) -> LRESULT {
     match message {
         WM_ERASEBKGND => return LRESULT(1),
+        WM_TIMER if wparam.0 == PREVIEW_RETRY_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), PREVIEW_RETRY_TIMER) };
+            invalidate(hwnd);
+        }
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
             unsafe {
@@ -964,9 +978,14 @@ unsafe extern "system" fn preview_proc(
                     let localized = (editor.display.language != app.display.language)
                         .then(|| readings(app.sample, app.total(), editor.display.language));
                     let values = localized.as_ref().unwrap_or(&app.displayed);
-                    let _ = editor
+                    if editor
                         .panel
-                        .paint(hwnd, editor.preview_dpi, appearance, values);
+                        .paint(hwnd, editor.preview_dpi, appearance, values)
+                        .is_err()
+                    {
+                        // 渲染目标已丢弃，稍后重绘时重新创建。
+                        unsafe { SetTimer(Some(hwnd), PREVIEW_RETRY_TIMER, 1_000, None) };
+                    }
                 });
             });
             unsafe {

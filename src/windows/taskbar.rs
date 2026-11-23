@@ -19,9 +19,10 @@ use ::windows::{
             Shell::{ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage},
             WindowsAndMessaging::{
                 FindWindowExW, FindWindowW, GA_ROOTOWNER, GUI_INMENUMODE, GUI_POPUPMENUMODE,
-                GUITHREADINFO, GW_HWNDPREV, GetAncestor, GetClassNameW, GetDesktopWindow,
-                GetForegroundWindow, GetGUIThreadInfo, GetShellWindow, GetWindow, GetWindowRect,
-                GetWindowThreadProcessId, IsWindowVisible,
+                GUITHREADINFO, GW_HWNDPREV, GWL_EXSTYLE, GetAncestor, GetClassNameW,
+                GetDesktopWindow, GetForegroundWindow, GetGUIThreadInfo, GetShellWindow, GetWindow,
+                GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
+                WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
             },
         },
     },
@@ -48,16 +49,10 @@ pub enum Observation {
 pub struct DockPlacement {
     current: Option<Placement>,
     pending: Option<(Placement, Instant)>,
-    preferred_x: Option<i32>,
 }
 
 impl DockPlacement {
-    pub fn preferred_x(&self) -> Option<i32> {
-        self.preferred_x
-    }
-
-    pub fn reset_preference(&mut self) {
-        self.preferred_x = None;
+    pub fn reset_pending(&mut self) {
         self.pending = None;
     }
 
@@ -90,9 +85,6 @@ impl DockPlacement {
         }
         self.pending = None;
         self.current = Some(next);
-        if let Placement::Docked(rect) = next {
-            self.preferred_x = Some(rect.left);
-        }
         Some(next)
     }
 }
@@ -151,7 +143,6 @@ impl Taskbar {
         own_window: HWND,
         side: TaskbarSide,
         size: LayoutSize,
-        preferred_x: Option<i32>,
     ) -> Option<Observation> {
         let mut info = APPBARDATA {
             cbSize: size_of::<APPBARDATA>() as u32,
@@ -231,7 +222,6 @@ impl Taskbar {
             width,
             padding,
             side,
-            preferred_x,
         ) else {
             return Some(Observation::NoRoom);
         };
@@ -360,6 +350,7 @@ fn fullscreen_on_bar(bar: HWND, own_window: HWND) -> bool {
         || foreground == unsafe { GetShellWindow() }
         || foreground == unsafe { GetDesktopWindow() }
         || is_taskbar_window(bar, foreground)
+        || screen_overlay(foreground)
     {
         return false;
     }
@@ -392,6 +383,14 @@ fn fullscreen_on_bar(bar: HWND, own_window: HWND) -> bool {
         && frame.bottom >= display.bottom
 }
 
+/// 截图工具（PixPin、Snipaste 等）打开时会盖一层全屏置顶的工具窗口，它不是全屏应用，
+/// 不能据此隐藏面板，否则面板会在截图开始时消失、结束时又出现，看起来像闪烁。
+fn screen_overlay(window: HWND) -> bool {
+    let style = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) };
+    let overlay = (WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0) as isize;
+    style & overlay == overlay
+}
+
 fn taskbar_gap(
     left: i32,
     tray_left: i32,
@@ -399,7 +398,6 @@ fn taskbar_gap(
     width: i32,
     padding: i32,
     side: TaskbarSide,
-    preferred_x: Option<i32>,
 ) -> Option<i32> {
     let left = if side == TaskbarSide::Right {
         // The right slot starts after the last visible taskbar control.
@@ -407,15 +405,9 @@ fn taskbar_gap(
     } else {
         left
     };
-    if let Some(x) = preferred_x {
-        let (start, end) = (x - padding, x + width + padding);
-        if start >= left
-            && end <= tray_left
-            && occupied.iter().all(|&(a, b)| b <= start || a >= end)
-        {
-            return Some(x);
-        }
-    }
+    // 始终按所选方向计算贴边槽位，不沿用旧位置：
+    // Explorer 短暂布局变化（防抖 1 秒由 DockPlacement 负责）若把面板挤到别处，
+    // 沿用旧位置会让它永远停在那里，出现“设置靠左、实际靠右”。
     if side == TaskbarSide::Right {
         return (tray_left - left >= width + 2 * padding).then_some(tray_left - padding - width);
     }
@@ -440,63 +432,48 @@ mod tests {
     fn docking_prefers_the_selected_edge_and_keeps_clear_of_controls() {
         let mut occupied = [(15, 65), (390, 500), (300, 440)];
         assert_eq!(
-            taskbar_gap(0, 850, &mut occupied, 150, 6, TaskbarSide::Left, None),
+            taskbar_gap(0, 850, &mut occupied, 150, 6, TaskbarSide::Left),
             Some(71)
         );
         assert_eq!(
-            taskbar_gap(0, 850, &mut occupied, 150, 6, TaskbarSide::Right, None),
+            taskbar_gap(0, 850, &mut occupied, 150, 6, TaskbarSide::Right),
             Some(694)
         );
         for side in [TaskbarSide::Left, TaskbarSide::Right] {
-            assert_eq!(taskbar_gap(0, 850, &mut occupied, 350, 6, side, None), None);
+            assert_eq!(taskbar_gap(0, 850, &mut occupied, 350, 6, side), None);
         }
     }
 
     #[test]
     fn right_docking_waits_for_room_next_to_the_tray() {
         let mut occupied = [(310, 650)];
-        let prior_slot = taskbar_gap(0, 740, &mut occupied, 240, 6, TaskbarSide::Left, None);
-        assert_eq!(prior_slot, Some(6));
-        for preferred_x in [None, prior_slot] {
-            assert_eq!(
-                taskbar_gap(
-                    0,
-                    740,
-                    &mut occupied,
-                    240,
-                    6,
-                    TaskbarSide::Right,
-                    preferred_x
-                ),
-                None
-            );
-        }
+        assert_eq!(
+            taskbar_gap(0, 740, &mut occupied, 240, 6, TaskbarSide::Left),
+            Some(6)
+        );
+        assert_eq!(
+            taskbar_gap(0, 740, &mut occupied, 240, 6, TaskbarSide::Right),
+            None
+        );
         occupied[0].1 = 488;
         assert_eq!(
-            taskbar_gap(
-                0,
-                740,
-                &mut occupied,
-                240,
-                6,
-                TaskbarSide::Right,
-                prior_slot
-            ),
+            taskbar_gap(0, 740, &mut occupied, 240, 6, TaskbarSide::Right),
             Some(494)
         );
     }
 
     #[test]
-    fn reuses_the_docked_slot_until_a_control_encroaches() {
+    fn left_docking_returns_to_the_edge_once_a_transient_control_leaves() {
+        // 短暂出现的控件把面板挤到中间后，控件消失应回到左侧，而不是停在旧位置。
         let mut occupied = [(0, 60), (400, 480)];
         assert_eq!(
-            taskbar_gap(0, 820, &mut occupied, 150, 6, TaskbarSide::Left, Some(200)),
-            Some(200)
-        );
-        occupied[1] = (355, 480);
-        assert_eq!(
-            taskbar_gap(0, 820, &mut occupied, 150, 6, TaskbarSide::Left, Some(200)),
+            taskbar_gap(0, 820, &mut occupied, 150, 6, TaskbarSide::Left),
             Some(66)
+        );
+        let mut occupied = [(0, 360), (400, 480)];
+        assert_eq!(
+            taskbar_gap(0, 820, &mut occupied, 150, 6, TaskbarSide::Left),
+            Some(486)
         );
     }
 
@@ -536,13 +513,11 @@ mod tests {
 
         assert_eq!(placement.resolve(Some(moved), start + second * 5), None);
         assert_eq!(placement.hold(), Some(docked));
-        assert_eq!(placement.preferred_x(), Some(80));
         assert_eq!(placement.resolve(Some(moved), start + second * 5), None);
         assert_eq!(
             placement.resolve(Some(moved), start + second * 6),
             Some(moved)
         );
-        assert_eq!(placement.preferred_x(), Some(280));
         assert_eq!(
             placement.resolve(Some(Placement::Hidden), start + second * 7),
             None
@@ -551,7 +526,6 @@ mod tests {
             placement.resolve(Some(Placement::Hidden), start + second * 8),
             Some(Placement::Hidden)
         );
-        assert_eq!(placement.preferred_x(), Some(280));
         assert_eq!(
             placement.resolve(Some(moved), start + second * 9),
             Some(moved)
@@ -561,6 +535,40 @@ mod tests {
             placement.resolve(None, start + second * 11),
             Some(Placement::Floating)
         );
+    }
+
+    #[test]
+    fn topmost_tool_windows_are_treated_as_screen_overlays() {
+        use ::windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP,
+        };
+        let create = |style: WINDOW_EX_STYLE| unsafe {
+            CreateWindowExW(
+                style,
+                w!("Static"),
+                PCWSTR::null(),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        for (style, expected) in [
+            (WS_EX_TOPMOST | WS_EX_TOOLWINDOW, true),
+            (WS_EX_TOPMOST, false),
+            (WS_EX_TOOLWINDOW, false),
+            (WINDOW_EX_STYLE::default(), false),
+        ] {
+            let window = create(style);
+            assert_eq!(screen_overlay(window), expected);
+            let _ = unsafe { DestroyWindow(window) };
+        }
     }
 
     #[test]

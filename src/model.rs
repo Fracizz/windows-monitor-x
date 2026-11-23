@@ -279,9 +279,20 @@ impl Reading {
     }
 
     fn gigabytes(bytes: Option<u64>) -> Self {
-        bytes.map_or_else(Self::unavailable, |bytes| Self {
-            number: format!("{:.2}", bytes as f64 / 1_000_000_000.0),
-            unit: "GB",
+        bytes.map_or_else(Self::unavailable, |bytes| {
+            let gigabytes = bytes as f64 / 1_000_000_000.0;
+            // 保留两位小数时 9999.995 GB 会进位成五位整数，超出面板预留宽度，因此改用 TB。
+            if gigabytes < 9_999.995 {
+                Self {
+                    number: format!("{gigabytes:.2}"),
+                    unit: "GB",
+                }
+            } else {
+                Self {
+                    number: format!("{:.2}", gigabytes / 1_000.0),
+                    unit: "TB",
+                }
+            }
         })
     }
 
@@ -290,7 +301,7 @@ impl Reading {
         let days = seconds / 86_400;
         let hours = seconds / 3_600;
         let minutes = seconds / 60;
-        if days >= 1000 {
+        if days >= 100 {
             Self {
                 number: days.to_string(),
                 unit: language.choose("天", "d"),
@@ -395,6 +406,8 @@ mod tests {
             (90, ("1", "min")),
             (7_500, ("2h 5m", "")),
             (90_000, ("1d 1h", "")),
+            (8_639_999, ("99d 23h", "")),
+            (8_640_000, ("100", "d")),
             (86_400_000, ("1000", "d")),
         ] {
             let value = Reading::uptime(Duration::from_secs(seconds), Language::English);
@@ -526,6 +539,15 @@ mod tests {
         assert_eq!(full[Metric::AvailableMemory.index()].number, "0.00");
         assert_eq!(full[Metric::AvailableMemory.index()].unit, "GB");
         assert_eq!(full[Metric::UsedMemory.index()].number, "20.00");
+        for (available, expected) in [
+            (9_999_994_999_999, ("9999.99", "GB")),
+            (9_999_995_000_000, ("10.00", "TB")),
+            (32_000_000_000_000, ("32.00", "TB")),
+        ] {
+            let values = readings(sample(64_000_000_000_000, available), 0, Language::English);
+            let value = &values[Metric::AvailableMemory.index()];
+            assert_eq!((value.number.as_str(), value.unit), expected);
+        }
         let empty = readings(sample(20_000_000_000, 20_000_000_000), 0, Language::Chinese);
         assert_eq!(empty[Metric::UsedMemory.index()].number, "0.00");
         assert_eq!(empty[Metric::AvailableMemoryPercent.index()].number, "100");

@@ -12,8 +12,8 @@ use ::windows::{
         Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1},
         NetworkManagement::{
             IpHelper::{
-                FreeMibTable, GetIfTable2, IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, MIB_IF_ROW2,
-                MIB_IF_TABLE2,
+                FreeMibTable, GetIfTable2, IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211,
+                IF_TYPE_WWANPP, IF_TYPE_WWANPP2, MIB_IF_ROW2, MIB_IF_TABLE2,
             },
             Ndis::IfOperStatusUp,
         },
@@ -148,9 +148,13 @@ fn read_network(current: &mut HashMap<u64, Bytes>) -> bool {
     current.clear();
     for row in rows {
         // Bit zero of InterfaceAndOperStatusFlags is HardwareInterface.
+        // 只统计物理网卡（有线、Wi-Fi、移动宽带），VPN 等虚拟接口会重复计算同一份流量。
         if row.OperStatus == IfOperStatusUp
             && row.InterfaceAndOperStatusFlags._bitfield & 1 != 0
-            && matches!(row.Type, IF_TYPE_ETHERNET_CSMACD | IF_TYPE_IEEE80211)
+            && matches!(
+                row.Type,
+                IF_TYPE_ETHERNET_CSMACD | IF_TYPE_IEEE80211 | IF_TYPE_WWANPP | IF_TYPE_WWANPP2
+            )
         {
             current.insert(
                 unsafe { row.InterfaceLuid.Value },

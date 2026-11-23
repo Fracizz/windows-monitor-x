@@ -1,14 +1,18 @@
 mod about;
+mod commands;
 mod editor;
 mod history_export;
 mod manager;
+mod menu;
 mod panel;
 mod panel_input;
 mod sampler;
 mod startup;
 mod state;
 mod taskbar;
+mod ui;
 mod updater;
+mod worker;
 
 use std::{
     cell::RefCell,
@@ -22,7 +26,7 @@ use std::{
 use ::windows::{
     Win32::{
         Foundation::{
-            CloseHandle, D2DERR_RECREATE_TARGET, ERROR_ALREADY_EXISTS, ERROR_CLASS_ALREADY_EXISTS,
+            CloseHandle, D2DERR_RECREATE_TARGET, ERROR_ALREADY_EXISTS, ERROR_CANCELLED,
             GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
         },
         Globalization::SetThreadUILanguage,
@@ -32,12 +36,15 @@ use ::windows::{
                 DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY, DwmSetWindowAttribute,
             },
             Gdi::{
-                BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, GetMonitorInfoW, HBRUSH,
-                HDC, HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-                MonitorFromPoint, MonitorFromWindow, PAINTSTRUCT, SetWindowRgn, UpdateWindow,
+                BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, GetMonitorInfoW, HDC,
+                HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+                MonitorFromWindow, PAINTSTRUCT, SetWindowRgn, UpdateWindow,
             },
         },
         System::{
+            Com::{
+                COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+            },
             LibraryLoader::GetModuleHandleW,
             Threading::{
                 CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CloseThreadpoolWait, CreateMutexW,
@@ -48,10 +55,10 @@ use ::windows::{
         },
         UI::{
             Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
-            HiDpi::GetDpiForWindow,
             Shell::{
                 NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION,
-                NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
+                NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, SEE_MASK_FLAG_NO_UI,
+                SHELLEXECUTEINFOW, Shell_NotifyIconW, ShellExecuteExW,
             },
             WindowsAndMessaging::*,
         },
@@ -64,14 +71,24 @@ use crate::{
     language::Language,
     model::{Metric, Reading, Sample, readings},
 };
+use commands::{
+    command, double_click, double_click_labels, finish_history_export, finish_update, set_display,
+    shell_open, show_update_error,
+};
+use menu::open_menu;
 use panel::{Appearance, Layout, LayoutSize, Panel};
 use panel_input::PanelInput;
 use sampler::Sampler;
-use state::{DisplayOptions, LanguagePreference, Refresh, Settings, TaskbarSide, TextSize, Theme};
+use state::{
+    DisplayOptions, DoubleClick, LanguagePreference, Refresh, Settings, TaskbarSide, TextSize,
+    Theme,
+};
 use taskbar::{
     DockPlacement, Observation, Placement, Taskbar, covered_by_taskbar, is_taskbar_window,
     is_tray_overflow, primary_taskbar, taskbar_has_focus, taskbar_menu_open,
 };
+use ui::{Window, control, position, register_class, scale, send, window_dpi};
+use worker::{Feed, SamplerWorker, WorkerCommand, notify};
 
 const CLASS: PCWSTR = w!("WindowsMonitor.Panel");
 const PRODUCT_NAME: &str = env!("WINDOWS_MONITOR_PRODUCT_NAME");
@@ -89,6 +106,9 @@ const ICON_ID: PCWSTR = PCWSTR(101usize as *const u16);
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const DOCK_INTERVAL: Duration = Duration::from_secs(1);
 const DOCK_Z_ORDER_TIMER: usize = 1;
+const PAINT_RETRY_TIMER: usize = 2;
+/// 绘制失败（如显示设备暂时不可用）后等待多久重绘；渲染目标已在失败时丢弃，重绘会重新创建。
+const PAINT_RETRY: u32 = 1_000;
 const DOCK_Z_ORDER_SETTLE: Duration = Duration::from_millis(120);
 const SAVE_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -114,6 +134,12 @@ const LANGUAGE_ENGLISH: usize = 123;
 const EXPORT_HISTORY: usize = 124;
 const OPEN_MANAGER: usize = 125;
 const RECORD_HISTORY: usize = 126;
+const DOUBLE_CLICK_OPTIONS: [(usize, DoubleClick); 4] = [
+    (127, DoubleClick::Nothing),
+    (128, DoubleClick::TaskManager),
+    (129, DoubleClick::ResourceMonitor),
+    (130, DoubleClick::Manager),
+];
 const REFRESH_OPTIONS: [(usize, Refresh); 4] = [
     (109, Refresh::One),
     (110, Refresh::Two),
@@ -123,26 +149,6 @@ const REFRESH_OPTIONS: [(usize, Refresh); 4] = [
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
-}
-
-#[derive(Default)]
-struct Mailbox {
-    sample: Option<Sample>,
-    dock: Option<(u64, Placement)>,
-    history_error: Option<String>,
-    history_export: Option<io::Result<u64>>,
-}
-
-type Feed = Arc<Mutex<Mailbox>>;
-
-enum WorkerCommand {
-    Interval(Refresh),
-    RecordHistory(bool),
-    ResetHistoryTraffic(u64),
-    Dock(Option<u64>, TaskbarSide, LayoutSize),
-    RecheckDock,
-    TaskbarInteraction,
-    Stop,
 }
 
 struct App {
@@ -172,6 +178,8 @@ struct App {
     paint_error: Option<Error>,
     update: Option<mpsc::Receiver<updater::Event>>,
     history_exporting: bool,
+    /// 进入系统移动循环时的窗口矩形；单击或双击浮窗也会进入该循环，用它判断是否真的移动过。
+    move_origin: Option<RECT>,
 }
 
 impl App {
@@ -223,6 +231,7 @@ impl App {
             paint_error: None,
             update: None,
             history_exporting: false,
+            move_origin: None,
         }
     }
 
@@ -344,6 +353,9 @@ impl App {
         let result = self.paint_metrics(hwnd);
         if initializing {
             self.paint_error = result.err();
+        } else if result.is_err() {
+            // 本次绘制区域已被 EndPaint 视为有效，读数不变时不会再重绘，因此稍后主动重试。
+            unsafe { SetTimer(Some(hwnd), PAINT_RETRY_TIMER, PAINT_RETRY, None) };
         }
     }
 
@@ -371,265 +383,10 @@ impl App {
     }
 }
 
-struct SamplerWorker {
-    control: mpsc::Sender<WorkerCommand>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl SamplerWorker {
-    fn start(
-        hwnd: HWND,
-        feed: Feed,
-        settings: Settings,
-        (control, commands): (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerCommand>),
-    ) -> std::io::Result<Self> {
-        let handle = hwnd.0 as usize;
-        let thread = thread::Builder::new()
-            .name("monitor-sampler".into())
-            .spawn(move || {
-                let hwnd = HWND(handle as *mut _);
-                let mut sampler = Sampler::new();
-                let mut last_sample = Instant::now();
-                let mut next_sample = last_sample;
-                let mut interval = settings.refresh.interval();
-                let mut capture = HistoryCapture::new(settings);
-                let mut dock = settings.taskbar.then_some((0, next_sample));
-                let mut taskbar_side = settings.taskbar_side;
-                let mut dock_size = Layout::Taskbar.size(settings.display);
-                let mut taskbar = None;
-                let mut dock_placement = DockPlacement::default();
-                let mut last_placement = None;
-                loop {
-                    let now = Instant::now();
-                    if now >= next_sample {
-                        last_sample = now;
-                        next_sample = now + interval;
-                        let sample = sampler.poll(interval);
-                        let pending = feed.lock().unwrap().sample.replace(sample).is_some();
-                        if !pending && !notify(hwnd, SAMPLE_READY) {
-                            break;
-                        }
-                        capture.poll(hwnd, &feed, now, interval, sample);
-                    }
-                    if let Some((generation, deadline)) = dock
-                        && now >= deadline
-                    {
-                        let bar = primary_taskbar();
-                        let observed = if bar.is_some_and(taskbar_menu_open) {
-                            Some(Observation::MenuOpen)
-                        } else {
-                            if taskbar.is_none() {
-                                taskbar = Taskbar::new().ok();
-                            }
-                            bar.and_then(|bar| {
-                                taskbar.as_mut()?.observe(
-                                    bar,
-                                    hwnd,
-                                    taskbar_side,
-                                    dock_size,
-                                    dock_placement.preferred_x(),
-                                )
-                            })
-                        };
-                        let placement = match observed {
-                            Some(Observation::MenuOpen) => dock_placement.hold(),
-                            // The XAML menu temporarily replaces the taskbar's automation tree.
-                            None if bar.is_some_and(taskbar_has_focus) => dock_placement.hold(),
-                            Some(Observation::Placement(placement)) => {
-                                dock_placement.resolve(Some(placement), Instant::now())
-                            }
-                            Some(Observation::NoRoom) | None => {
-                                dock_placement.resolve(None, Instant::now())
-                            }
-                        };
-                        if let Some(placement) = placement
-                            && (last_placement != Some(placement)
-                                || matches!(placement, Placement::Docked(rect)
-                                    if bar.is_some_and(|bar| covered_by_taskbar(bar, hwnd, rect))))
-                        {
-                            last_placement = Some(placement);
-                            let pending = feed
-                                .lock()
-                                .unwrap()
-                                .dock
-                                .replace((generation, placement))
-                                .is_some();
-                            if !pending && !notify(hwnd, DOCK_READY) {
-                                break;
-                            }
-                        }
-                        dock = Some((generation, Instant::now() + DOCK_INTERVAL));
-                    }
-                    let wake = dock.map_or(next_sample, |(_, deadline)| deadline.min(next_sample));
-                    match commands.recv_timeout(wake.saturating_duration_since(Instant::now())) {
-                        Ok(WorkerCommand::Interval(refresh)) => {
-                            interval = refresh.interval();
-                            next_sample = last_sample + interval;
-                        }
-                        Ok(WorkerCommand::RecordHistory(enabled)) => {
-                            capture.set_enabled(hwnd, &feed, enabled);
-                        }
-                        Ok(WorkerCommand::ResetHistoryTraffic(traffic)) => {
-                            capture.starting_traffic = 0;
-                            capture.traffic_at_reset = traffic;
-                        }
-                        Ok(WorkerCommand::Dock(generation, side, size)) => {
-                            taskbar_side = side;
-                            dock_size = size;
-                            dock = generation.map(|id| (id, Instant::now()));
-                            if dock.is_none() {
-                                taskbar = None;
-                                dock_placement = DockPlacement::default();
-                            } else {
-                                dock_placement.reset_preference();
-                            }
-                            last_placement = None;
-                        }
-                        Ok(WorkerCommand::RecheckDock) => {
-                            dock = dock.map(|(id, _)| (id, Instant::now()));
-                        }
-                        Ok(WorkerCommand::TaskbarInteraction) => {
-                            // Keep the current slot while Explorer rearranges its popup controls.
-                            dock_placement.hold();
-                            dock = dock.map(|(id, _)| (id, Instant::now() + DOCK_INTERVAL));
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        _ => break,
-                    }
-                }
-            })?;
-        Ok(Self {
-            control,
-            thread: Some(thread),
-        })
-    }
-}
-
-fn history_directory() -> Option<PathBuf> {
-    Some(state::data_directory()?.join("history-v1"))
-}
-
-struct HistoryCapture {
-    directory: Option<PathBuf>,
-    writer: Option<history::Writer>,
-    enabled: bool,
-    first_sample: bool,
-    prune_at: Instant,
-    retry_at: Instant,
-    starting_traffic: u64,
-    traffic_at_reset: u64,
-}
-
-impl HistoryCapture {
-    fn new(settings: Settings) -> Self {
-        let now = Instant::now();
-        Self {
-            directory: history_directory(),
-            writer: None,
-            enabled: settings.record_history,
-            first_sample: true,
-            prune_at: now,
-            retry_at: now,
-            starting_traffic: settings.traffic,
-            traffic_at_reset: 0,
-        }
-    }
-
-    fn set_enabled(&mut self, hwnd: HWND, feed: &Feed, enabled: bool) {
-        self.enabled = enabled;
-        self.first_sample = true;
-        self.retry_at = Instant::now();
-        if !enabled {
-            self.writer = None;
-            Self::report(hwnd, feed, None);
-        }
-    }
-
-    fn poll(&mut self, hwnd: HWND, feed: &Feed, now: Instant, interval: Duration, sample: Sample) {
-        if now >= self.prune_at {
-            // Previously recorded history expires even when recording is paused.
-            let result = self.directory.as_ref().map_or(Ok(()), |directory| {
-                history::prune(directory, history::now_ms())
-            });
-            self.prune_at = now
-                + if result.is_ok() {
-                    Duration::from_secs(3600)
-                } else {
-                    SAVE_INTERVAL
-                };
-        }
-        if !self.enabled || now < self.retry_at {
-            return;
-        }
-        let opening = self.writer.is_none();
-        let result = self.record(interval, sample);
-        if let Err(error) = result {
-            self.writer = None;
-            self.first_sample = true;
-            self.retry_at = now + SAVE_INTERVAL;
-            Self::report(hwnd, feed, Some(error.to_string()));
-        } else if opening {
-            Self::report(hwnd, feed, None);
-        }
-    }
-
-    fn record(&mut self, interval: Duration, sample: Sample) -> io::Result<()> {
-        let directory = self
-            .directory
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA"))?;
-        let writer = self
-            .writer
-            .get_or_insert_with(|| history::Writer::new(directory.clone()));
-        let cadence = if self.first_sample {
-            0
-        } else {
-            interval.as_millis() as u64
-        };
-        let traffic = self
-            .starting_traffic
-            .saturating_add(sample.traffic.saturating_sub(self.traffic_at_reset));
-        writer.record(history::now_ms(), cadence, sample, traffic)?;
-        self.first_sample = false;
-        Ok(())
-    }
-
-    fn report(hwnd: HWND, feed: &Feed, error: Option<String>) {
-        let mut mailbox = feed.lock().unwrap();
-        if mailbox.history_error != error {
-            mailbox.history_error = error;
-            drop(mailbox);
-            notify(hwnd, HISTORY_STATUS);
-        }
-    }
-}
-
-fn notify(hwnd: HWND, message: u32) -> bool {
-    unsafe { PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(0)) }.is_ok()
-}
-
-impl Drop for SamplerWorker {
-    fn drop(&mut self) {
-        let _ = self.control.send(WorkerCommand::Stop);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
 struct Instance(HANDLE);
 impl Drop for Instance {
     fn drop(&mut self) {
         let _ = unsafe { CloseHandle(self.0) };
-    }
-}
-
-struct Window(HWND);
-impl Drop for Window {
-    fn drop(&mut self) {
-        if unsafe { IsWindow(Some(self.0)) }.as_bool() {
-            let _ = unsafe { DestroyWindow(self.0) };
-        }
     }
 }
 
@@ -911,7 +668,7 @@ fn create_window(
     unsafe {
         let class = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(window_proc),
             hInstance: module,
             hIcon: icon,
@@ -944,70 +701,6 @@ fn create_window(
             None,
         )
     }
-}
-
-fn register_class(
-    class: PCWSTR,
-    instance: HINSTANCE,
-    proc: WNDPROC,
-    icon: HICON,
-    background: isize,
-) -> Result<()> {
-    unsafe {
-        let definition = WNDCLASSW {
-            lpfnWndProc: proc,
-            hInstance: instance,
-            hIcon: icon,
-            hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hbrBackground: HBRUSH(background as *mut _),
-            lpszClassName: class,
-            ..Default::default()
-        };
-        if RegisterClassW(&definition) == 0 {
-            let error = Error::from_thread();
-            if error.code() != ERROR_CLASS_ALREADY_EXISTS.to_hresult() {
-                return Err(error);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn control(parent: HWND, class: PCWSTR, label: PCWSTR, style: u32, id: usize) -> Result<HWND> {
-    unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            class,
-            label,
-            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(style),
-            0,
-            0,
-            0,
-            0,
-            Some(parent),
-            Some(HMENU(id as *mut _)),
-            None,
-            None,
-        )
-    }
-}
-
-fn position(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
-    unsafe {
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            x,
-            y,
-            width,
-            height,
-            SWP_NOACTIVATE | SWP_NOZORDER,
-        );
-    }
-}
-
-fn send(hwnd: HWND, message: u32, wparam: usize, lparam: isize) -> isize {
-    unsafe { SendMessageW(hwnd, message, Some(WPARAM(wparam)), Some(LPARAM(lparam))).0 }
 }
 
 fn with_app<T>(run: impl FnOnce(&mut App) -> T) -> Option<T> {
@@ -1081,12 +774,24 @@ unsafe extern "system" fn window_proc(
                 recheck_placement(hwnd);
             }
         }
+        WM_ENTERSIZEMOVE => {
+            let mut rect = RECT::default();
+            let origin = unsafe { GetWindowRect(hwnd, &mut rect) }
+                .is_ok()
+                .then_some(rect);
+            with_app(|app| app.move_origin = origin);
+        }
         WM_EXITSIZEMOVE => {
-            if with_app(|app| app.layout()) == Some(Layout::Taskbar) {
+            let Some((layout, origin)) = with_app(|app| (app.layout(), app.move_origin.take()))
+            else {
+                return LRESULT(0);
+            };
+            if layout == Layout::Taskbar {
                 return LRESULT(0);
             }
             let mut rect = RECT::default();
-            if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() {
+            // 只是单击或双击而没有拖动时，不重新吸附也不写设置文件。
+            if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() && origin != Some(rect) {
                 let position = POINT {
                     x: rect.left,
                     y: rect.top,
@@ -1101,8 +806,14 @@ unsafe extern "system" fn window_proc(
             }
         }
         WM_CONTEXTMENU | WM_NCRBUTTONUP => open_menu(hwnd, message_point(lparam)),
+        // 浮窗命中 HTCAPTION（非客户区双击），任务栏模式命中 HTCLIENT（需 CS_DBLCLKS）。
+        WM_NCLBUTTONDBLCLK | WM_LBUTTONDBLCLK => double_click(hwnd),
         DOCK_Z_ORDER_CHECK => check_dock_z_order(hwnd),
         WM_TIMER if wparam.0 == DOCK_Z_ORDER_TIMER => check_dock_z_order(hwnd),
+        WM_TIMER if wparam.0 == PAINT_RETRY_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), PAINT_RETRY_TIMER) };
+            invalidate(hwnd);
+        }
         TRAY_EVENT => match (lparam.0 as u32) & 0xffff {
             WM_CONTEXTMENU => open_menu(hwnd, message_point(LPARAM(wparam.0 as isize))),
             NIN_SELECT | NIN_KEYSELECT => command(hwnd, TOGGLE),
@@ -1330,15 +1041,6 @@ fn recheck_placement(hwnd: HWND) {
     }
 }
 
-fn window_dpi(hwnd: HWND) -> u32 {
-    let dpi = unsafe { GetDpiForWindow(hwnd) };
-    if dpi == 0 { 96 } else { dpi }
-}
-
-fn scale(dip: i32, dpi: u32) -> i32 {
-    (dip * dpi as i32 + 48) / 96
-}
-
 fn center_starting_panel(hwnd: HWND, dpi: u32, text_size: TextSize) {
     let mut monitor = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
@@ -1501,288 +1203,6 @@ fn message_point(value: LPARAM) -> POINT {
     }
 }
 
-struct Menu(HMENU);
-
-impl Menu {
-    fn new() -> Result<Self> {
-        Ok(Self(unsafe { CreatePopupMenu()? }))
-    }
-
-    fn item(&self, id: usize, label: PCWSTR, flags: MENU_ITEM_FLAGS) -> Result<()> {
-        unsafe { AppendMenuW(self.0, MF_STRING | flags, id, label) }
-    }
-
-    fn separator(&self) -> Result<()> {
-        unsafe { AppendMenuW(self.0, MF_SEPARATOR, 0, PCWSTR::null()) }
-    }
-
-    fn submenu(&self, label: PCWSTR, child: Self) -> Result<()> {
-        let handle = child.0;
-        unsafe { AppendMenuW(self.0, MF_POPUP | MF_STRING, handle.0 as usize, label)? };
-        // The parent menu now owns the submenu.
-        std::mem::forget(child);
-        Ok(())
-    }
-}
-
-impl Drop for Menu {
-    fn drop(&mut self) {
-        let _ = unsafe { DestroyMenu(self.0) };
-    }
-}
-
-fn open_menu(hwnd: HWND, at: POINT) {
-    let Some((settings, tray_ready, shown, placement, update_busy)) = with_app(|app| {
-        (
-            app.settings,
-            app.tray_ready,
-            app.shown,
-            app.placement.unwrap_or_default(),
-            app.update.is_some(),
-        )
-    }) else {
-        return;
-    };
-    if let Ok(menu) = make_menu(
-        settings,
-        tray_ready,
-        shown,
-        placement,
-        startup::status().ok(),
-        update_busy,
-    ) {
-        let menu_host = (settings.theme == Theme::Transparent)
-            .then(|| create_menu_host().ok())
-            .flatten();
-        let owner = menu_host.as_ref().map_or(hwnd, |window| window.0);
-        let selection = unsafe {
-            let _ = SetForegroundWindow(owner);
-            let result = TrackPopupMenu(
-                menu.0,
-                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                at.x,
-                at.y,
-                None,
-                owner,
-                None,
-            );
-            let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
-            result.0 as usize
-        };
-        if selection != 0 {
-            command(hwnd, selection);
-        }
-    }
-}
-
-fn create_menu_host() -> Result<Window> {
-    // Keep the painted panel out of the foreground while Windows tracks its menu.
-    unsafe {
-        let instance = HINSTANCE(GetModuleHandleW(PCWSTR::null())?.0);
-        let window = Window(CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
-            w!("Static"),
-            PCWSTR::null(),
-            WS_POPUP,
-            GetSystemMetrics(SM_XVIRTUALSCREEN).saturating_sub(32),
-            GetSystemMetrics(SM_YVIRTUALSCREEN).saturating_sub(32),
-            1,
-            1,
-            None,
-            None,
-            Some(instance),
-            None,
-        )?);
-        set_panel_frame(window.0, false);
-        let _ = ShowWindow(window.0, SW_SHOWNOACTIVATE);
-        Ok(window)
-    }
-}
-
-fn make_menu(
-    settings: Settings,
-    tray_ready: bool,
-    shown: bool,
-    placement: Placement,
-    startup: Option<startup::Status>,
-    update_busy: bool,
-) -> Result<Menu> {
-    let language = settings.display.language;
-    let menu = Menu::new()?;
-    menu.item(
-        OPEN_MANAGER,
-        language.choose(w!("打开管理窗口…"), w!("Open Manager…")),
-        MF_ENABLED,
-    )?;
-    let visibility = if shown {
-        language.choose(w!("隐藏监控"), w!("Hide Monitor"))
-    } else {
-        language.choose(w!("显示监控"), w!("Show Monitor"))
-    };
-    let available = if tray_ready { MF_ENABLED } else { MF_GRAYED };
-    menu.item(TOGGLE, visibility, available)?;
-    menu.submenu(
-        language.choose(w!("设置"), w!("Settings")),
-        make_settings_menu(settings, placement, startup, update_busy)?,
-    )?;
-    menu.separator()?;
-    menu.item(
-        EXPORT_HISTORY,
-        language.choose(w!("导出监控记录（JSON）…"), w!("Export History (JSON)…")),
-        MF_ENABLED,
-    )?;
-    menu.item(
-        RESET_TRAFFIC,
-        language.choose(w!("清零总流量"), w!("Reset Total Traffic")),
-        MF_ENABLED,
-    )?;
-    menu.item(
-        ABOUT,
-        language.choose(w!("关于…"), w!("About…")),
-        MF_ENABLED,
-    )?;
-    menu.item(EXIT, language.choose(w!("退出"), w!("Exit")), MF_ENABLED)?;
-    Ok(menu)
-}
-
-fn make_settings_menu(
-    settings: Settings,
-    placement: Placement,
-    startup: Option<startup::Status>,
-    update_busy: bool,
-) -> Result<Menu> {
-    let language = settings.display.language;
-    let menu = Menu::new()?;
-    let checked = |condition| if condition { MF_CHECKED } else { MF_UNCHECKED };
-    let startup_label = if startup == Some(startup::Status::OtherPath) {
-        language.choose(
-            w!("开机自启（更新路径）"),
-            w!("Run at Sign-in (Update Path)"),
-        )
-    } else {
-        language.choose(w!("开机自启"), w!("Run at Sign-in"))
-    };
-    let docked = matches!(placement, Placement::Docked(_));
-    let dock_label = if settings.taskbar && placement == Placement::Floating {
-        language.choose(
-            w!("嵌入任务栏（等候空位）"),
-            w!("Embed in Taskbar (Waiting for Space)"),
-        )
-    } else {
-        language.choose(w!("嵌入任务栏"), w!("Embed in Taskbar"))
-    };
-    let topmost = if docked { MF_GRAYED } else { MF_ENABLED };
-    menu.item(
-        AUTOSTART,
-        startup_label,
-        checked(startup == Some(startup::Status::Enabled)),
-    )?;
-    menu.item(DOCK, dock_label, checked(settings.taskbar))?;
-    menu.item(
-        TOPMOST,
-        language.choose(w!("窗口置顶"), w!("Always on Top")),
-        topmost | checked(settings.topmost || docked),
-    )?;
-    menu.separator()?;
-
-    let refresh = Menu::new()?;
-    let labels = language.choose(
-        [w!("1 秒"), w!("2 秒"), w!("3 秒"), w!("5 秒")],
-        [
-            w!("1 second"),
-            w!("2 seconds"),
-            w!("3 seconds"),
-            w!("5 seconds"),
-        ],
-    );
-    for ((id, interval), label) in REFRESH_OPTIONS.into_iter().zip(labels) {
-        refresh.item(id, label, checked(settings.refresh == interval))?;
-    }
-    menu.submenu(
-        language.choose(w!("刷新频率"), w!("Refresh Interval")),
-        refresh,
-    )?;
-
-    let theme = Menu::new()?;
-    for (id, choice, label) in [
-        (
-            FOLLOW_SYSTEM,
-            Theme::System,
-            language.choose(w!("跟随系统"), w!("Use System Theme")),
-        ),
-        (
-            LIGHT,
-            Theme::Light,
-            language.choose(w!("浅色"), w!("Light")),
-        ),
-        (DARK, Theme::Dark, language.choose(w!("深色"), w!("Dark"))),
-        (
-            TRANSPARENT_THEME,
-            Theme::Transparent,
-            language.choose(w!("透明"), w!("Transparent")),
-        ),
-    ] {
-        theme.item(id, label, checked(settings.theme == choice))?;
-    }
-    menu.submenu(language.choose(w!("主题"), w!("Theme")), theme)?;
-    menu.item(
-        LABEL_BOLD,
-        language.choose(w!("标签加粗"), w!("Bold Labels")),
-        checked(settings.label_bold),
-    )?;
-
-    let taskbar_position = Menu::new()?;
-    taskbar_position.item(
-        DOCK_LEFT,
-        language.choose(w!("靠左"), w!("Left")),
-        checked(settings.taskbar_side == TaskbarSide::Left),
-    )?;
-    taskbar_position.item(
-        DOCK_RIGHT,
-        language.choose(w!("靠右"), w!("Right")),
-        checked(settings.taskbar_side == TaskbarSide::Right),
-    )?;
-    menu.submenu(
-        language.choose(w!("任务栏位置"), w!("Taskbar Position")),
-        taskbar_position,
-    )?;
-    menu.item(
-        EDIT_METRICS,
-        language.choose(w!("编辑监控项…"), w!("Edit Metrics…")),
-        MF_ENABLED,
-    )?;
-    let (update_label, update_flags) = if update_busy {
-        (
-            language.choose(w!("正在处理更新…"), w!("Working on Update…")),
-            MF_GRAYED,
-        )
-    } else {
-        (
-            language.choose(w!("检查更新…"), w!("Check for Updates…")),
-            MF_ENABLED,
-        )
-    };
-    menu.item(CHECK_UPDATE, update_label, update_flags)?;
-    let languages = Menu::new()?;
-    for (id, preference, label) in [
-        (
-            LANGUAGE_SYSTEM,
-            LanguagePreference::System,
-            language.choose(w!("跟随系统"), w!("Use System Language")),
-        ),
-        (
-            LANGUAGE_CHINESE,
-            LanguagePreference::Chinese,
-            w!("简体中文"),
-        ),
-        (LANGUAGE_ENGLISH, LanguagePreference::English, w!("English")),
-    ] {
-        languages.item(id, label, checked(settings.language == preference))?;
-    }
-    menu.submenu(language.choose(w!("语言"), w!("Language")), languages)?;
-    Ok(menu)
-}
-
 fn metric_name(metric: Metric, language: Language) -> &'static str {
     match metric {
         Metric::Upload => language.choose("上传速度", "Upload Speed"),
@@ -1802,372 +1222,6 @@ fn metric_name(metric: Metric, language: Language) -> &'static str {
         Metric::Uptime => language.choose("运行时长", "Uptime"),
         Metric::Battery => language.choose("电池电量", "Battery Level"),
     }
-}
-
-fn set_display(hwnd: HWND, display: DisplayOptions) {
-    let apply_now = with_app(|app| {
-        if app.settings.display == display {
-            return false;
-        }
-        let size = Layout::Taskbar.size(display);
-        let resize_dock =
-            app.settings.taskbar && size != Layout::Taskbar.size(app.settings.display);
-        app.settings.display = display;
-        if resize_dock {
-            app.request_dock();
-        }
-        app.save();
-        // Keep the current panel in its slot until the worker has checked the new dimensions.
-        app.layout() != Layout::Taskbar || size == Layout::Taskbar.size(app.display)
-    });
-    if apply_now == Some(true) {
-        apply_placement(hwnd);
-    }
-}
-
-fn set_language(hwnd: HWND, preference: LanguagePreference) {
-    let language = preference.resolve();
-    let display = with_app(|app| {
-        let previous = app.settings.display;
-        if app.settings.language == preference && previous.language == language {
-            return None;
-        }
-        app.settings.language = preference;
-        if previous.language == language {
-            app.save();
-            return None;
-        }
-        Some(DisplayOptions {
-            language,
-            ..previous
-        })
-    })
-    .flatten();
-    if let Some(display) = display {
-        set_thread_language(language);
-        set_display(hwnd, display);
-        editor::set_language(language);
-    }
-}
-
-fn start_update(hwnd: HWND, action: updater::Action) {
-    let result = with_app(|app| {
-        if app.update.is_none() {
-            app.update = Some(updater::start(hwnd, action, app.settings.display.language)?);
-        }
-        Ok::<_, std::io::Error>(())
-    });
-    if let Some(Err(error)) = result {
-        show_update_error(Some(manager::dialog_owner(hwnd)), &error);
-    }
-}
-
-fn finish_update(hwnd: HWND) {
-    let event = with_app(|app| {
-        let event = app.update.as_ref()?.try_recv().ok()?;
-        app.update = None;
-        Some(event)
-    })
-    .flatten();
-    let owner = manager::dialog_owner(hwnd);
-    match event {
-        Some(updater::Event::Checked(Ok(Some(release)))) => {
-            let version = release.version.to_string();
-            let text = HSTRING::from(match ui_language() {
-                Language::Chinese => format!("GitHub 上有新版本 v{version}。是否下载并重启应用？"),
-                Language::English => format!(
-                    "Version v{version} is available on GitHub. Download it and restart the app?"
-                ),
-            });
-            let answer = unsafe {
-                MessageBoxW(
-                    Some(owner),
-                    &text,
-                    app_title(),
-                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
-                )
-            };
-            if answer == IDYES {
-                start_update(hwnd, updater::Action::Download(release));
-            }
-        }
-        Some(updater::Event::Checked(Ok(None))) => {
-            let text = HSTRING::from(ui_language().choose(
-                concat!("当前已是最新版本 v", env!("CARGO_PKG_VERSION"), "。"),
-                concat!(
-                    "You are using the latest version, v",
-                    env!("CARGO_PKG_VERSION"),
-                    "."
-                ),
-            ));
-            unsafe { MessageBoxW(Some(owner), &text, app_title(), MB_OK | MB_ICONINFORMATION) };
-        }
-        Some(updater::Event::Downloaded(Ok(update))) => match update.launch(ui_language()) {
-            Ok(()) => {
-                let _ = unsafe { DestroyWindow(hwnd) };
-            }
-            Err(error) => show_update_error(Some(owner), &error),
-        },
-        Some(updater::Event::Checked(Err(error)) | updater::Event::Downloaded(Err(error))) => {
-            show_update_error(Some(owner), &error);
-        }
-        None => {}
-    }
-    manager::refresh_settings();
-}
-
-fn show_update_error(hwnd: Option<HWND>, error: &impl std::fmt::Display) {
-    show_warning(
-        hwnd,
-        ui_language().choose("无法完成在线更新。", "The update could not be completed."),
-        error,
-    );
-}
-
-fn show_warning(hwnd: Option<HWND>, heading: &str, error: &impl std::fmt::Display) {
-    let text = HSTRING::from(format!("{heading}\n\n{error}"));
-    unsafe { MessageBoxW(hwnd, &text, app_title(), MB_OK | MB_ICONWARNING) };
-}
-
-fn start_history_export(hwnd: HWND, owner: HWND) {
-    let Some(feed) = with_app(|app| {
-        if app.history_exporting {
-            return None;
-        }
-        app.history_exporting = true;
-        Some(app.feed.clone())
-    })
-    .flatten() else {
-        return;
-    };
-    let language = ui_language();
-    let started = (|| -> io::Result<bool> {
-        let Some(path) = history_export::destination(owner, language)? else {
-            return Ok(false);
-        };
-        let directory = history_directory()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA"))?;
-        let handle = hwnd.0 as usize;
-        thread::Builder::new()
-            .name("monitor-history-export".into())
-            .spawn(move || {
-                let result = history::export_json(&directory, &path, history::now_ms());
-                feed.lock().unwrap().history_export = Some(result);
-                notify(HWND(handle as *mut _), HISTORY_EXPORTED);
-            })?;
-        Ok(true)
-    })();
-    if !matches!(started, Ok(true)) {
-        with_app(|app| app.history_exporting = false);
-    }
-    if let Err(error) = started {
-        show_history_export_error(owner, &error);
-    }
-}
-
-fn finish_history_export(hwnd: HWND) {
-    let result = with_app(|app| {
-        let result = app.feed.lock().unwrap().history_export.take();
-        if result.is_some() {
-            app.history_exporting = false;
-        }
-        result
-    })
-    .flatten();
-    manager::refresh_settings();
-    let owner = manager::dialog_owner(hwnd);
-    match result {
-        Some(Ok(count)) => {
-            let text = HSTRING::from(ui_language().choose(
-                format!("已导出 {count} 条监控记录。"),
-                format!("Exported {count} monitoring samples."),
-            ));
-            unsafe { MessageBoxW(Some(owner), &text, app_title(), MB_OK | MB_ICONINFORMATION) };
-        }
-        Some(Err(error)) => show_history_export_error(owner, &error),
-        None => {}
-    }
-}
-
-fn show_history_export_error(owner: HWND, error: &io::Error) {
-    show_warning(
-        Some(owner),
-        ui_language().choose("无法导出监控记录。", "Could not export monitoring history."),
-        error,
-    );
-}
-
-fn command(hwnd: HWND, selection: usize) {
-    let owner = manager::dialog_owner(hwnd);
-    match selection {
-        OPEN_MANAGER => {
-            if let Err(error) = manager::open(hwnd) {
-                show_warning(
-                    Some(hwnd),
-                    ui_language().choose(
-                        "无法打开管理窗口。",
-                        "The manager window could not be opened.",
-                    ),
-                    &error,
-                );
-            }
-            return;
-        }
-        EXPORT_HISTORY => start_history_export(hwnd, owner),
-        RECORD_HISTORY => {
-            with_app(|app| {
-                app.settings.record_history = !app.settings.record_history;
-                let _ = app
-                    .worker
-                    .send(WorkerCommand::RecordHistory(app.settings.record_history));
-                app.save();
-            });
-        }
-        ABOUT => {
-            if let Err(error) = about::open(owner) {
-                show_warning(
-                    Some(owner),
-                    ui_language().choose(
-                        "无法打开关于窗口。",
-                        "The About dialog could not be opened.",
-                    ),
-                    &error,
-                );
-            }
-        }
-        CHECK_UPDATE => start_update(hwnd, updater::Action::Check),
-        EDIT_METRICS => {
-            if let Err(error) = editor::open(hwnd, owner) {
-                show_warning(
-                    Some(owner),
-                    ui_language().choose(
-                        "无法打开监控项编辑器。",
-                        "The metrics editor could not be opened.",
-                    ),
-                    &error,
-                );
-            }
-        }
-        AUTOSTART => {
-            let language = ui_language();
-            if let Err(error) = startup::toggle(language) {
-                show_warning(
-                    Some(owner),
-                    language.choose(
-                        "无法更改开机自启设置。",
-                        "The run-at-sign-in setting could not be changed.",
-                    ),
-                    &error,
-                );
-            }
-        }
-        LANGUAGE_SYSTEM | LANGUAGE_CHINESE | LANGUAGE_ENGLISH => {
-            set_language(
-                hwnd,
-                match selection {
-                    LANGUAGE_CHINESE => LanguagePreference::Chinese,
-                    LANGUAGE_ENGLISH => LanguagePreference::English,
-                    _ => LanguagePreference::System,
-                },
-            );
-        }
-        TOGGLE => {
-            let changed = with_app(|app| {
-                if app.tray_ready {
-                    app.shown = !app.shown;
-                }
-                app.tray_ready
-            });
-            if changed == Some(true) {
-                apply_visibility(hwnd);
-            }
-        }
-        DOCK => {
-            with_app(|app| {
-                app.settings.taskbar = !app.settings.taskbar;
-                app.request_dock();
-                app.placement = (!app.settings.taskbar).then_some(Placement::Floating);
-                app.save();
-            });
-            apply_placement(hwnd);
-        }
-        DOCK_LEFT | DOCK_RIGHT => {
-            let side = if selection == DOCK_LEFT {
-                TaskbarSide::Left
-            } else {
-                TaskbarSide::Right
-            };
-            with_app(|app| {
-                if app.settings.taskbar_side != side {
-                    app.settings.taskbar_side = side;
-                    if app.settings.taskbar {
-                        app.request_dock();
-                    }
-                    app.save();
-                }
-            });
-        }
-        TOPMOST => {
-            if let Some(topmost) = with_app(|app| {
-                app.settings.topmost = !app.settings.topmost;
-                app.save();
-                app.panel_topmost()
-            }) {
-                set_topmost(hwnd, topmost);
-            }
-        }
-        FOLLOW_SYSTEM | LIGHT | DARK | TRANSPARENT_THEME => {
-            with_app(|app| {
-                app.settings.theme = match selection {
-                    LIGHT => Theme::Light,
-                    DARK => Theme::Dark,
-                    TRANSPARENT_THEME => Theme::Transparent,
-                    _ => Theme::System,
-                };
-                app.save();
-            });
-            apply_placement(hwnd);
-            editor::refresh_preview();
-        }
-        LABEL_BOLD => {
-            with_app(|app| {
-                app.settings.label_bold = !app.settings.label_bold;
-                app.save();
-            });
-            invalidate(hwnd);
-            editor::refresh_preview();
-        }
-        RESET_TRAFFIC => {
-            with_app(|app| {
-                app.take_sample();
-                app.starting_traffic = 0;
-                app.traffic_at_reset = app.sample.traffic;
-                let _ = app
-                    .worker
-                    .send(WorkerCommand::ResetHistoryTraffic(app.traffic_at_reset));
-                app.update_display();
-                app.save();
-            });
-            invalidate(hwnd);
-            editor::refresh_preview();
-        }
-        EXIT => {
-            let _ = unsafe { DestroyWindow(hwnd) };
-            return;
-        }
-        _ => {
-            if let Some((_, interval)) =
-                REFRESH_OPTIONS.into_iter().find(|(id, _)| *id == selection)
-            {
-                with_app(|app| {
-                    app.settings.refresh = interval;
-                    let _ = app.worker.send(WorkerCommand::Interval(interval));
-                    app.save();
-                });
-            }
-        }
-    }
-    manager::refresh_settings();
 }
 
 #[cfg(test)]
@@ -2264,100 +1318,5 @@ mod tests {
             "Initial window painted in {} ms before sampling",
             elapsed.as_millis()
         );
-    }
-
-    #[test]
-    fn settings_menu_groups_preferences_and_shows_current_choices() {
-        let settings = Settings {
-            refresh: Refresh::Three,
-            theme: Theme::Transparent,
-            ..Default::default()
-        };
-        let menu = make_menu(
-            settings,
-            true,
-            true,
-            Placement::Floating,
-            Some(startup::Status::Enabled),
-            false,
-        )
-        .unwrap();
-        unsafe {
-            assert_eq!(GetMenuItemCount(Some(menu.0)), 8);
-            assert_eq!(GetMenuItemID(menu.0, 0), OPEN_MANAGER as u32);
-            assert_eq!(GetMenuItemID(menu.0, 1), TOGGLE as u32);
-            assert_eq!(GetMenuItemID(menu.0, 4), EXPORT_HISTORY as u32);
-            assert_eq!(GetMenuItemID(menu.0, 6), ABOUT as u32);
-            assert_eq!(GetMenuItemID(menu.0, 7), EXIT as u32);
-            let settings = GetSubMenu(menu.0, 2);
-            assert!(!settings.is_invalid());
-            let refresh = GetSubMenu(settings, 4);
-            let theme = GetSubMenu(settings, 5);
-            let position = GetSubMenu(settings, 7);
-            assert_eq!(GetMenuItemID(settings, 6), LABEL_BOLD as u32);
-            assert_eq!(GetMenuItemID(settings, 8), EDIT_METRICS as u32);
-            assert_eq!(GetMenuItemID(settings, 9), CHECK_UPDATE as u32);
-            assert!(!refresh.is_invalid());
-            assert!(!theme.is_invalid());
-            assert!(!position.is_invalid());
-            for (submenu, command) in [
-                (settings, AUTOSTART),
-                (settings, LABEL_BOLD),
-                (refresh, 111),
-                (theme, TRANSPARENT_THEME),
-                (position, DOCK_RIGHT),
-            ] {
-                let flags = GetMenuState(submenu, command as u32, MF_BYCOMMAND);
-                assert_ne!(flags, u32::MAX);
-                assert_ne!(flags & MF_CHECKED.0, 0);
-            }
-        }
-    }
-
-    #[test]
-    fn changing_interval_reschedules_the_running_sampler() {
-        let window = Window(
-            unsafe {
-                CreateWindowExW(
-                    WINDOW_EX_STYLE::default(),
-                    w!("Static"),
-                    PCWSTR::null(),
-                    WINDOW_STYLE::default(),
-                    0,
-                    0,
-                    0,
-                    0,
-                    Some(HWND_MESSAGE),
-                    None,
-                    None,
-                    None,
-                )
-            }
-            .unwrap(),
-        );
-        let settings = Settings {
-            refresh: Refresh::Three,
-            ..Default::default()
-        };
-        let feed = Feed::default();
-        let command = mpsc::channel();
-        let sender = command.0.clone();
-        let _worker = SamplerWorker::start(window.0, feed.clone(), settings, command).unwrap();
-        let wait_for_sample = || {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while Instant::now() < deadline {
-                if feed.lock().unwrap().sample.take().is_some() {
-                    return true;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            false
-        };
-        assert!(wait_for_sample());
-        sender.send(WorkerCommand::Interval(Refresh::Five)).unwrap();
-        thread::sleep(Duration::from_millis(2200));
-        assert!(feed.lock().unwrap().sample.is_none());
-        sender.send(WorkerCommand::Interval(Refresh::Two)).unwrap();
-        assert!(wait_for_sample());
     }
 }

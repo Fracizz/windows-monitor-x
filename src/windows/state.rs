@@ -152,6 +152,36 @@ impl TaskbarSide {
     }
 }
 
+/// 双击监控面板时执行的操作。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DoubleClick {
+    Nothing,
+    #[default]
+    TaskManager,
+    ResourceMonitor,
+    Manager,
+}
+
+impl DoubleClick {
+    fn parse(value: &str) -> Self {
+        match value {
+            "none" => Self::Nothing,
+            "resource_monitor" => Self::ResourceMonitor,
+            "manager" => Self::Manager,
+            _ => Self::TaskManager,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Nothing => "none",
+            Self::TaskManager => "task_manager",
+            Self::ResourceMonitor => "resource_monitor",
+            Self::Manager => "manager",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Settings {
     pub traffic: u64,
@@ -163,6 +193,7 @@ pub struct Settings {
     pub taskbar_side: TaskbarSide,
     pub refresh: Refresh,
     pub record_history: bool,
+    pub double_click: DoubleClick,
     pub display: DisplayOptions,
     pub position: Option<POINT>,
 }
@@ -179,6 +210,7 @@ impl Default for Settings {
             taskbar_side: TaskbarSide::default(),
             refresh: Refresh::default(),
             record_history: false,
+            double_click: DoubleClick::default(),
             display: DisplayOptions {
                 language: LanguagePreference::System.resolve(),
                 ..Default::default()
@@ -209,6 +241,7 @@ impl Settings {
                         "record_history" => {
                             settings.record_history = value.parse().unwrap_or(false)
                         }
+                        "double_click" => settings.double_click = DoubleClick::parse(value),
                         "metrics" => settings.display.metrics = Metrics::parse(value),
                         "density" => settings.display.density = Density::parse(value),
                         "text_size" => {
@@ -252,7 +285,7 @@ impl Settings {
         fs::write(
             &temp,
             format!(
-                "traffic={}\ntheme={theme}\nlanguage={}\nlabel_bold={}\ntopmost={}\ntaskbar={}\ntaskbar_side={}\nrefresh={}\nrecord_history={}\nposition={position}\nmetrics={metrics}\ntext_size={text_size}\ndensity={density}\n",
+                "traffic={}\ntheme={theme}\nlanguage={}\nlabel_bold={}\ntopmost={}\ntaskbar={}\ntaskbar_side={}\nrefresh={}\nrecord_history={}\ndouble_click={}\nposition={position}\nmetrics={metrics}\ntext_size={text_size}\ndensity={density}\n",
                 self.traffic,
                 self.language.key(),
                 self.label_bold,
@@ -261,6 +294,7 @@ impl Settings {
                 self.taskbar_side.as_str(),
                 self.refresh.seconds(),
                 self.record_history,
+                self.double_click.as_str(),
             ),
         )?;
         fs::rename(temp, file)

@@ -1,13 +1,13 @@
 use ::windows::{
     Win32::{
-        Foundation::{ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::*,
     },
-    core::{Error, PCWSTR, Result, w},
+    core::{PCWSTR, Result, w},
 };
 
-use super::{Window, message_point, open_menu, panel_hit_test, set_panel_frame};
+use super::{Window, message_point, open_menu, panel_hit_test, register_class, set_panel_frame};
 
 const CLASS: PCWSTR = w!("WindowsMonitor.PanelInput");
 
@@ -56,19 +56,15 @@ impl PanelInput {
 fn create(owner: HWND, rect: RECT) -> Result<HWND> {
     unsafe {
         let instance = HINSTANCE(GetModuleHandleW(PCWSTR::null())?.0);
-        let class = WNDCLASSW {
-            lpfnWndProc: Some(input_proc),
-            hInstance: instance,
-            hCursor: LoadCursorW(None, IDC_ARROW)?,
-            lpszClassName: CLASS,
-            ..Default::default()
-        };
-        if RegisterClassW(&class) == 0 {
-            let error = Error::from_thread();
-            if error.code() != ERROR_CLASS_ALREADY_EXISTS.to_hresult() {
-                return Err(error);
-            }
-        }
+        // 浮窗双击由非客户区消息处理；任务栏模式命中客户区，需要 CS_DBLCLKS 才会产生双击消息。
+        register_class(
+            CLASS,
+            instance,
+            CS_DBLCLKS,
+            Some(input_proc),
+            HICON::default(),
+            0,
+        )?;
         // The owned window handles input without contributing any pixels to the desktop.
         let window = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
@@ -104,7 +100,7 @@ unsafe extern "system" fn input_proc(
             }
             LRESULT(0)
         }
-        WM_NCLBUTTONDOWN => {
+        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK | WM_LBUTTONDBLCLK => {
             if let Ok(owner) = unsafe { GetWindow(hwnd, GW_OWNER) } {
                 unsafe { SendMessageW(owner, message, Some(wparam), Some(lparam)) }
             } else {

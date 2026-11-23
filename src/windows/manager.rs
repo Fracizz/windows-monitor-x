@@ -2,16 +2,14 @@ use std::cell::RefCell;
 
 use ::windows::{
     Win32::{
-        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::{
-            COLOR_BTNFACE, CreateFontIndirectW, DEFAULT_GUI_FONT, DeleteObject, FW_BOLD,
-            GetMonitorInfoW, GetStockObject, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-            MonitorFromWindow,
+            COLOR_WINDOW, ExcludeClipRect, FillRect, GetSysColorBrush, HDC, MapWindowPoints,
+            RestoreDC, SaveDC, SetBkMode, TRANSPARENT,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Controls::*,
-            HiDpi::{AdjustWindowRectExForDpi, SystemParametersInfoForDpi},
             Input::KeyboardAndMouse::{EnableWindow, SetFocus},
             WindowsAndMessaging::*,
         },
@@ -20,14 +18,15 @@ use ::windows::{
 };
 
 use super::{
-    ABOUT, AUTOSTART, CHECK_UPDATE, DARK, DOCK, DOCK_LEFT, DOCK_RIGHT, EDIT_METRICS, EXIT,
-    EXPORT_HISTORY, FOLLOW_SYSTEM, LABEL_BOLD, LANGUAGE_CHINESE, LANGUAGE_ENGLISH, LANGUAGE_SYSTEM,
-    LIGHT, PRODUCT_NAME, RECORD_HISTORY, REFRESH_OPTIONS, RESET_TRAFFIC, TOGGLE, TOPMOST,
-    TRANSPARENT_THEME, Window, command, control, metric_name, position, register_class, scale,
-    send,
+    ABOUT, AUTOSTART, CHECK_UPDATE, DARK, DOCK, DOCK_LEFT, DOCK_RIGHT, DOUBLE_CLICK_OPTIONS,
+    EDIT_METRICS, EXIT, EXPORT_HISTORY, FOLLOW_SYSTEM, LABEL_BOLD, LANGUAGE_CHINESE,
+    LANGUAGE_ENGLISH, LANGUAGE_SYSTEM, LIGHT, PRODUCT_NAME, RECORD_HISTORY, REFRESH_OPTIONS,
+    RESET_TRAFFIC, TOGGLE, TOPMOST, TRANSPARENT_THEME, Window, command, control,
+    double_click_labels, metric_name, position, register_class, scale, send,
     startup::{self, Status},
     state::{LanguagePreference, TaskbarSide, Theme},
     taskbar::Placement,
+    ui::{Fonts, centered_bounds, follow_dpi_change, init_common_controls, window_size, work_area},
     window_dpi, with_app,
 };
 use crate::{
@@ -36,15 +35,32 @@ use crate::{
 };
 
 const CLASS: PCWSTR = w!("WindowsMonitor.Manager");
-const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 | WS_CLIPCHILDREN.0);
+// 不使用 WS_CLIPCHILDREN：分组框只绘制边框，内部依赖父窗口擦除背景。
+// 为避免改变大小时擦掉其他控件造成闪烁，WM_ERASEBKGND 中手动排除分组框以外的子控件。
+const STYLE: WINDOW_STYLE = WS_OVERLAPPEDWINDOW;
 const EX_STYLE: WINDOW_EX_STYLE = WS_EX_APPWINDOW;
 const SELECT_POSITION: usize = 201;
 const SELECT_THEME: usize = 202;
 const SELECT_REFRESH: usize = 203;
 const SELECT_LANGUAGE: usize = 204;
 const LIVE_LIST: usize = 205;
+const SELECT_DOUBLE_CLICK: usize = 206;
+// 静态控件单行文本垂直居中（SystemServices::SS_CENTERIMAGE），避免为一个常量引入整个特性。
+const SS_CENTERIMAGE: u32 = 0x200;
+const WIDTH: i32 = 820;
+const HEIGHT: i32 = 496;
 const MIN_WIDTH: i32 = 620;
-const MIN_HEIGHT: i32 = 407;
+const MIN_HEIGHT: i32 = 437;
+// 设置区纵向布局（DIP）：分组框从状态栏下方开始，组内各行按统一行距自上而下排布。
+const GROUPS_TOP: i32 = 77;
+const GROUP_PADDING_TOP: i32 = 19;
+const GROUP_PADDING_BOTTOM: i32 = 10;
+const GROUP_SPACING: i32 = 7;
+const CHECK_HEIGHT: i32 = 24;
+const BUTTON_HEIGHT: i32 = 28;
+const ROW_GAP: (i32, i32) = (2, 6);
+const FOOTER_HEIGHT: i32 = 45;
+const FOOTER_SPACING: i32 = 8;
 const POSITION_COMMANDS: [usize; 2] = [DOCK_LEFT, DOCK_RIGHT];
 const THEME_COMMANDS: [usize; 4] = [FOLLOW_SYSTEM, LIGHT, DARK, TRANSPARENT_THEME];
 const LANGUAGE_COMMANDS: [usize; 3] = [LANGUAGE_SYSTEM, LANGUAGE_CHINESE, LANGUAGE_ENGLISH];
@@ -70,6 +86,7 @@ struct Manager {
     theme: (HWND, HWND),
     refresh: (HWND, HWND),
     language_select: (HWND, HWND),
+    double_click: (HWND, HWND),
     edit: HWND,
     export_history: HWND,
     record_history: HWND,
@@ -99,47 +116,26 @@ pub fn open(panel: HWND) -> Result<()> {
         return Ok(());
     };
     let instance = unsafe { HINSTANCE(GetModuleHandleW(PCWSTR::null())?.0) };
-    unsafe {
-        InitCommonControlsEx(&INITCOMMONCONTROLSEX {
-            dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
-        })
-        .ok()?;
-    }
+    init_common_controls()?;
     register_class(
         CLASS,
         instance,
+        WNDCLASS_STYLES::default(),
         Some(window_proc),
         icon,
-        COLOR_BTNFACE.0 as isize + 1,
+        COLOR_WINDOW.0 as isize + 1,
     )?;
-
-    let dpi = window_dpi(panel);
-    let mut monitor = MONITORINFO {
-        cbSize: size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    unsafe {
-        GetMonitorInfoW(
-            MonitorFromWindow(panel, MONITOR_DEFAULTTONEAREST),
-            &mut monitor,
-        )
-        .ok()?;
-    }
-    let work = monitor.rcWork;
-    let bounds = window_bounds(820, 466, dpi)?;
-    let width = bounds.right.min(work.right - work.left);
-    let height = bounds.bottom.min(work.bottom - work.top);
+    let bounds = centered_bounds(panel, WIDTH, HEIGHT, STYLE, EX_STYLE)?;
     let window = Window(unsafe {
         CreateWindowExW(
             EX_STYLE,
             CLASS,
             PCWSTR::null(),
             STYLE,
-            work.left + (work.right - work.left - width) / 2,
-            work.top + (work.bottom - work.top - height) / 2,
-            width,
-            height,
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
             None,
             None,
             Some(instance),
@@ -203,7 +199,16 @@ pub fn refresh_readings() {
 }
 
 fn with_manager<T>(run: impl FnOnce(&mut Manager) -> T) -> Option<T> {
-    MANAGER.with(|slot| slot.try_borrow_mut().ok()?.as_mut().map(run))
+    MANAGER.with(|slot| {
+        let mut slot = slot.try_borrow_mut().ok()?;
+        if slot
+            .as_ref()
+            .is_some_and(|manager| !unsafe { IsWindow(Some(manager.hwnd)) }.as_bool())
+        {
+            *slot = None;
+        }
+        slot.as_mut().map(run)
+    })
 }
 
 impl Manager {
@@ -214,7 +219,8 @@ impl Manager {
         let push = |id| button(hwnd, BS_PUSHBUTTON, id);
         let combo = |id| -> Result<_> {
             Ok((
-                static_text()?,
+                // 标签与下拉框同高并垂直居中，保证两者文字基线对齐。
+                control(hwnd, WC_STATICW, PCWSTR::null(), SS_CENTERIMAGE, 0)?,
                 control(
                     hwnd,
                     WC_COMBOBOXW,
@@ -238,6 +244,7 @@ impl Manager {
         let app_group = group()?;
         let refresh = combo(SELECT_REFRESH)?;
         let language_select = combo(SELECT_LANGUAGE)?;
+        let double_click = combo(SELECT_DOUBLE_CLICK)?;
         let autostart = check(AUTOSTART)?;
         let record_history = check(RECORD_HISTORY)?;
         let live_heading = static_text()?;
@@ -291,6 +298,7 @@ impl Manager {
             theme,
             refresh,
             language_select,
+            double_click,
             edit,
             export_history,
             record_history,
@@ -334,6 +342,11 @@ impl Manager {
             (self.theme.0, w!("面板主题"), w!("Panel Theme")),
             (self.refresh.0, w!("刷新频率"), w!("Refresh Interval")),
             (self.language_select.0, w!("语言"), w!("Language")),
+            (
+                self.double_click.0,
+                w!("双击面板"),
+                w!("Double-Click Panel"),
+            ),
             (self.edit, w!("编辑监控项…"), w!("Edit Metrics…")),
             (
                 self.record_history,
@@ -377,6 +390,7 @@ impl Manager {
                 w!("English"),
             ],
         );
+        set_options(self.double_click.1, double_click_labels(language));
         let columns = language.choose([w!("指标"), w!("读数")], [w!("Metric"), w!("Reading")]);
         for (index, text) in columns.into_iter().enumerate() {
             let column = LVCOLUMNW {
@@ -432,7 +446,7 @@ impl Manager {
             if app.history_exporting {
                 language.choose(w!("正在导出…"), w!("Exporting…"))
             } else {
-                language.choose(w!("导出 JSON…"), w!("Export JSON…"))
+                language.choose(w!("导出记录…"), w!("Export…"))
             },
         );
         set_text(
@@ -477,6 +491,15 @@ impl Manager {
                 LanguagePreference::Chinese => 1,
                 LanguagePreference::English => 2,
             },
+            0,
+        );
+        let double_click = DOUBLE_CLICK_OPTIONS
+            .iter()
+            .position(|&(_, action)| action == settings.double_click);
+        send(
+            self.double_click.1,
+            CB_SETCURSEL,
+            double_click.unwrap_or(0),
             0,
         );
         self.update_status(app);
@@ -559,7 +582,7 @@ impl Manager {
         if self.fonts.as_ref().is_none_or(|fonts| fonts.dpi != dpi) {
             self.set_fonts(dpi);
         }
-        let dip = |px| px * 96 / dpi as i32;
+        let dip = |px: i32| px * 96 / dpi as i32;
         let width = dip(area.right);
         let height = dip(area.bottom);
         let left = 20;
@@ -568,8 +591,8 @@ impl Manager {
         let live_x = left + panel_width + 20;
         let inside = left + 14;
         let column = inside + (panel_width - 28) / 2;
-        let compact = (435 - height).clamp(0, 28);
-        let footer = height - 45;
+        let half = panel_width / 2 - 14;
+        let footer = height - FOOTER_HEIGHT;
         let set = |hwnd, x, y, w, h| {
             position(
                 hwnd,
@@ -582,42 +605,82 @@ impl Manager {
 
         set(self.title, left, 14, right - left, 34);
         set(self.status, left, 51, right - left, 22);
-        set(self.panel_group, left, 77, panel_width, 184 - compact / 2);
+
+        // 下拉框收起时的高度由字体与 DPI 决定，行高取它与复选框高度的较大者。
+        let mut combo = RECT::default();
+        let combo_px = if unsafe { GetWindowRect(self.theme.1, &mut combo) }.is_ok() {
+            combo.bottom - combo.top
+        } else {
+            scale(CHECK_HEIGHT, dpi)
+        };
+        let combo_height = ((combo_px * 96 + dpi as i32 - 1) / dpi as i32).max(CHECK_HEIGHT);
+        let panel_rows = [
+            CHECK_HEIGHT,
+            CHECK_HEIGHT,
+            combo_height,
+            combo_height,
+            BUTTON_HEIGHT,
+        ];
+        let app_rows = [combo_height, combo_height, combo_height, CHECK_HEIGHT];
+        let padding = GROUP_PADDING_TOP + GROUP_PADDING_BOTTOM;
+        let fixed = panel_rows.iter().chain(&app_rows).sum::<i32>() + 2 * padding + GROUP_SPACING;
+        let gaps = (panel_rows.len() + app_rows.len() - 2) as i32;
+        let available = footer - FOOTER_SPACING - GROUPS_TOP;
+        let gap = ((available - fixed) / gaps).clamp(ROW_GAP.0, ROW_GAP.1);
+        let mut rows = Rows::new(GROUPS_TOP + GROUP_PADDING_TOP, gap);
+
+        let place_combo = |(label, field): (HWND, HWND), y| {
+            set(field, column, y, half, 150);
+            // 标签与下拉框同高并垂直居中，两者文字基线对齐。
+            position(
+                label,
+                scale(inside, dpi),
+                scale(y, dpi),
+                scale(column - inside, dpi),
+                combo_px,
+            );
+        };
+
+        let y = rows.next(CHECK_HEIGHT);
+        set(self.show_panel, inside, y, column - inside, CHECK_HEIGHT);
+        set(self.topmost, column, y, half, CHECK_HEIGHT);
+        let y = rows.next(CHECK_HEIGHT);
+        set(self.dock, inside, y, column - inside, CHECK_HEIGHT);
+        set(self.bold, column, y, half, CHECK_HEIGHT);
+        place_combo(self.taskbar_position, rows.next(combo_height));
+        place_combo(self.theme, rows.next(combo_height));
+        let y = rows.next(BUTTON_HEIGHT);
+        set(self.edit, inside, y, 136, BUTTON_HEIGHT);
+        set(self.export_history, inside + 146, y, 116, BUTTON_HEIGHT);
+        let panel_bottom = rows.end() + GROUP_PADDING_BOTTOM;
         set(
-            self.app_group,
+            self.panel_group,
             left,
-            268 - compact / 2,
+            GROUPS_TOP,
             panel_width,
-            113 - compact / 2,
+            panel_bottom - GROUPS_TOP,
         );
-        set(self.show_panel, inside, 96, column - inside, 24);
-        set(self.topmost, column, 96, panel_width / 2 - 14, 24);
-        set(self.dock, inside, 125, column - inside, 24);
-        set(self.bold, column, 125, panel_width / 2 - 14, 24);
-        for ((label, field), y) in [
-            (self.taskbar_position, 155),
-            (self.theme, 185 - compact / 4),
-            (self.refresh, 287 - compact / 2),
-            (self.language_select, 317 - compact * 3 / 4),
-        ] {
-            set(label, inside, y + 4, column - inside, 22);
-            set(field, column, y, panel_width / 2 - 14, 150);
-        }
-        set(self.edit, inside, 219 - compact / 2, 136, 28);
-        set(
-            self.export_history,
-            inside + 146,
-            219 - compact / 2,
-            116,
-            28,
-        );
-        set(self.autostart, inside, 347 - compact, 172, 24);
+
+        let app_top = panel_bottom + GROUP_SPACING;
+        let mut rows = Rows::new(app_top + GROUP_PADDING_TOP, gap);
+        place_combo(self.refresh, rows.next(combo_height));
+        place_combo(self.language_select, rows.next(combo_height));
+        place_combo(self.double_click, rows.next(combo_height));
+        let y = rows.next(CHECK_HEIGHT);
+        set(self.autostart, inside, y, 172, CHECK_HEIGHT);
         set(
             self.record_history,
             inside + 174,
-            347 - compact,
+            y,
             panel_width - 202,
-            24,
+            CHECK_HEIGHT,
+        );
+        set(
+            self.app_group,
+            left,
+            app_top,
+            panel_width,
+            rows.end() + GROUP_PADDING_BOTTOM - app_top,
         );
 
         let live_width = (right - live_x).max(1);
@@ -653,16 +716,7 @@ impl Manager {
 
     fn set_fonts(&mut self, dpi: u32) {
         let fonts = Fonts::new(dpi);
-        let fallback = unsafe { GetStockObject(DEFAULT_GUI_FONT).0 as isize };
-        let use_font = |control, font: HFONT| {
-            let handle = if font.is_invalid() {
-                fallback
-            } else {
-                font.0 as isize
-            };
-            send(control, WM_SETFONT, handle as usize, 1);
-        };
-        for control in [
+        fonts.apply_body(&[
             self.status,
             self.panel_group,
             self.app_group,
@@ -680,6 +734,8 @@ impl Manager {
             self.refresh.1,
             self.language_select.0,
             self.language_select.1,
+            self.double_click.0,
+            self.double_click.1,
             self.edit,
             self.export_history,
             self.record_history,
@@ -688,71 +744,40 @@ impl Manager {
             self.update,
             self.about,
             self.exit,
-        ] {
-            use_font(control, fonts.body);
-        }
-        use_font(self.title, fonts.title);
+        ]);
+        fonts.apply_title(self.title);
         self.fonts = Some(fonts);
     }
 }
 
-struct Fonts {
-    dpi: u32,
-    body: HFONT,
-    title: HFONT,
+/// 自上而下排布等间距的行。
+struct Rows {
+    y: i32,
+    gap: i32,
+    end: i32,
 }
 
-impl Fonts {
-    fn new(dpi: u32) -> Self {
-        let mut metrics = NONCLIENTMETRICSW {
-            cbSize: size_of::<NONCLIENTMETRICSW>() as u32,
-            ..Default::default()
-        };
-        let mut fonts = Self {
-            dpi,
-            body: HFONT::default(),
-            title: HFONT::default(),
-        };
-        unsafe {
-            if SystemParametersInfoForDpi(
-                SPI_GETNONCLIENTMETRICS.0,
-                metrics.cbSize,
-                Some((&raw mut metrics).cast()),
-                0,
-                dpi,
-            )
-            .is_ok()
-            {
-                fonts.body = CreateFontIndirectW(&metrics.lfMessageFont);
-                metrics.lfMessageFont.lfHeight = -scale(26, dpi);
-                metrics.lfMessageFont.lfWeight = FW_BOLD.0 as i32;
-                fonts.title = CreateFontIndirectW(&metrics.lfMessageFont);
-            }
-        }
-        fonts
-    }
-}
-
-impl Drop for Fonts {
-    fn drop(&mut self) {
-        for font in [self.body, self.title] {
-            if !font.is_invalid() {
-                let _ = unsafe { DeleteObject(HGDIOBJ(font.0)) };
-            }
+impl Rows {
+    fn new(top: i32, gap: i32) -> Self {
+        Self {
+            y: top,
+            gap,
+            end: top,
         }
     }
-}
 
-fn window_bounds(width: i32, height: i32, dpi: u32) -> Result<RECT> {
-    let mut rect = RECT {
-        right: scale(width, dpi),
-        bottom: scale(height, dpi),
-        ..Default::default()
-    };
-    unsafe { AdjustWindowRectExForDpi(&mut rect, STYLE, false, EX_STYLE, dpi)? };
-    rect.right -= rect.left;
-    rect.bottom -= rect.top;
-    Ok(rect)
+    /// 返回下一行的顶部坐标。
+    fn next(&mut self, height: i32) -> i32 {
+        let top = self.y;
+        self.end = top + height;
+        self.y = self.end + self.gap;
+        top
+    }
+
+    /// 最后一行的底部坐标。
+    fn end(&self) -> i32 {
+        self.end
+    }
 }
 
 fn button(hwnd: HWND, style: i32, id: usize) -> Result<HWND> {
@@ -786,6 +811,48 @@ fn set_cell(list: HWND, row: usize, column: i32, text: &str) {
     send(list, LVM_SETITEMTEXTW, row, &raw const item as isize);
 }
 
+/// 用窗口底色擦除背景，但跳过分组框以外的子控件，效果等同 WS_CLIPCHILDREN 而保留分组框内部的擦除。
+fn erase_background(hwnd: HWND, dc: HDC) {
+    unsafe {
+        let saved = SaveDC(dc);
+        let mut child = GetWindow(hwnd, GW_CHILD);
+        while let Ok(current) = child {
+            let mut rect = RECT::default();
+            if IsWindowVisible(current).as_bool()
+                && !is_group_box(current)
+                && GetWindowRect(current, &mut rect).is_ok()
+            {
+                let mut corners = [
+                    POINT {
+                        x: rect.left,
+                        y: rect.top,
+                    },
+                    POINT {
+                        x: rect.right,
+                        y: rect.bottom,
+                    },
+                ];
+                MapWindowPoints(None, Some(hwnd), &mut corners);
+                ExcludeClipRect(dc, corners[0].x, corners[0].y, corners[1].x, corners[1].y);
+            }
+            child = GetWindow(current, GW_HWNDNEXT);
+        }
+        let mut client = RECT::default();
+        if GetClientRect(hwnd, &mut client).is_ok() {
+            FillRect(dc, &client, GetSysColorBrush(COLOR_WINDOW));
+        }
+        let _ = RestoreDC(dc, saved);
+    }
+}
+
+fn is_group_box(hwnd: HWND) -> bool {
+    let mut class = [0u16; 16];
+    let len = unsafe { GetClassNameW(hwnd, &mut class) } as usize;
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
+    String::from_utf16_lossy(&class[..len]).eq_ignore_ascii_case("Button")
+        && style & BS_TYPEMASK as u32 == BS_GROUPBOX as u32
+}
+
 fn selected(combo: HWND, id: usize) -> Option<usize> {
     let index = usize::try_from(send(combo, CB_GETCURSEL, 0, 0)).ok()?;
     match id {
@@ -793,12 +860,18 @@ fn selected(combo: HWND, id: usize) -> Option<usize> {
         SELECT_THEME => THEME_COMMANDS.get(index).copied(),
         SELECT_LANGUAGE => LANGUAGE_COMMANDS.get(index).copied(),
         SELECT_REFRESH => REFRESH_OPTIONS.get(index).map(|&(command, _)| command),
+        SELECT_DOUBLE_CLICK => DOUBLE_CLICK_OPTIONS.get(index).map(|&(command, _)| command),
         _ => None,
     }
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
+        // 静态文本、复选框和分组框统一使用窗口底色，避免出现灰色色块。
+        WM_CTLCOLORSTATIC => {
+            unsafe { SetBkMode(HDC(wp.0 as *mut _), TRANSPARENT) };
+            return LRESULT(unsafe { GetSysColorBrush(COLOR_WINDOW) }.0 as isize);
+        }
         WM_COMMAND => {
             let id = wp.0 & 0xffff;
             let notification = (wp.0 >> 16) as u32;
@@ -821,43 +894,30 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         WM_SIZE if wp.0 != SIZE_MINIMIZED as usize => {
             with_manager(Manager::arrange);
         }
+        WM_ERASEBKGND => {
+            erase_background(hwnd, HDC(wp.0 as *mut _));
+            return LRESULT(1);
+        }
         WM_DPICHANGED => {
-            let suggested = unsafe { &*(lp.0 as *const RECT) };
-            position(
-                hwnd,
-                suggested.left,
-                suggested.top,
-                suggested.right - suggested.left,
-                suggested.bottom - suggested.top,
-            );
+            follow_dpi_change(hwnd, lp);
             with_manager(Manager::arrange);
         }
         WM_GETMINMAXINFO => {
-            if let Ok(bounds) = window_bounds(MIN_WIDTH, MIN_HEIGHT, window_dpi(hwnd)) {
+            if let Ok((width, height)) =
+                window_size(MIN_WIDTH, MIN_HEIGHT, window_dpi(hwnd), STYLE, EX_STYLE)
+                && let Some(work) = work_area(hwnd)
+            {
                 let limits = unsafe { &mut *(lp.0 as *mut MINMAXINFO) };
-                let mut monitor = MONITORINFO {
-                    cbSize: size_of::<MONITORINFO>() as u32,
-                    ..Default::default()
-                };
-                if unsafe {
-                    GetMonitorInfoW(
-                        MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
-                        &mut monitor,
-                    )
-                    .as_bool()
-                } {
-                    limits.ptMinTrackSize.x =
-                        bounds.right.min(monitor.rcWork.right - monitor.rcWork.left);
-                    limits.ptMinTrackSize.y = bounds
-                        .bottom
-                        .min(monitor.rcWork.bottom - monitor.rcWork.top);
-                }
+                limits.ptMinTrackSize.x = width.min(work.right - work.left);
+                limits.ptMinTrackSize.y = height.min(work.bottom - work.top);
             }
         }
         WM_NCDESTROY => {
+            // 正在借用时无法立即清理；with_manager 下次调用时会发现窗口已销毁并释放状态。
             MANAGER.with(|slot| {
-                let mut slot = slot.borrow_mut();
-                if slot.as_ref().is_some_and(|manager| manager.hwnd == hwnd) {
+                if let Ok(mut slot) = slot.try_borrow_mut()
+                    && slot.as_ref().is_some_and(|manager| manager.hwnd == hwnd)
+                {
                     slot.take();
                 }
             });

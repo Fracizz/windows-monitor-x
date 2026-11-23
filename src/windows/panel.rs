@@ -50,6 +50,9 @@ const UNIT_GAP: f32 = 4.0;
 const PERCENT_GAP: f32 = 2.5;
 const ARROW_WING: f32 = 3.7;
 const ARROW_INSET: f32 = 2.5;
+/// 读数右对齐，在实测墨迹宽度之外多留的余量：吸收不同 Windows 版本字体度量的细微差异，
+/// 避免标签或读数稍宽时侵入两者之间的间距。
+const VALUE_MARGIN: i32 = 1;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Layout {
@@ -122,8 +125,8 @@ impl Layout {
     fn column_padding(self, density: Density) -> i32 {
         let (floating, taskbar) = match density {
             Density::Standard => (18, 13),
-            Density::Compact => (12, 8),
-            Density::Tight => (7, 4),
+            Density::Compact => (13, 10),
+            Density::Tight => (9, 7),
         };
         match self {
             Self::Floating => floating,
@@ -131,42 +134,43 @@ impl Layout {
         }
     }
 
+    /// 标签与最大读数的墨迹宽度（向上取整，读数另加 `VALUE_MARGIN`），
+    /// 由 `field_widths_fit_the_widest_text` 校验。
     fn field_widths(self, metric: Metric, language: Language) -> (i32, i32) {
         let (chinese, english) = match metric {
             Metric::Upload | Metric::Download => (10, 10),
-            Metric::Cpu | Metric::CpuFrequency => (28, 28),
-            Metric::Memory => (29, 33),
-            Metric::Disk => (29, 29),
-            Metric::Traffic => (57, 40),
-            Metric::AvailableMemory | Metric::AvailableMemoryPercent => (57, 63),
-            Metric::UsedMemory => (57, 68),
-            Metric::Uptime => (57, 48),
-            Metric::Battery => (29, 48),
-            Metric::DiskRead => (43, 64),
-            Metric::DiskWrite => (43, 67),
-            Metric::GpuMemoryPercent => (29, 41),
-            Metric::UsedGpuMemory => (57, 77),
+            Metric::Cpu | Metric::CpuFrequency => (26, 26),
+            Metric::Memory => (27, 29),
+            Metric::Disk => (28, 26),
+            Metric::Traffic => (56, 39),
+            Metric::AvailableMemory | Metric::AvailableMemoryPercent => (56, 60),
+            Metric::UsedMemory => (55, 65),
+            Metric::Uptime => (56, 46),
+            Metric::Battery => (27, 45),
+            Metric::DiskRead => (42, 61),
+            Metric::DiskWrite => (42, 65),
+            Metric::GpuMemoryPercent => (28, 39),
+            Metric::UsedGpuMemory => (55, 74),
         };
         let (floating, taskbar) = match metric {
-            Metric::Upload | Metric::Download | Metric::DiskRead | Metric::DiskWrite => (59, 57),
+            Metric::Upload | Metric::Download | Metric::DiskRead | Metric::DiskWrite => (55, 53),
             Metric::Cpu
             | Metric::Memory
             | Metric::Disk
             | Metric::Battery
             | Metric::AvailableMemoryPercent
-            | Metric::GpuMemoryPercent => (37, 37),
-            Metric::Traffic => (51, 49),
-            Metric::AvailableMemory | Metric::UsedMemory => (87, 83),
-            Metric::CpuFrequency => (66, 64),
-            Metric::Uptime if language == Language::English => (62, 62),
-            Metric::Uptime => (73, 73),
-            Metric::UsedGpuMemory => (78, 75),
+            | Metric::GpuMemoryPercent => (33, 33),
+            Metric::Traffic => (45, 43),
+            Metric::AvailableMemory | Metric::UsedMemory | Metric::UsedGpuMemory => (74, 70),
+            Metric::CpuFrequency => (62, 60),
+            Metric::Uptime if language == Language::English => (54, 54),
+            Metric::Uptime => (63, 63),
         };
         let value = match self {
             Self::Floating => floating,
             Self::Taskbar => taskbar,
         };
-        (language.choose(chinese, english), value)
+        (language.choose(chinese, english), value + VALUE_MARGIN)
     }
 
     fn columns(self, display: DisplayOptions) -> impl Iterator<Item = Column> {
@@ -1094,24 +1098,24 @@ mod tests {
             ..Default::default()
         };
         let selections = [
-            (Metrics::default(), [357, 328]),
+            (Metrics::default(), [343, 314]),
             (
                 Metrics::parse("upload,download,cpu_frequency,memory,disk,traffic"),
-                [386, 355],
+                [372, 341],
             ),
             (
                 Metrics::parse(
                     "uptime,upload,available_memory,cpu_frequency,battery,download,traffic",
                 ),
-                [646, 598],
+                [612, 564],
             ),
             (
                 Metrics::parse("traffic,disk,upload,download,cpu_frequency,available_memory"),
-                [453, 415],
+                [431, 393],
             ),
             (
                 Metrics::parse("available_memory_percent,used_memory,available_memory"),
-                [376, 348],
+                [350, 322],
             ),
             (Metrics::parse(""), [132, 112]),
         ];
@@ -1157,8 +1161,8 @@ mod tests {
         let mut panel = Panel::new(Language::Chinese).unwrap();
         let values = readings(Sample::default(), 16_000_000, Language::Chinese);
         for (mode, widths) in [
-            (Layout::Floating, [357, 321, 290]),
-            (Layout::Taskbar, [328, 297, 271]),
+            (Layout::Floating, [343, 312, 286]),
+            (Layout::Taskbar, [314, 293, 272]),
         ] {
             let height = mode.size(DisplayOptions::default()).pixels(96).1;
             for ((density, gap), width) in [
@@ -1506,6 +1510,104 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// 字段预留宽度必须容纳最宽的标签与最大读数，且只多出很小的余量，
+    /// 标签与数值之间才只剩统一的间距。
+    #[test]
+    fn field_widths_fit_the_widest_text() {
+        let ink = |text: &IDWriteTextLayout| {
+            let (left, right) = text_bounds(text).unwrap();
+            right - left
+        };
+        for language in [Language::Chinese, Language::English] {
+            let panel = Panel::new(language).unwrap();
+            for metric in Metric::ALL {
+                let widest: &[(&str, &str)] = match metric {
+                    Metric::Upload | Metric::Download | Metric::DiskRead | Metric::DiskWrite => &[
+                        ("999", "B/s"),
+                        ("999", "KB/s"),
+                        ("999", "MB/s"),
+                        ("999", "GB/s"),
+                        ("999", "TB/s"),
+                    ],
+                    Metric::Cpu
+                    | Metric::Memory
+                    | Metric::Disk
+                    | Metric::Battery
+                    | Metric::AvailableMemoryPercent
+                    | Metric::GpuMemoryPercent => &[("100", "%")],
+                    Metric::Traffic => &[
+                        ("999", "KB"),
+                        ("999", "MB"),
+                        ("999", "GB"),
+                        ("999", "TB"),
+                        ("999", "PB"),
+                        ("999", "EB"),
+                    ],
+                    Metric::AvailableMemory | Metric::UsedMemory | Metric::UsedGpuMemory => {
+                        &[("9999.99", "GB"), ("9999.99", "TB")]
+                    }
+                    Metric::CpuFrequency => &[("10.00", "GHz")],
+                    Metric::Uptime => match language {
+                        Language::Chinese => {
+                            &[("99天 23时", ""), ("23时 59分", ""), ("9999", "天")]
+                        }
+                        Language::English => &[("99d 23h", ""), ("23h 59m", ""), ("9999", "d")],
+                    },
+                };
+                let label = panel.labels[metric.index()]
+                    .as_ref()
+                    .map_or(ARROW_INSET + 2.0 * ARROW_WING, |label| ink(&label.layout));
+                for mode in [Layout::Floating, Layout::Taskbar] {
+                    let format = match metric {
+                        Metric::Cpu
+                        | Metric::Memory
+                        | Metric::Disk
+                        | Metric::Battery
+                        | Metric::Uptime
+                        | Metric::GpuMemoryPercent
+                        | Metric::AvailableMemoryPercent => &panel.percent_format,
+                        _ if mode == Layout::Taskbar => &panel.compact_format,
+                        _ => &panel.number_format,
+                    };
+                    let value = widest
+                        .iter()
+                        .map(|(number, unit)| {
+                            let text = layout(&panel.fonts, format, number, 200.0).unwrap();
+                            unsafe {
+                                text.SetTypography(
+                                    &panel.tabular,
+                                    DWRITE_TEXT_RANGE {
+                                        startPosition: 0,
+                                        length: number.encode_utf16().count() as u32,
+                                    },
+                                )
+                                .unwrap();
+                            }
+                            let gap = match *unit {
+                                "" => return ink(&text),
+                                "%" => PERCENT_GAP,
+                                _ => UNIT_GAP,
+                            };
+                            let unit =
+                                layout(&panel.fonts, &panel.unit_format, unit, 43.0).unwrap();
+                            ink(&text) + gap + ink(&unit)
+                        })
+                        .fold(0.0, f32::max);
+                    let (label_width, value_width) = mode.field_widths(metric, language);
+                    let value_room = (value_width - VALUE_MARGIN) as f32;
+                    // 下限保证不重叠；上限防止表中数值远大于实测、浪费宽度。
+                    assert!(
+                        label <= label_width as f32
+                            && label_width as f32 - label < 2.0
+                            && value <= value_room
+                            && value_room - value < 2.0,
+                        "{language:?} {mode:?} {metric:?}: label {label} in {label_width}, value {value} in {value_room}"
+                    );
                 }
             }
         }

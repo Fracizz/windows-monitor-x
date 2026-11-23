@@ -11,7 +11,7 @@ use ::windows::{
     core::{PWSTR, w},
 };
 
-use crate::language::Language;
+use crate::{history::Format, language::Language};
 
 pub fn destination(owner: HWND, language: Language) -> io::Result<Option<PathBuf>> {
     let mut path = vec![0u16; 32_768];
@@ -53,15 +53,12 @@ pub fn destination(owner: HWND, language: Language) -> io::Result<Option<PathBuf
         .position(|&unit| unit == 0)
         .unwrap_or(path.len());
     let destination = PathBuf::from(OsString::from_wide(&path[..end]));
-    if !destination
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
-    {
+    if Format::from_path(&destination).is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             language.choose(
-                "请选择以 .json 结尾的文件名。",
-                "Choose a file name ending in .json.",
+                "请选择以 .json 或 .csv 结尾的文件名。",
+                "Choose a file name ending in .json or .csv.",
             ),
         ));
     }
