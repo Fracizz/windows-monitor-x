@@ -19,10 +19,10 @@ use ::windows::{
             Shell::{ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage},
             WindowsAndMessaging::{
                 FindWindowExW, FindWindowW, GA_ROOTOWNER, GUI_INMENUMODE, GUI_POPUPMENUMODE,
-                GUITHREADINFO, GW_HWNDPREV, GWL_EXSTYLE, GetAncestor, GetClassNameW,
+                GUITHREADINFO, GW_HWNDPREV, GW_OWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW,
                 GetDesktopWindow, GetForegroundWindow, GetGUIThreadInfo, GetShellWindow, GetWindow,
                 GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
-                WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
             },
         },
     },
@@ -43,12 +43,16 @@ pub enum Observation {
     Placement(Placement),
     NoRoom,
     MenuOpen,
+    /// 截图工具等全屏置顶覆盖层在前台：任务栏读数不可信，保持当前位置。
+    Overlay,
 }
 
 #[derive(Default)]
 pub struct DockPlacement {
     current: Option<Placement>,
     pending: Option<(Placement, Instant)>,
+    /// 最近一次确认的贴边槽位，从隐藏恢复时优先回到这里。
+    docked: Option<RECT>,
 }
 
 impl DockPlacement {
@@ -64,13 +68,11 @@ impl DockPlacement {
     pub fn resolve(&mut self, observed: Option<Placement>, now: Instant) -> Option<Placement> {
         let next = observed.unwrap_or_default();
         // Explorer's layout and foreground bounds can be in transition for one poll.
+        // 离开贴边槽位（换槽、转浮窗、隐藏）都要持续 1 秒才生效，避免一次异常读数让面板跳走。
         let needs_confirmation = Some(next) != self.current
             && (observed.is_none()
                 || next == Placement::Hidden
-                || matches!(
-                    (self.current, next),
-                    (Some(Placement::Docked(_)), Placement::Docked(_))
-                ));
+                || matches!(self.current, Some(Placement::Docked(_))));
         if needs_confirmation {
             let since = match self.pending {
                 Some((candidate, since)) if candidate == next => since,
@@ -83,8 +85,22 @@ impl DockPlacement {
                 return None;
             }
         }
+        // 从隐藏（全屏应用、截图后）恢复时任务栏布局可能还在变化：先回到原槽位，
+        // 新槽位按换槽规则持续 1 秒后才采用，避免出现后再跳一次。
+        if self.current == Some(Placement::Hidden)
+            && let Placement::Docked(rect) = next
+            && let Some(previous) = self.docked
+            && previous != rect
+        {
+            self.pending = Some((next, now));
+            self.current = Some(Placement::Docked(previous));
+            return self.current;
+        }
         self.pending = None;
         self.current = Some(next);
+        if let Placement::Docked(rect) = next {
+            self.docked = Some(rect);
+        }
         Some(next)
     }
 }
@@ -144,6 +160,9 @@ impl Taskbar {
         side: TaskbarSide,
         size: LayoutSize,
     ) -> Option<Observation> {
+        if overlay_on_bar(bar, own_window) {
+            return Some(Observation::Overlay);
+        }
         let mut info = APPBARDATA {
             cbSize: size_of::<APPBARDATA>() as u32,
             ..Default::default()
@@ -345,15 +364,29 @@ fn is_button(kind: UIA_CONTROLTYPE_ID) -> bool {
 
 fn fullscreen_on_bar(bar: HWND, own_window: HWND) -> bool {
     let foreground = unsafe { GetForegroundWindow() };
-    if foreground.is_invalid()
+    foreground_candidate(bar, own_window, foreground)
+        && !screen_overlay(foreground)
+        && covers_bar_monitor(bar, foreground)
+}
+
+/// 前台是否为盖住任务栏所在显示器的截图覆盖层。截图期间（以及刚结束时）任务栏的
+/// 可见性和布局读数都不可信，此时保持面板原状，不隐藏、不换槽、不转浮窗。
+fn overlay_on_bar(bar: HWND, own_window: HWND) -> bool {
+    let foreground = unsafe { GetForegroundWindow() };
+    foreground_candidate(bar, own_window, foreground)
+        && screen_overlay(foreground)
+        && covers_bar_monitor(bar, foreground)
+}
+
+fn foreground_candidate(bar: HWND, own_window: HWND, foreground: HWND) -> bool {
+    !(foreground.is_invalid()
         || foreground == own_window
         || foreground == unsafe { GetShellWindow() }
         || foreground == unsafe { GetDesktopWindow() }
-        || is_taskbar_window(bar, foreground)
-        || screen_overlay(foreground)
-    {
-        return false;
-    }
+        || is_taskbar_window(bar, foreground))
+}
+
+fn covers_bar_monitor(bar: HWND, window: HWND) -> bool {
     let mut monitor = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
         ..Default::default()
@@ -364,18 +397,18 @@ fn fullscreen_on_bar(bar: HWND, own_window: HWND) -> bool {
         return false;
     }
     let mut frame = RECT::default();
-    if unsafe {
+    let dwm = unsafe {
         DwmGetWindowAttribute(
-            foreground,
+            window,
             DWMWA_EXTENDED_FRAME_BOUNDS,
             (&raw mut frame).cast(),
             size_of::<RECT>() as u32,
         )
-    }
-    .is_err()
-    {
+    };
+    // 分层/无边框覆盖层可能取不到 DWM 边框，退回窗口矩形。
+    let Some(frame) = dwm.is_ok().then_some(frame).or_else(|| window_rect(window)) else {
         return false;
-    }
+    };
     let display = monitor.rcMonitor;
     frame.left <= display.left
         && frame.top <= display.top
@@ -383,12 +416,17 @@ fn fullscreen_on_bar(bar: HWND, own_window: HWND) -> bool {
         && frame.bottom >= display.bottom
 }
 
-/// 截图工具（PixPin、Snipaste 等）打开时会盖一层全屏置顶的工具窗口，它不是全屏应用，
-/// 不能据此隐藏面板，否则面板会在截图开始时消失、结束时又出现，看起来像闪烁。
+/// 截图工具（PixPin、Snipaste、微信/QQ 截图等）打开时会盖一层全屏置顶、不在任务栏显示按钮的窗口，
+/// 它不是全屏应用，不能据此隐藏面板，否则面板会在截图开始时消失、结束时又出现，看起来像闪烁。
+/// 全屏游戏、视频等通常有任务栏按钮（非工具窗口、无所有者），仍按全屏处理。
 fn screen_overlay(window: HWND) -> bool {
     let style = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) };
-    let overlay = (WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0) as isize;
-    style & overlay == overlay
+    if style & WS_EX_TOPMOST.0 as isize == 0 || style & WS_EX_APPWINDOW.0 as isize != 0 {
+        return false;
+    }
+    let no_button = (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0) as isize;
+    style & no_button != 0
+        || unsafe { GetWindow(window, GW_OWNER) }.is_ok_and(|owner| !owner.is_invalid())
 }
 
 fn taskbar_gap(
@@ -538,6 +576,77 @@ mod tests {
     }
 
     #[test]
+    fn leaving_a_slot_for_floating_needs_confirmation() {
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+        let docked = Placement::Docked(RECT {
+            left: 80,
+            top: 800,
+            right: 230,
+            bottom: 836,
+        });
+        let mut placement = DockPlacement::default();
+        assert_eq!(placement.resolve(Some(docked), start), Some(docked));
+        assert_eq!(
+            placement.resolve(Some(Placement::Floating), start + second / 2),
+            None
+        );
+        assert_eq!(
+            placement.resolve(Some(docked), start + second),
+            Some(docked)
+        );
+        assert_eq!(
+            placement.resolve(Some(Placement::Floating), start + second * 2),
+            None
+        );
+        assert_eq!(
+            placement.resolve(Some(Placement::Floating), start + second * 3),
+            Some(Placement::Floating)
+        );
+    }
+
+    #[test]
+    fn returning_from_hidden_reuses_the_previous_slot_first() {
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+        let rect = RECT {
+            left: 80,
+            top: 800,
+            right: 230,
+            bottom: 836,
+        };
+        let docked = Placement::Docked(rect);
+        let shifted = Placement::Docked(RECT {
+            left: 280,
+            right: 430,
+            ..rect
+        });
+        let mut placement = DockPlacement::default();
+        assert_eq!(placement.resolve(Some(docked), start), Some(docked));
+        assert_eq!(placement.resolve(Some(Placement::Hidden), start), None);
+        assert_eq!(
+            placement.resolve(Some(Placement::Hidden), start + second),
+            Some(Placement::Hidden)
+        );
+        // 截图/全屏结束后的第一次读数槽位偏了：先回原位，不跳。
+        assert_eq!(
+            placement.resolve(Some(shifted), start + second * 2),
+            Some(docked)
+        );
+        // 偏移只是瞬时的：回到原槽位后不再变化。
+        assert_eq!(
+            placement.resolve(Some(docked), start + second * 2 + second / 2),
+            Some(docked)
+        );
+        // 新槽位持续 1 秒才采用。
+        assert_eq!(placement.resolve(Some(shifted), start + second * 3), None);
+        assert_eq!(
+            placement.resolve(Some(shifted), start + second * 4),
+            Some(shifted)
+        );
+    }
+
+    #[test]
     fn topmost_tool_windows_are_treated_as_screen_overlays() {
         use ::windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP,
@@ -561,6 +670,8 @@ mod tests {
         };
         for (style, expected) in [
             (WS_EX_TOPMOST | WS_EX_TOOLWINDOW, true),
+            (WS_EX_TOPMOST | WS_EX_NOACTIVATE, true),
+            (WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_APPWINDOW, false),
             (WS_EX_TOPMOST, false),
             (WS_EX_TOOLWINDOW, false),
             (WINDOW_EX_STYLE::default(), false),

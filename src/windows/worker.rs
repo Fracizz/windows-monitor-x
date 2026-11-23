@@ -79,7 +79,9 @@ impl SamplerWorker {
                             })
                         };
                         let placement = match observed {
-                            Some(Observation::MenuOpen) => dock_placement.hold(),
+                            Some(Observation::MenuOpen | Observation::Overlay) => {
+                                dock_placement.hold()
+                            }
                             // The XAML menu temporarily replaces the taskbar's automation tree.
                             None if bar.is_some_and(taskbar_has_focus) => dock_placement.hold(),
                             Some(Observation::Placement(placement)) => {
