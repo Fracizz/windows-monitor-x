@@ -4,7 +4,7 @@ use ::windows::{
     Win32::{
         Foundation::{ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, RECT, WPARAM},
         Graphics::Gdi::{
-            CreateFontIndirectW, DEFAULT_GUI_FONT, DeleteObject, FW_BOLD, GetDC, GetMonitorInfoW,
+            CreateFontIndirectW, DEFAULT_GUI_FONT, DeleteObject, GetDC, GetMonitorInfoW,
             GetStockObject, GetTextMetricsW, HBRUSH, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST,
             MONITORINFO, MonitorFromWindow, ReleaseDC, SelectObject, TEXTMETRICW,
         },
@@ -194,7 +194,6 @@ pub fn follow_dpi_change(hwnd: HWND, lparam: LPARAM) {
 pub struct Fonts {
     pub dpi: u32,
     body: HFONT,
-    title: HFONT,
     /// 正文字体的行高（像素）。
     pub line_height: i32,
 }
@@ -208,7 +207,6 @@ impl Fonts {
         let mut fonts = Self {
             dpi,
             body: HFONT::default(),
-            title: HFONT::default(),
             line_height: scale(16, dpi),
         };
         unsafe {
@@ -222,9 +220,6 @@ impl Fonts {
             .is_ok()
             {
                 fonts.body = CreateFontIndirectW(&metrics.lfMessageFont);
-                metrics.lfMessageFont.lfHeight = -scale(26, dpi);
-                metrics.lfMessageFont.lfWeight = FW_BOLD.0 as i32;
-                fonts.title = CreateFontIndirectW(&metrics.lfMessageFont);
             }
         }
         if let Some(height) = line_height(fonts.body) {
@@ -242,14 +237,6 @@ impl Fonts {
         };
         for &control in controls {
             send(control, WM_SETFONT, font as usize, 1);
-        }
-    }
-
-    pub fn apply_title(&self, control: HWND) {
-        if self.title.is_invalid() {
-            self.apply_body(&[control]);
-        } else {
-            send(control, WM_SETFONT, self.title.0 as usize, 1);
         }
     }
 }
@@ -274,10 +261,8 @@ fn line_height(font: HFONT) -> Option<i32> {
 
 impl Drop for Fonts {
     fn drop(&mut self) {
-        for font in [self.body, self.title] {
-            if !font.is_invalid() {
-                let _ = unsafe { DeleteObject(HGDIOBJ(font.0)) };
-            }
+        if !self.body.is_invalid() {
+            let _ = unsafe { DeleteObject(HGDIOBJ(self.body.0)) };
         }
     }
 }

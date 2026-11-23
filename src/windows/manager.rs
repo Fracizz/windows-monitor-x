@@ -25,7 +25,6 @@ use super::{
     double_click_labels, metric_name, position, register_class, scale, send,
     startup::{self, Status},
     state::{LanguagePreference, TaskbarSide, Theme},
-    taskbar::Placement,
     ui::{Fonts, centered_bounds, follow_dpi_change, init_common_controls, window_size, work_area},
     window_dpi, with_app,
 };
@@ -51,8 +50,8 @@ const WIDTH: i32 = 820;
 const HEIGHT: i32 = 496;
 const MIN_WIDTH: i32 = 620;
 const MIN_HEIGHT: i32 = 437;
-// 设置区纵向布局（DIP）：分组框从状态栏下方开始，组内各行按统一行距自上而下排布。
-const GROUPS_TOP: i32 = 77;
+// 设置区纵向布局（DIP）：分组框从窗口顶部开始，组内各行按统一行距自上而下排布。
+const GROUPS_TOP: i32 = 12;
 const GROUP_PADDING_TOP: i32 = 19;
 const GROUP_PADDING_BOTTOM: i32 = 10;
 const GROUP_SPACING: i32 = 7;
@@ -72,8 +71,7 @@ thread_local! {
 struct Manager {
     hwnd: HWND,
     panel: HWND,
-    title: HWND,
-    status: HWND,
+    version: HWND,
     panel_group: HWND,
     app_group: HWND,
     live_heading: HWND,
@@ -96,7 +94,6 @@ struct Manager {
     about: HWND,
     exit: HWND,
     language: Option<Language>,
-    status_text: PCWSTR,
     values: [String; Metric::ALL.len()],
     fonts: Option<Fonts>,
 }
@@ -230,8 +227,7 @@ impl Manager {
                 )?,
             ))
         };
-        let title = static_text()?;
-        let status = static_text()?;
+        let version = static_text()?;
         let panel_group = group()?;
         let show_panel = check(TOGGLE)?;
         let topmost = check(TOPMOST)?;
@@ -284,8 +280,7 @@ impl Manager {
         Ok(Self {
             hwnd,
             panel,
-            title,
-            status,
+            version,
             panel_group,
             app_group,
             live_heading,
@@ -308,7 +303,6 @@ impl Manager {
             about: push(ABOUT)?,
             exit: push(EXIT)?,
             language: None,
-            status_text: PCWSTR::null(),
             values: Default::default(),
             fonts: None,
         })
@@ -321,8 +315,13 @@ impl Manager {
             language.choose("管理窗口", "Manager")
         ));
         set_text(self.hwnd, PCWSTR(caption.as_ptr()));
+        let version = HSTRING::from(format!(
+            "{} v{}",
+            language.choose("版本", "Version"),
+            env!("CARGO_PKG_VERSION")
+        ));
+        set_text(self.version, PCWSTR(version.as_ptr()));
         for (control, chinese, english) in [
-            (self.title, w!("系统监控"), w!("Windows Monitor")),
             (self.panel_group, w!("监控面板"), w!("Monitor Panel")),
             (self.app_group, w!("常规设置"), w!("General Settings")),
             (self.live_heading, w!("实时监控"), w!("Live Readings")),
@@ -507,38 +506,6 @@ impl Manager {
     }
 
     fn update_status(&mut self, app: &super::App) {
-        let language = app.settings.display.language;
-        let status =
-            if app.settings.record_history && app.feed.lock().unwrap().history_error.is_some() {
-                language.choose(
-                    w!("无法写入监控记录"),
-                    w!("Could not record monitoring history"),
-                )
-            } else if !app.shown {
-                language.choose(w!("监控面板已隐藏"), w!("Monitor panel hidden"))
-            } else if app.waiting_sample {
-                language.choose(w!("正在读取监控数据…"), w!("Collecting the first sample…"))
-            } else {
-                match app.placement {
-                    Some(Placement::Docked(_)) => language.choose(
-                        w!("监控面板已嵌入任务栏"),
-                        w!("Monitor panel embedded in the taskbar"),
-                    ),
-                    Some(Placement::Hidden) => language.choose(
-                        w!("任务栏被覆盖，监控面板暂时隐藏"),
-                        w!("Monitor panel hidden while the taskbar is covered"),
-                    ),
-                    _ if app.settings.taskbar => language.choose(
-                        w!("当前为浮窗，正在等待任务栏空位"),
-                        w!("Floating panel · Waiting for taskbar space"),
-                    ),
-                    _ => language.choose(w!("监控面板以浮窗显示"), w!("Monitor panel floating")),
-                }
-            };
-        if status != self.status_text {
-            set_text(self.status, status);
-            self.status_text = status;
-        }
         let docked = app.layout() == super::Layout::Taskbar;
         send(
             self.topmost,
@@ -602,9 +569,6 @@ impl Manager {
                 scale(h, dpi),
             );
         };
-
-        set(self.title, left, 14, right - left, 34);
-        set(self.status, left, 51, right - left, 22);
 
         // 下拉框收起时的高度由字体与 DPI 决定，行高取它与复选框高度的较大者。
         let mut combo = RECT::default();
@@ -675,22 +639,20 @@ impl Manager {
             panel_width - 202,
             CHECK_HEIGHT,
         );
-        set(
-            self.app_group,
-            left,
-            app_top,
-            panel_width,
-            rows.end() + GROUP_PADDING_BOTTOM - app_top,
-        );
+        let app_bottom = rows.end() + GROUP_PADDING_BOTTOM;
+        set(self.app_group, left, app_top, panel_width, app_bottom - app_top);
+        // 版本号放在常规设置下方、底部按钮之上的空白处。
+        let version_y = (footer - FOOTER_SPACING - 22).max(app_bottom + 4);
+        set(self.version, left + 2, version_y, panel_width, 22);
 
         let live_width = (right - live_x).max(1);
-        set(self.live_heading, live_x, 80, live_width, 24);
+        set(self.live_heading, live_x, 15, live_width, 24);
         set(
             self.live_list,
             live_x,
-            105,
+            40,
             live_width,
-            (footer - 117).max(1),
+            (footer - 52).max(1),
         );
         let readings_width = (live_width / 3).max(94);
         // Account for the border and a potential vertical scrollbar.
@@ -717,7 +679,7 @@ impl Manager {
     fn set_fonts(&mut self, dpi: u32) {
         let fonts = Fonts::new(dpi);
         fonts.apply_body(&[
-            self.status,
+            self.version,
             self.panel_group,
             self.app_group,
             self.live_heading,
@@ -745,7 +707,6 @@ impl Manager {
             self.about,
             self.exit,
         ]);
-        fonts.apply_title(self.title);
         self.fonts = Some(fonts);
     }
 }
