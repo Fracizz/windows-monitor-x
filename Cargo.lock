@@ -402,7 +402,7 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
 name = "windows-monitor"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "embed-resource",
  "semver",
