@@ -5,7 +5,7 @@ use std::{
 
 use ::windows::{
     Win32::{
-        Foundation::{HWND, RECT},
+        Foundation::{HWND, POINT, RECT},
         Graphics::{
             Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
             Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromWindow},
@@ -20,9 +20,10 @@ use ::windows::{
             WindowsAndMessaging::{
                 FindWindowExW, FindWindowW, GA_ROOTOWNER, GUI_INMENUMODE, GUI_POPUPMENUMODE,
                 GUITHREADINFO, GW_HWNDPREV, GW_OWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW,
-                GetDesktopWindow, GetForegroundWindow, GetGUIThreadInfo, GetShellWindow, GetWindow,
-                GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
-                WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetGUIThreadInfo,
+                GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
+                GetWindowThreadProcessId, IsWindowVisible, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+                WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
             },
         },
     },
@@ -42,7 +43,7 @@ pub enum Placement {
 pub enum Observation {
     Placement(Placement),
     NoRoom,
-    MenuOpen,
+    Interaction,
     /// 截图工具等全屏置顶覆盖层在前台：任务栏读数不可信，保持当前位置。
     Overlay,
 }
@@ -68,6 +69,10 @@ impl DockPlacement {
             self.bar_geometry = Some((bounds, dpi));
         }
         self.docked.map(|rect| rect.left)
+    }
+
+    fn has_confirmed_slot(&self) -> bool {
+        matches!(self.current, Some(Placement::Docked(rect)) if self.docked == Some(rect))
     }
 
     pub fn hold(&mut self) -> Option<Placement> {
@@ -196,11 +201,20 @@ impl Taskbar {
             return Some(Observation::Placement(Placement::Floating));
         }
 
-        let tray =
+        let previous_x = placement.previous_x(bounds, dpi);
+        let tray_window =
             unsafe { FindWindowExW(Some(bar), None, w!("TrayNotifyWnd"), PCWSTR::null()) }.ok()?;
-        let tray = window_rect(tray)?;
+        let tray = window_rect(tray_window)?;
         if !valid_on_bar(tray, bounds) || tray.left <= bounds.left {
             return None;
+        }
+        // The clock tooltip can live in a separate XAML popup, outside the taskbar UIA tree.
+        let mut cursor = POINT::default();
+        if placement.has_confirmed_slot()
+            && unsafe { GetCursorPos(&mut cursor) }.is_ok()
+            && clock_hovered(tray_window, tray, cursor)
+        {
+            return Some(Observation::Interaction);
         }
         self.occupied.clear();
 
@@ -215,10 +229,13 @@ impl Taskbar {
                 if child.CachedIsOffscreen().ok()?.as_bool() {
                     continue;
                 }
-                let rect = child.CachedBoundingRectangle().ok()?;
                 let kind = child.CachedControlType().ok()?;
+                if kind == UIA_ToolTipControlTypeId && placement.has_confirmed_slot() {
+                    return Some(Observation::Interaction);
+                }
+                let rect = child.CachedBoundingRectangle().ok()?;
                 if popup_menu(kind, rect, bounds) {
-                    return Some(Observation::MenuOpen);
+                    return Some(Observation::Interaction);
                 }
                 if !valid_on_bar(rect, bounds) || rect.left >= tray.left {
                     continue;
@@ -260,7 +277,7 @@ impl Taskbar {
             width,
             padding,
             side,
-            placement.previous_x(bounds, dpi),
+            previous_x,
         ) else {
             return Some(Observation::NoRoom);
         };
@@ -352,6 +369,30 @@ fn window_rect(hwnd: HWND) -> Option<RECT> {
     let mut rect = RECT::default();
     unsafe { GetWindowRect(hwnd, &mut rect) }.ok()?;
     Some(rect)
+}
+
+fn clock_hovered(tray_window: HWND, tray: RECT, point: POINT) -> bool {
+    if !contains_point(tray, point) {
+        return false;
+    }
+    // Classic taskbars expose a clock HWND. XAML taskbars may expose only the notification area.
+    unsafe {
+        FindWindowExW(
+            Some(tray_window),
+            None,
+            w!("TrayClockWClass"),
+            PCWSTR::null(),
+        )
+    }
+    .ok()
+    .filter(|&hwnd| unsafe { IsWindowVisible(hwnd).as_bool() })
+    .and_then(window_rect)
+    .filter(|&rect| valid_on_bar(rect, tray))
+    .is_none_or(|clock| contains_point(clock, point))
+}
+
+fn contains_point(rect: RECT, point: POINT) -> bool {
+    (rect.left..rect.right).contains(&point.x) && (rect.top..rect.bottom).contains(&point.y)
 }
 
 fn valid_on_bar(rect: RECT, bar: RECT) -> bool {
@@ -844,6 +885,82 @@ mod tests {
         for window in [upper, lower] {
             let _ = unsafe { DestroyWindow(window) };
         }
+    }
+
+    #[test]
+    fn clock_hover_keeps_a_confirmed_slot_and_resumes_after_pointer_exit() {
+        use ::windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+        // A message-only window has no native clock child, like a XAML notification area.
+        let tray_window = super::super::Window(unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("Static"),
+                PCWSTR::null(),
+                WINDOW_STYLE::default(),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        });
+        let tray = RECT {
+            left: 800,
+            top: 960,
+            right: 1000,
+            bottom: 1000,
+        };
+        let clock = POINT { x: 950, y: 980 };
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+        let rect = RECT {
+            left: 630,
+            top: 962,
+            right: 780,
+            bottom: 998,
+        };
+        let slot = Placement::Docked(rect);
+        let moved = Placement::Docked(RECT {
+            left: 600,
+            right: 750,
+            ..rect
+        });
+        let mut placement = DockPlacement::default();
+        let poll = |state: &mut DockPlacement, point, candidate, time| {
+            if state.has_confirmed_slot() && clock_hovered(tray_window.0, tray, point) {
+                state.hold()
+            } else {
+                state.resolve(Some(candidate), time)
+            }
+        };
+        let outside = POINT {
+            x: tray.left - 1,
+            ..clock
+        };
+        assert_eq!(poll(&mut placement, clock, slot, start), Some(slot));
+        assert_eq!(poll(&mut placement, outside, moved, start + second), None);
+        for tick in [2, 3, 60] {
+            assert_eq!(
+                poll(&mut placement, clock, moved, start + tick * second),
+                Some(slot)
+            );
+        }
+        assert_eq!(
+            poll(&mut placement, outside, moved, start + 61 * second),
+            None
+        );
+        assert_eq!(
+            poll(&mut placement, outside, moved, start + 62 * second),
+            Some(moved)
+        );
+        placement.reset_slot();
+        assert!(!placement.has_confirmed_slot());
     }
 
     #[test]

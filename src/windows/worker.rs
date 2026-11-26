@@ -67,7 +67,7 @@ impl SamplerWorker {
                     {
                         let bar = primary_taskbar();
                         let observed = if bar.is_some_and(taskbar_menu_open) {
-                            Some(Observation::MenuOpen)
+                            Some(Observation::Interaction)
                         } else {
                             if taskbar.is_none() {
                                 taskbar = Taskbar::new().ok();
@@ -83,7 +83,7 @@ impl SamplerWorker {
                             })
                         };
                         let placement = match observed {
-                            Some(Observation::MenuOpen | Observation::Overlay) => {
+                            Some(Observation::Interaction | Observation::Overlay) => {
                                 dock_placement.hold()
                             }
                             // The XAML menu temporarily replaces the taskbar's automation tree.
