@@ -53,11 +53,21 @@ pub struct DockPlacement {
     pending: Option<(Placement, Instant)>,
     /// 最近一次确认的贴边槽位，从隐藏恢复时优先回到这里。
     docked: Option<RECT>,
+    bar_geometry: Option<(RECT, u32)>,
 }
 
 impl DockPlacement {
-    pub fn reset_pending(&mut self) {
+    pub fn reset_slot(&mut self) {
+        self.docked = None;
         self.pending = None;
+    }
+
+    fn previous_x(&mut self, bounds: RECT, dpi: u32) -> Option<i32> {
+        if self.bar_geometry != Some((bounds, dpi)) {
+            self.reset_slot();
+            self.bar_geometry = Some((bounds, dpi));
+        }
+        self.docked.map(|rect| rect.left)
     }
 
     pub fn hold(&mut self) -> Option<Placement> {
@@ -159,6 +169,7 @@ impl Taskbar {
         own_window: HWND,
         side: TaskbarSide,
         size: LayoutSize,
+        placement: &mut DockPlacement,
     ) -> Option<Observation> {
         let cover = foreground_cover(bar, own_window);
         if cover == Cover::Overlay {
@@ -249,6 +260,7 @@ impl Taskbar {
             width,
             padding,
             side,
+            placement.previous_x(bounds, dpi),
         ) else {
             return Some(Observation::NoRoom);
         };
@@ -475,26 +487,37 @@ fn taskbar_gap(
     width: i32,
     padding: i32,
     side: TaskbarSide,
+    previous_x: Option<i32>,
 ) -> Option<i32> {
-    let left = if side == TaskbarSide::Right {
-        // The right slot starts after the last visible taskbar control.
-        occupied.iter().fold(left, |edge, &(_, end)| edge.max(end))
-    } else {
-        left
+    // 先选符合左右设置的空位，仅在该空位内保留已确认的坐标。
+    let fit = |start: i32, end: i32| {
+        let first = start + padding;
+        let last = end - padding - width;
+        if first > last {
+            return None;
+        }
+        let edge = if side == TaskbarSide::Right {
+            last
+        } else {
+            first
+        };
+        Some(
+            previous_x
+                .filter(|x| (first..=last).contains(x))
+                .unwrap_or(edge),
+        )
     };
-    // 始终按所选方向计算贴边槽位，不沿用旧位置：
-    // Explorer 短暂布局变化（防抖 1 秒由 DockPlacement 负责）若把面板挤到别处，
-    // 沿用旧位置会让它永远停在那里，出现“设置靠左、实际靠右”。
     if side == TaskbarSide::Right {
-        return (tray_left - left >= width + 2 * padding).then_some(tray_left - padding - width);
+        let start = occupied.iter().fold(left, |edge, &(_, end)| edge.max(end));
+        return fit(start, tray_left);
     }
 
     occupied.sort_unstable();
     let mut next = left;
     for (start, end) in occupied.iter().copied().chain([(tray_left, tray_left)]) {
         let start = start.clamp(left, tray_left);
-        if start - next >= width + 2 * padding {
-            return Some(next + padding);
+        if let Some(x) = fit(next, start) {
+            return Some(x);
         }
         next = next.max(end.clamp(left, tray_left));
     }
@@ -509,15 +532,15 @@ mod tests {
     fn docking_prefers_the_selected_edge_and_keeps_clear_of_controls() {
         let mut occupied = [(15, 65), (390, 500), (300, 440)];
         assert_eq!(
-            taskbar_gap(0, 850, &mut occupied, 150, 6, TaskbarSide::Left),
+            taskbar_gap(0, 850, &mut occupied, 150, 6, TaskbarSide::Left, None),
             Some(71)
         );
         assert_eq!(
-            taskbar_gap(0, 850, &mut occupied, 150, 6, TaskbarSide::Right),
+            taskbar_gap(0, 850, &mut occupied, 150, 6, TaskbarSide::Right, None),
             Some(694)
         );
         for side in [TaskbarSide::Left, TaskbarSide::Right] {
-            assert_eq!(taskbar_gap(0, 850, &mut occupied, 350, 6, side), None);
+            assert_eq!(taskbar_gap(0, 850, &mut occupied, 350, 6, side, None), None);
         }
     }
 
@@ -525,33 +548,99 @@ mod tests {
     fn right_docking_waits_for_room_next_to_the_tray() {
         let mut occupied = [(310, 650)];
         assert_eq!(
-            taskbar_gap(0, 740, &mut occupied, 240, 6, TaskbarSide::Left),
+            taskbar_gap(0, 740, &mut occupied, 240, 6, TaskbarSide::Left, None),
             Some(6)
         );
         assert_eq!(
-            taskbar_gap(0, 740, &mut occupied, 240, 6, TaskbarSide::Right),
+            taskbar_gap(0, 740, &mut occupied, 240, 6, TaskbarSide::Right, None),
             None
         );
         occupied[0].1 = 488;
         assert_eq!(
-            taskbar_gap(0, 740, &mut occupied, 240, 6, TaskbarSide::Right),
+            taskbar_gap(0, 740, &mut occupied, 240, 6, TaskbarSide::Right, None),
             Some(494)
         );
     }
 
     #[test]
-    fn left_docking_returns_to_the_edge_once_a_transient_control_leaves() {
-        // 短暂出现的控件把面板挤到中间后，控件消失应回到左侧，而不是停在旧位置。
-        let mut occupied = [(0, 60), (400, 480)];
-        assert_eq!(
-            taskbar_gap(0, 820, &mut occupied, 150, 6, TaskbarSide::Left),
-            Some(66)
-        );
-        let mut occupied = [(0, 360), (400, 480)];
-        assert_eq!(
-            taskbar_gap(0, 820, &mut occupied, 150, 6, TaskbarSide::Left),
-            Some(486)
-        );
+    fn tray_icons_can_come_and_go_without_moving_a_docked_panel_back_and_forth() {
+        let gap = |tray, previous| {
+            taskbar_gap(
+                0,
+                tray,
+                &mut [(310, 500)],
+                150,
+                6,
+                TaskbarSide::Right,
+                previous,
+            )
+        };
+        let original = gap(850, None);
+        assert_eq!(original, Some(694));
+        let shifted = gap(826, original);
+        assert_eq!(shifted, Some(670));
+        assert_eq!(gap(850, shifted), shifted);
+        assert_eq!(gap(826, shifted), shifted);
+        assert_eq!(gap(650, shifted), None);
+    }
+
+    #[test]
+    fn left_docking_reuses_space_only_in_the_first_gap_that_fits() {
+        let gap = |button_end, previous| {
+            taskbar_gap(
+                0,
+                820,
+                &mut [(0, button_end), (400, 480)],
+                150,
+                6,
+                TaskbarSide::Left,
+                previous,
+            )
+        };
+        let original = gap(60, None);
+        assert_eq!(original, Some(66));
+        assert_eq!(gap(32, original), original);
+        let shifted = gap(360, original);
+        assert_eq!(shifted, Some(486));
+        assert_eq!(gap(60, shifted), original);
+    }
+
+    #[test]
+    fn reuses_only_confirmed_coordinates_for_the_current_taskbar_geometry_and_settings() {
+        let mut placement = DockPlacement::default();
+        let bar = RECT {
+            left: 0,
+            top: 800,
+            right: 1000,
+            bottom: 840,
+        };
+        let slot = Placement::Docked(RECT {
+            left: 700,
+            top: 802,
+            right: 850,
+            bottom: 838,
+        });
+        let now = Instant::now();
+        assert_eq!(placement.previous_x(bar, 96), None);
+        assert_eq!(placement.resolve(Some(slot), now), Some(slot));
+        assert_eq!(placement.previous_x(bar, 96), Some(700));
+
+        let other = Placement::Docked(RECT {
+            left: 660,
+            top: 802,
+            right: 810,
+            bottom: 838,
+        });
+        assert_eq!(placement.resolve(Some(other), now), None);
+        assert_eq!(placement.previous_x(bar, 96), Some(700));
+
+        let wider = RECT { right: 1200, ..bar };
+        assert_eq!(placement.previous_x(wider, 96), None);
+        placement.resolve(Some(slot), now);
+        assert_eq!(placement.previous_x(wider, 144), None);
+        placement.resolve(Some(slot), now);
+        placement.reset_slot();
+        assert_eq!(placement.previous_x(wider, 144), None);
     }
 
     #[test]

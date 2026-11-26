@@ -73,9 +73,13 @@ impl SamplerWorker {
                                 taskbar = Taskbar::new().ok();
                             }
                             bar.and_then(|bar| {
-                                taskbar
-                                    .as_mut()?
-                                    .observe(bar, hwnd, taskbar_side, dock_size)
+                                taskbar.as_mut()?.observe(
+                                    bar,
+                                    hwnd,
+                                    taskbar_side,
+                                    dock_size,
+                                    &mut dock_placement,
+                                )
                             })
                         };
                         let placement = match observed {
@@ -130,7 +134,7 @@ impl SamplerWorker {
                                 taskbar = None;
                                 dock_placement = DockPlacement::default();
                             } else {
-                                dock_placement.reset_pending();
+                                dock_placement.reset_slot();
                             }
                             last_placement = None;
                         }
